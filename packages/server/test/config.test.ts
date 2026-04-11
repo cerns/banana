@@ -94,6 +94,20 @@ describe('config', () => {
     expect(config.hubCooldownMs).toBe(5000);
   });
 
+  it('should default promptCompressEnabled=true', async () => {
+    process.env.BANANA_TOKEN = 'test';
+    delete process.env.BANANA_PROMPT_COMPRESS;
+    const { config } = await import('../src/config.js');
+    expect(config.promptCompressEnabled).toBe(true);
+  });
+
+  it('should disable promptCompressEnabled when BANANA_PROMPT_COMPRESS=0', async () => {
+    process.env.BANANA_TOKEN = 'test';
+    process.env.BANANA_PROMPT_COMPRESS = '0';
+    const { config } = await import('../src/config.js');
+    expect(config.promptCompressEnabled).toBe(false);
+  });
+
   it('should exit if BANANA_TOKEN is missing', async () => {
     delete process.env.BANANA_TOKEN;
     const mockExit = vi.spyOn(process, 'exit').mockImplementation(() => undefined as never);

@@ -7,6 +7,7 @@ import type { ChannelTask } from './taskStore.js';
 import { docStore } from './docStore.js';
 import type { ChannelDoc } from './docStore.js';
 import { extractArtifactActions } from './channelArtifactExtractor.js';
+import { compressPrompt, compressionStats } from './promptCompressor.js';
 import { sessionStore } from '../sessions/sessionStore.js';
 import type { SessionRecord } from '../sessions/sessionStore.js';
 import { createJob } from '../sessions/sessionManager.js';
@@ -15,6 +16,22 @@ import { isSessionBusy, onJobComplete, executeRemoteJob } from '../ssh/remoteSes
 
 /** Track last dispatch time per session for cooldown. */
 const sessionCooldowns = new Map<string, number>();
+
+/**
+ * Apply heuristic compression to a prompt before sending to claude.
+ * Logs the savings so operators can see token reduction in real time.
+ * Bypassed when BANANA_PROMPT_COMPRESS=0.
+ */
+function compressForDispatch(prompt: string, label: string): string {
+  if (!config.promptCompressEnabled) return prompt;
+  const compressed = compressPrompt(prompt);
+  const stats = compressionStats(prompt, compressed);
+  if (stats.saved > 0) {
+    const pct = ((1 - stats.ratio) * 100).toFixed(1);
+    console.log(`[hub] compress(${label}) ${stats.beforeChars}→${stats.afterChars} chars (-${pct}%)`);
+  }
+  return compressed;
+}
 
 /** Count currently running hub-dispatched jobs. */
 let runningHubJobs = 0;
@@ -544,7 +561,7 @@ function dispatchToSession(
       ? `[YOU WERE TRIGGERED TO ACT ON THIS MESSAGE in ${channelName} from ${hubMessage.fromName}]`
       : `[HUB ${channelName} from ${hubMessage.fromName}]`;
 
-  const prompt = [
+  const rawPrompt = [
     roleLine,
     rolePromptLine,
     contextBlock,
@@ -554,6 +571,8 @@ function dispatchToSession(
     '---',
     guidance,
   ].filter(Boolean).join('\n');
+
+  const prompt = compressForDispatch(rawPrompt, `dispatch ${session.sessionId.slice(0, 8)}`);
 
   // Create job
   const job = createJob(session.sessionId, prompt);
@@ -743,7 +762,7 @@ function continueTalking(
     'beat without the marker. Reply with SKIP to drop out entirely.',
   ].join('\n');
 
-  const prompt = [
+  const rawPrompt = [
     roleLine,
     rolePromptLine,
     contextBlock,
@@ -752,6 +771,8 @@ function continueTalking(
     '---',
     guidance,
   ].filter(Boolean).join('\n');
+
+  const prompt = compressForDispatch(rawPrompt, `talking ${sessionId.slice(0, 8)}`);
 
   const job = createJob(sessionId, prompt);
 
@@ -1118,7 +1139,7 @@ export async function compactChannel(
     .map((c, i) => `### Prior compaction ${i + 1} (${c.createdAt})\n${c.summary}`)
     .join('\n\n');
 
-  const prompt = [
+  const rawPrompt = [
     `You are compacting the conversation history of channel "${channel.name}".`,
     'Produce a faithful, dense summary that preserves EVERYTHING the agents will',
     'need to keep working — open decisions, unresolved questions, action items,',
@@ -1139,6 +1160,8 @@ export async function compactChannel(
     '## Transcript to compact',
     transcript,
   ].filter(Boolean).join('\n');
+
+  const prompt = compressForDispatch(rawPrompt, `compact ${channelId}`);
 
   const machine = machineStore.get(mid);
   if (!machine) throw new Error('machine not found');

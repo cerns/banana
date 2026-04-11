@@ -33,6 +33,11 @@ export const config = {
   // connection errors (with exponential backoff + jitter). Auth errors and
   // post-connect failures are NOT retried.
   sshConnectRetries: parseInt(process.env.BANANA_SSH_CONNECT_RETRIES ?? '2', 10),
+  // Heuristic prompt compression (LLMLingua-style). Strips filler words,
+  // rewrites wordy phrases, collapses whitespace, dedupes adjacent lines.
+  // Code blocks (``` and `inline`) are preserved verbatim. Set to "0" to
+  // disable; default is enabled.
+  promptCompressEnabled: process.env.BANANA_PROMPT_COMPRESS !== '0',
 };
 
 if (!config.token) {
