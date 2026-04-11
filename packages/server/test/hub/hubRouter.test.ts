@@ -719,6 +719,53 @@ describe('hubRouter', () => {
       expect(r.replyPosted).toBe(true);
     });
 
+    it('should NOT suppress short imperative starting with "Skip" (no separator)', () => {
+      // Real content beginning with the verb "skip" — must NOT be dropped.
+      const r = runWithReply('Skip the cache and rebuild from source for accurate timing.');
+      expect(r.dispatchStatus).toBe('acted');
+      expect(r.replyPosted).toBe(true);
+    });
+
+    it('should NOT suppress long complex reply that begins with "skip"', () => {
+      // The exact regression: a long, multi-step reply from a complex
+      // agent process that happens to start with the word "skip" was being
+      // killed by the old `^skip\b` check.
+      const longReply = [
+        'Skip cache invalidation for now, here is the full plan:',
+        '',
+        '1. Run lint',
+        '2. Build the bundle',
+        '3. Run unit tests with --coverage',
+        '4. Run the perf suite (this is the slow one)',
+        '5. Compare against baseline',
+        '6. Post results to #perf channel',
+        '',
+        'I will execute steps 1–4 in parallel where possible.',
+      ].join('\n');
+      const r = runWithReply(longReply);
+      expect(r.dispatchStatus).toBe('acted');
+      expect(r.replyPosted).toBe(true);
+    });
+
+    it('should NOT suppress multi-paragraph reply', () => {
+      // Multi-paragraph (\n\n) replies are real content even if short.
+      const r = runWithReply('skip the noise.\n\nHere is what I found in the logs.');
+      expect(r.dispatchStatus).toBe('acted');
+      expect(r.replyPosted).toBe(true);
+    });
+
+    it('should suppress "skip: nothing to add" (explicit reason form)', () => {
+      const r = runWithReply('skip: nothing to add here');
+      expect(r.dispatchStatus).toBe('skipped');
+      expect(r.replyPosted).toBe(false);
+    });
+
+    it('should suppress "SKIP — out of scope" (em-dash reason)', () => {
+      const r = runWithReply('SKIP — out of scope for me');
+      expect(r.dispatchStatus).toBe('skipped');
+      expect(r.replyPosted).toBe(false);
+    });
+
     it('should suppress double SKIP via stream_event text_deltas + tool_use + rate_limit_event', () => {
       // Reproduces the real-world pattern reported by user: model emits two
       // "\n\nSKIP" text deltas, then starts a tool_use that gets cut off by a

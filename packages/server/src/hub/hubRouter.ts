@@ -519,23 +519,46 @@ function stripTalkingMarkers(text: string): string {
   return text.replace(/\[(IM_TALKING|IM_THINKING)\]/gi, '').replace(/\n{3,}/g, '\n\n').trim();
 }
 
+/** Hard cap above which a reply can never be classified as SKIP. Real SKIP
+ * signals are tiny by definition — anything substantive is real content. */
+const SKIP_MAX_LEN = 200;
+
 /**
  * Detect whether an agent's reply is a "SKIP" — meaning it should be silently
  * dropped rather than posted as a real message. Catches:
  *   - empty responses
  *   - "SKIP", "SKIP.", "SKIP!", "skip"
- *   - "SKIPSKIP", "SKIP SKIP" (LLM stuttering)
+ *   - "SKIPSKIP", "SKIP SKIP", "SKIP\n\nSKIP" (LLM stuttering)
  *   - "SKIP - not relevant", "skip: nothing to add"
- * Does NOT match: "skipping the build", "skip ahead to ..." (real content).
+ * Does NOT match: "skipping the build", "skip ahead to ..." (real content),
+ * long substantive replies that happen to begin with the word "skip", or
+ * any multi-paragraph reply.
  */
 function isSkipResponse(text: string): boolean {
   const trimmed = text.trim();
   if (trimmed === '') return true;
-  // Strip everything except letters, then check for repeated "skip"
+
+  // 1) Letters-only check — pure repetitions of SKIP regardless of
+  //    intervening punctuation/whitespace. Catches "SKIP", "SKIP.",
+  //    "SKIP SKIP", "SKIPSKIP", "SKIP\n\nSKIP" (LLM stutter). This branch
+  //    runs without a length cap so we still catch the rare degenerate
+  //    case where the model emits hundreds of "SKIP"s in a row.
   const lettersOnly = trimmed.replace(/[^a-z]/gi, '').toLowerCase();
-  if (/^(skip)+$/.test(lettersOnly)) return true;
-  // "SKIP <punctuation/space> ..." → still a skip
-  if (/^skip\b/i.test(trimmed)) return true;
+  if (lettersOnly.length > 0 && /^(skip)+$/.test(lettersOnly)) return true;
+
+  // 2) Anything substantive is real content. A genuine "skip + short reason"
+  //    is by nature tiny and single-paragraph; multi-paragraph or long
+  //    replies are work products that must NOT be silently dropped.
+  if (trimmed.length > SKIP_MAX_LEN) return false;
+  if (trimmed.includes('\n\n')) return false;
+
+  // 3) Explicit reason form: "skip: nothing to add", "skip - not relevant",
+  //    "skip — out of scope". Requires an explicit colon/dash separator
+  //    after the word "skip". This prevents instructional content like
+  //    "Skip the validation step and run the build" from being
+  //    misclassified — that one has neither punctuation nor a length match.
+  if (/^skip\s*[:\-–—]/i.test(trimmed)) return true;
+
   return false;
 }
 
