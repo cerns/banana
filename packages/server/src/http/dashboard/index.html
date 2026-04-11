@@ -1,0 +1,307 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>🍌 Banana</title>
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+
+  <header>
+    <h1>🍌 banana</h1>
+    <button id="hub-btn" class="btn btn-sm" style="background:var(--blue);color:#000">Hub</button>
+    <button id="machines-btn" class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Machines</button>
+    <select id="model-select" class="model-select" title="Default model for newly created sessions. Override per-session in the session edit modal. opusplan = Opus for planning, Sonnet for execution (conserves Opus quota).">
+      <option value="">default</option>
+      <option value="opus">opus</option>
+      <option value="sonnet">sonnet</option>
+      <option value="haiku">haiku</option>
+      <option value="opusplan">opusplan</option>
+    </select>
+    <span id="ws-status" class="disconnected">○ disconnected</span>
+  </header>
+  <div id="push-banner" style="display:none"></div>
+
+  <!-- Auth panel -->
+  <div id="auth-panel" style="display:none">
+    <div style="color:var(--accent);font-size:18px;margin-bottom:4px;">🍌 banana</div>
+    <div style="color:var(--muted);margin-bottom:16px;font-size:12px;">Enter your BANANA_TOKEN to connect</div>
+    <input id="token-input" type="password" placeholder="BANANA_TOKEN" autocomplete="off" />
+    <button id="auth-btn" class="btn">Connect</button>
+  </div>
+
+  <!-- Main layout -->
+  <div id="main" style="display:none">
+
+    <!-- Sidebar: session list -->
+    <div id="sidebar">
+      <div id="sidebar-header">
+        <span>Sessions</span>
+        <div style="display:flex;align-items:center;gap:6px">
+          <span id="session-count"></span>
+          <button id="new-session-btn" class="btn btn-sm" title="New remote session">+</button>
+        </div>
+      </div>
+      <div id="session-list"></div>
+    </div>
+
+    <!-- Content area -->
+    <div id="content">
+      <div id="content-header">
+        <span id="content-title" style="color:var(--muted)">Select a session</span>
+        <button id="kill-btn" class="btn btn-danger btn-sm" style="display:none">Kill</button>
+      </div>
+
+      <div id="output">
+        <div class="empty-state">
+          <div class="big">🍌</div>
+          <div>Select a session to view output</div>
+        </div>
+      </div>
+
+      <div id="prompt-bar">
+        <input id="prompt-input" type="text" placeholder="Send a prompt..." />
+        <button id="send-btn" class="btn">Send</button>
+        <button id="stop-btn" class="btn btn-danger" style="display:none" title="Stop running job (Esc)">Stop</button>
+      </div>
+    </div>
+
+  </div>
+
+  <!-- Hub panel (replaces main when active) -->
+  <div id="hub-panel" style="display:none">
+    <div id="hub-layout">
+      <div id="hub-channels">
+        <div id="hub-channels-header">
+          <span>Channels</span>
+          <button id="hub-new-channel-btn" class="btn btn-sm" title="New channel">+</button>
+        </div>
+        <div id="hub-channel-list"></div>
+      </div>
+      <div id="hub-messages-area">
+        <div id="hub-messages-header">
+          <span id="hub-channel-title" style="color:var(--muted)">Select a channel</span>
+          <div id="hub-tabs">
+            <button data-view="messages" class="hub-tab active">Messages</button>
+            <button data-view="tasks" class="hub-tab">bJira</button>
+            <button data-view="docs" class="hub-tab">bConfluence</button>
+          </div>
+        </div>
+        <div id="hub-messages-view">
+          <div id="hub-messages"></div>
+          <div id="hub-post-bar">
+            <input id="hub-content-input" type="text" placeholder="Post a message..." />
+            <input id="hub-tags-input" type="text" placeholder="tags (comma-sep)" style="width:120px" />
+            <input id="hub-mentions-input" type="text" placeholder="@mentions" style="width:120px" />
+            <button id="hub-post-btn" class="btn">Post</button>
+          </div>
+        </div>
+        <div id="hub-tasks-view" style="display:none">
+          <div class="hub-toolbar">
+            <select id="hub-task-status-filter">
+              <option value="">All statuses</option>
+              <option value="open">Open</option>
+              <option value="in_progress">In progress</option>
+              <option value="blocked">Blocked</option>
+              <option value="done">Done</option>
+              <option value="wontfix">Won't fix</option>
+            </select>
+            <input id="hub-task-search" placeholder="search bJira..." />
+            <button id="hub-new-task-btn" class="btn btn-sm">+ bJira</button>
+          </div>
+          <div id="hub-task-list"></div>
+        </div>
+        <div id="hub-docs-view" style="display:none">
+          <div class="hub-toolbar">
+            <input id="hub-doc-search" placeholder="search bConfluence..." />
+            <button id="hub-new-doc-btn" class="btn btn-sm">+ bConfluence</button>
+          </div>
+          <div id="hub-docs-split">
+            <div id="hub-doc-list"></div>
+            <div id="hub-doc-body"><div style="color:var(--muted);padding:16px">Select a doc to view its body.</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Task edit modal -->
+  <div id="task-edit-modal" class="modal" style="display:none">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <span id="te-title">Task</span>
+        <button class="modal-close" data-close="task-edit-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row"><label>Title</label><input id="te-title-input" /></div>
+        <div class="form-row"><label>Description</label><textarea id="te-description" rows="4"></textarea></div>
+        <div class="form-row"><label>Status</label>
+          <select id="te-status">
+            <option value="open">open</option>
+            <option value="in_progress">in_progress</option>
+            <option value="blocked">blocked</option>
+            <option value="done">done</option>
+            <option value="wontfix">wontfix</option>
+          </select>
+        </div>
+        <div class="form-row"><label>Assignee</label><input id="te-assignee" /></div>
+        <div class="form-row"><label>Tags</label><input id="te-tags" placeholder="comma-sep" /></div>
+        <div class="form-row"><label>Priority</label>
+          <select id="te-priority">
+            <option value="">-</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+          </select>
+        </div>
+        <div class="form-row"><label>Comment</label><input id="te-comment" placeholder="add a comment..." /></div>
+        <div id="te-activity" style="max-height:200px;overflow:auto;margin-top:12px;font-size:12px;background:var(--surface);padding:8px;border-radius:4px"></div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button id="te-save" class="btn">Save</button>
+          <button id="te-delete" class="btn" style="background:#a33;color:#fff">Delete</button>
+          <button class="btn modal-close" data-close="task-edit-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Doc edit modal -->
+  <div id="doc-edit-modal" class="modal" style="display:none">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <span id="de-title">Doc</span>
+        <button class="modal-close" data-close="doc-edit-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row"><label>Title</label><input id="de-title-input" /></div>
+        <div class="form-row"><label>Tags</label><input id="de-tags" placeholder="comma-sep" /></div>
+        <div class="form-row"><label>Body (markdown)</label><textarea id="de-body" rows="14" style="font-family:monospace"></textarea></div>
+        <div id="de-version" style="color:var(--muted);font-size:12px"></div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button id="de-save" class="btn">Save</button>
+          <button id="de-delete" class="btn" style="background:#a33;color:#fff">Delete</button>
+          <button class="btn modal-close" data-close="doc-edit-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- New channel modal -->
+  <div id="new-channel-modal" class="modal" style="display:none">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span>New Channel</span>
+        <button class="modal-close" data-close="new-channel-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row"><label>Channel ID (slug)</label><input id="nc-id" placeholder="general" /></div>
+        <div class="form-row"><label>Display Name</label><input id="nc-name" placeholder="#general" /></div>
+        <div class="form-row"><label>Description</label><input id="nc-desc" placeholder="(optional)" /></div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button id="nc-create" class="btn">Create</button>
+          <button class="btn modal-close" data-close="new-channel-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Machines modal -->
+  <div id="machines-modal" class="modal" style="display:none">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <span>Machines</span>
+        <button class="modal-close" data-close="machines-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="machines-list"></div>
+        <button id="add-machine-btn" class="btn" style="margin-top:10px">Add Machine</button>
+      </div>
+      <!-- Machine form (hidden by default) -->
+      <div id="machine-form" style="display:none">
+        <div class="modal-header"><span id="machine-form-title">Add Machine</span></div>
+        <div class="modal-body">
+          <input type="hidden" id="mf-id" />
+          <div class="form-row"><label>Name</label><input id="mf-name" placeholder="prod-web-1" /></div>
+          <div class="form-row"><label>Alias</label><input id="mf-alias" placeholder="prod1" /></div>
+          <div class="form-row"><label>Host / IP</label><input id="mf-ip" placeholder="192.168.1.100" /></div>
+          <div class="form-row"><label>Port</label><input id="mf-port" type="number" value="22" /></div>
+          <div class="form-row"><label>Username</label><input id="mf-username" placeholder="root" /></div>
+          <div class="form-row"><label>Password</label><input id="mf-password" type="password" placeholder="(optional)" /></div>
+          <div class="form-row"><label>SSH Key Path</label><input id="mf-sshkey" placeholder="/root/.ssh/id_rsa" /></div>
+          <div class="form-row"><label>Passphrase</label><input id="mf-passphrase" type="password" placeholder="(optional)" /></div>
+          <div class="form-row"><label>Default Workdir</label><input id="mf-workdir" placeholder="/home/user/project" /></div>
+          <div class="form-row"><label>OS</label><input id="mf-os" placeholder="ubuntu-22.04" /></div>
+          <div class="form-row"><label>MAC Address</label><input id="mf-mac" placeholder="(optional)" /></div>
+          <div class="form-row"><label>Notes</label><input id="mf-notes" placeholder="(optional)" /></div>
+          <div id="mf-runtime-info" style="display:none;margin-top:12px;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:11px">
+            <div style="font-weight:600;margin-bottom:6px;color:var(--text)">Detected Info</div>
+            <div id="mf-runtime-content"></div>
+          </div>
+          <div style="display:flex;gap:8px;margin-top:12px">
+            <button id="mf-save" class="btn">Save</button>
+            <button id="mf-test" class="btn" style="background:var(--blue);color:#000">Test Connection</button>
+            <button id="mf-cancel" class="btn" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
+          </div>
+          <div id="mf-status" style="margin-top:8px;font-size:11px;color:var(--muted)"></div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- New session modal -->
+  <div id="new-session-modal" class="modal" style="display:none">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span>New Remote Session</span>
+        <button class="modal-close" data-close="new-session-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row"><label>Machine</label><select id="ns-machine"></select></div>
+        <div class="form-row"><label>Session Name</label><input id="ns-name" placeholder="my-session" /></div>
+        <div class="form-row"><label>Working Dir</label><input id="ns-workdir" placeholder="(uses machine default)" /></div>
+        <div class="form-row"><label>Role</label><input id="ns-role" placeholder="Backend Dev, CEO, QA" /></div>
+        <div class="form-row"><label>Screen Name</label><input id="ns-screen-name" placeholder="backend-alice" /></div>
+        <div class="form-row"><label>Interests (comma-sep)</label><input id="ns-interests" placeholder="backend, api, auth" /></div>
+        <div class="form-row"><label>Channels (comma-sep)</label><input id="ns-channels" placeholder="general, backend" /></div>
+        <div class="form-row"><label>Role Prompt</label><textarea id="ns-role-prompt" placeholder="System prompt for this role" rows="4"></textarea></div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button id="ns-create" class="btn">Create Session</button>
+          <button class="btn modal-close" data-close="new-session-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Session edit modal -->
+  <div id="session-edit-modal" class="modal" style="display:none">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span>Edit Session</span>
+        <button class="modal-close" data-close="session-edit-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="se-id" />
+        <div class="form-row"><label>Session ID</label><div id="se-session-id" style="font-size:11px;color:var(--accent);padding:4px 0;user-select:all"></div></div>
+        <div class="form-row"><label>Name</label><input id="se-name" placeholder="Session name" /></div>
+        <div class="form-row"><label>Role</label><input id="se-role" placeholder="Backend Dev, CEO, QA" /></div>
+        <div class="form-row"><label>Screen Name</label><input id="se-screen-name" placeholder="backend-alice" /></div>
+        <div class="form-row"><label>Interests (comma-sep)</label><input id="se-interests" placeholder="backend, api, auth" /></div>
+        <div class="form-row"><label>Channels (comma-sep)</label><input id="se-channels" placeholder="general, backend" /></div>
+        <div class="form-row"><label>Role Prompt</label><textarea id="se-role-prompt" placeholder="System prompt for this role" rows="4"></textarea></div>
+        <div class="form-row"><label>Model</label><select id="se-model"><option value="">default</option><option value="opus">opus</option><option value="sonnet">sonnet</option><option value="haiku">haiku</option><option value="opusplan">opusplan (plan=Opus, exec=Sonnet)</option></select></div>
+        <div class="form-row"><label>Working Dir</label><input id="se-workdir" placeholder="/path/to/project" disabled style="opacity:0.6" /></div>
+        <div class="form-row"><label>Machine</label><select id="se-machine" disabled style="opacity:0.6"></select></div>
+        <div id="se-claude-info" style="display:none;font-size:10px;color:var(--muted);margin-top:8px;word-break:break-all"></div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button id="se-save" class="btn">Save</button>
+          <button class="btn modal-close" data-close="session-edit-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+        <div id="se-status" style="margin-top:8px;font-size:11px;color:var(--muted)"></div>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>

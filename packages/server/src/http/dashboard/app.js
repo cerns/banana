@@ -1,0 +1,1514 @@
+/* global WebSocket, localStorage */
+
+const API = window.location.origin;
+const WS_URL = `${window.location.protocol === 'https:' ? 'wss' : 'ws'}://${window.location.host}`;
+
+let token = localStorage.getItem('banana_token') || '';
+let ws = null;
+let sessions = {};
+let activeSessionId = localStorage.getItem('banana_active_session') || null;
+let outputs = {};
+let unread = {}; // sessionId → true if has unread output
+let hubChannels = [];
+let hubMessages = {}; // channelId → HubMessage[]
+let activeChannelId = null;
+let hubVisible = false;
+let hubViewMode = 'messages'; // 'messages' | 'tasks' | 'docs'
+let channelTasks = {}; // channelId → ChannelTask[]
+let channelDocs = {}; // channelId → ChannelDoc[]
+let currentDocId = null;
+
+// ── DOM refs ──────────────────────────────────────────────────────────────────
+const authPanel = document.getElementById('auth-panel');
+const mainPanel = document.getElementById('main');
+const tokenInput = document.getElementById('token-input');
+const wsStatus = document.getElementById('ws-status');
+const sessionList = document.getElementById('session-list');
+const contentTitle = document.getElementById('content-title');
+const outputDiv = document.getElementById('output');
+const promptInput = document.getElementById('prompt-input');
+const sendBtn = document.getElementById('send-btn');
+const killBtn = document.getElementById('kill-btn');
+const stopBtn = document.getElementById('stop-btn');
+
+// ── localStorage output cache ─────────────────────────────────────────────────
+let _savePending = {};
+
+function saveOutputs(sessionId) {
+  // Debounce: save at most once per second per session
+  if (_savePending[sessionId]) return;
+  _savePending[sessionId] = true;
+  setTimeout(() => {
+    _savePending[sessionId] = false;
+    try {
+      if (outputs[sessionId]) {
+        localStorage.setItem(`banana_out_${sessionId}`, JSON.stringify(outputs[sessionId]));
+      }
+    } catch (e) {
+      // localStorage quota exceeded — not fatal
+    }
+  }, 1000);
+}
+
+function restoreOutputs(sessionId) {
+  if (outputs[sessionId]) return; // already in memory
+  try {
+    const raw = localStorage.getItem(`banana_out_${sessionId}`);
+    if (raw) outputs[sessionId] = JSON.parse(raw);
+  } catch (e) {
+    // corrupt cache — ignore
+  }
+}
+
+// ── Auth ───────────────────────────────────────────────────────────────────────
+if (token) tryConnect();
+else showAuth();
+
+function showAuth() {
+  authPanel.style.display = 'flex';
+  mainPanel.style.display = 'none';
+}
+
+function showMain() {
+  authPanel.style.display = 'none';
+  mainPanel.style.display = 'flex';
+  // Restore last active session from localStorage immediately (before API loads)
+  if (activeSessionId) {
+    restoreOutputs(activeSessionId);
+    if (outputs[activeSessionId]) {
+      updateInputState();
+      renderOutput();
+    }
+  }
+  setupPush();
+}
+
+// ── Notifications ─────────────────────────────────────────────────────────────
+function notify(title, body) {
+  const toast = document.createElement('div');
+  toast.className = 'toast';
+  toast.innerHTML = `<strong>${esc(title)}</strong><div class="toast-body">${esc(body)}</div>`;
+  document.body.appendChild(toast);
+  requestAnimationFrame(() => toast.classList.add('toast-show'));
+  setTimeout(() => {
+    toast.classList.remove('toast-show');
+    setTimeout(() => toast.remove(), 300);
+  }, 4000);
+}
+
+function urlBase64ToUint8Array(base64String) {
+  const padding = '='.repeat((4 - (base64String.length % 4)) % 4);
+  const base64 = (base64String + padding).replace(/-/g, '+').replace(/_/g, '/');
+  const raw = atob(base64);
+  return Uint8Array.from(raw, c => c.charCodeAt(0));
+}
+
+const pushBanner = document.getElementById('push-banner');
+
+function showPushBanner(html, onclick) {
+  pushBanner.innerHTML = html;
+  pushBanner.style.display = 'block';
+  if (onclick) pushBanner.querySelector('button')?.addEventListener('click', onclick);
+}
+
+function hidePushBanner() {
+  pushBanner.style.display = 'none';
+}
+
+async function setupPush() {
+  console.log('[push] setupPush — serviceWorker:', 'serviceWorker' in navigator, '— PushManager:', 'PushManager' in window, '— Notification:', typeof Notification !== 'undefined' ? Notification.permission : 'unavailable');
+
+  if (!('serviceWorker' in navigator)) { console.warn('[push] serviceWorker not supported'); return; }
+  if (!('PushManager' in window))      { console.warn('[push] PushManager not supported'); return; }
+  if (typeof Notification === 'undefined') { console.warn('[push] Notification API not available'); return; }
+
+  const permission = Notification.permission;
+  console.log('[push] Current permission:', permission);
+
+  if (permission === 'denied') {
+    showPushBanner(
+      `<span>🔕 Notifications are blocked for this site.</span>
+       <strong>To fix:</strong> click the 🔒 icon in the address bar → Permissions → Notifications → Allow, then reload.`,
+      null
+    );
+    return;
+  }
+
+  if (permission === 'default') {
+    // Must wait for a user gesture before calling requestPermission in Firefox
+    showPushBanner(
+      `<span>🔔 Enable push notifications to get alerted when Claude finishes.</span>
+       <button class="btn btn-sm">Enable notifications</button>`,
+      () => doSubscribe()
+    );
+    return;
+  }
+
+  // permission === 'granted' — subscribe silently, no banner needed
+  await doSubscribe();
+}
+
+async function doSubscribe() {
+  hidePushBanner();
+  try {
+    console.log('[push] Requesting permission…');
+    const permission = await Notification.requestPermission();
+    console.log('[push] Permission result:', permission);
+
+    if (permission !== 'granted') {
+      showPushBanner(
+        `<span>🔕 Notifications not granted (${permission}). Click the 🔒 icon → Notifications → Allow, then reload.</span>`,
+        null
+      );
+      return;
+    }
+
+    console.log('[push] Registering service worker…');
+    const reg = await navigator.serviceWorker.register('/sw.js');
+    await navigator.serviceWorker.ready;
+    console.log('[push] Service worker ready');
+
+    const { publicKey } = await apiFetch('/api/push/vapid-key');
+    console.log('[push] Got VAPID public key');
+
+    // Re-subscribe if VAPID key changed
+    const existing = await reg.pushManager.getSubscription();
+    const storedKey = localStorage.getItem('banana_vapid_key');
+    if (existing && storedKey !== publicKey) {
+      console.log('[push] VAPID key changed — unsubscribing old subscription');
+      await existing.unsubscribe();
+    }
+
+    const sub = (storedKey === publicKey && existing)
+      ? existing
+      : await reg.pushManager.subscribe({ userVisibleOnly: true, applicationServerKey: urlBase64ToUint8Array(publicKey) });
+
+    localStorage.setItem('banana_vapid_key', publicKey);
+    await apiFetch('/api/push/subscribe', { method: 'POST', body: JSON.stringify(sub.toJSON()) });
+    console.log('[push] ✅ Subscribed successfully');
+  } catch (e) {
+    console.error('[push] Subscribe failed:', e);
+    showPushBanner(
+      `<span>❌ Push setup failed: ${esc(String(e))}. <button class="btn btn-sm">Retry</button></span>`,
+      () => doSubscribe()
+    );
+  }
+}
+
+document.getElementById('auth-btn').addEventListener('click', () => {
+  token = tokenInput.value.trim();
+  if (!token) return;
+  localStorage.setItem('banana_token', token);
+  tryConnect();
+});
+tokenInput.addEventListener('keydown', e => { if (e.key === 'Enter') document.getElementById('auth-btn').click(); });
+
+// ── WebSocket ──────────────────────────────────────────────────────────────────
+function tryConnect() {
+  ws = new WebSocket(WS_URL);
+  ws.addEventListener('open', () => ws.send(JSON.stringify({ type: 'DASHBOARD_CONNECT', token })));
+  ws.addEventListener('message', e => {
+    let msg;
+    try { msg = JSON.parse(e.data); } catch { return; }
+    if (msg.type === 'DASHBOARD_ACK') { showMain(); setStatus('connected'); loadSessions(); return; }
+    if (msg.type === 'DASHBOARD_REJECT') { alert('Invalid token'); localStorage.removeItem('banana_token'); showAuth(); return; }
+    if (msg.type === 'DASHBOARD_EVENT') handleEvent(msg);
+    if (msg.type === 'DASHBOARD_EVENT' && msg.event === 'HUB_MESSAGE') handleHubEvent(msg);
+  });
+  ws.addEventListener('close', () => { setStatus('disconnected'); setTimeout(tryConnect, 3000); });
+  ws.addEventListener('error', () => setStatus('disconnected'));
+}
+
+function setStatus(s) {
+  wsStatus.textContent = s === 'connected' ? '● connected' : '○ disconnected';
+  wsStatus.className = s;
+}
+
+// ── Unread tracking ──────────────────────────────────────────────────────────
+let _unreadRenderPending = false;
+
+function markUnread(sessionId) {
+  if (sessionId === activeSessionId) return;
+  if (unread[sessionId]) return; // already marked, skip sidebar rebuild
+  unread[sessionId] = true;
+  // Debounce sidebar re-renders from unread changes
+  if (!_unreadRenderPending) {
+    _unreadRenderPending = true;
+    requestAnimationFrame(() => {
+      _unreadRenderPending = false;
+      renderSidebar();
+    });
+  }
+}
+
+function markRead(sessionId) {
+  if (unread[sessionId]) {
+    delete unread[sessionId];
+    // Just remove the dot instead of full sidebar rebuild
+    const item = sessionList.querySelector(`.session-item[data-id="${sessionId}"] .unread-dot`);
+    if (item) item.remove();
+  }
+}
+
+// ── Events from server ────────────────────────────────────────────────────────
+function handleEvent(msg) {
+  const { event, sessionId } = msg;
+
+  if (event === 'SESSION_CONNECTED') {
+    sessions[sessionId] = { sessionId, clientId: msg.clientId, hostname: msg.hostname, workdir: msg.workdir, status: 'connected' };
+    renderSidebar();
+    if (sessionId === activeSessionId) updateInputState();
+    return;
+  }
+
+  if (event === 'SESSION_DISCONNECTED') {
+    if (sessions[sessionId]) sessions[sessionId].status = 'disconnected';
+    renderSidebar();
+    if (sessionId === activeSessionId) updateInputState();
+    return;
+  }
+
+  if (event === 'OUTPUT_CHUNK') {
+    ensureOutput(sessionId, msg.jobId);
+    outputs[sessionId][msg.jobId].chunks.push(msg.chunk);
+    saveOutputs(sessionId);
+    markUnread(sessionId);
+    if (sessionId === activeSessionId) renderOutput();
+    return;
+  }
+
+  if (event === 'OUTPUT_DONE') {
+    ensureOutput(sessionId, msg.jobId);
+    outputs[sessionId][msg.jobId].done = true;
+    outputs[sessionId][msg.jobId].exitCode = msg.exitCode;
+    saveOutputs(sessionId);
+    markUnread(sessionId);
+    if (sessionId === activeSessionId) { renderOutput(); updateInputState(); }
+    const s = sessions[sessionId];
+    const host = s?.hostname ?? sessionId.slice(0, 8);
+    const folder = s?.workdir?.split('/').pop() ?? '';
+    const dur = fmtDuration(msg.durationMs ?? 0);
+    const prompt = outputs[sessionId][msg.jobId].prompt.slice(0, 80);
+    const title = msg.exitCode === 0
+      ? `✅ ${host} finished in ${dur}`
+      : `⚠️ ${host} failed · exit ${msg.exitCode} · ${dur}`;
+    notify(title, `${folder} · "${prompt}"`);
+    return;
+  }
+
+  if (event === 'OUTPUT_ERROR') {
+    ensureOutput(sessionId, msg.jobId);
+    outputs[sessionId][msg.jobId].error = msg.error;
+    saveOutputs(sessionId);
+    markUnread(sessionId);
+    if (sessionId === activeSessionId) { renderOutput(); updateInputState(); }
+    const s = sessions[sessionId];
+    const host = s?.hostname ?? sessionId.slice(0, 8);
+    const folder = s?.workdir?.split('/').pop() ?? '';
+    notify(`❌ ${host} couldn't start`, `${folder} · ${String(msg.error).slice(0, 100)}`);
+    return;
+  }
+}
+
+function ensureOutput(sessionId, jobId) {
+  if (!outputs[sessionId]) outputs[sessionId] = {};
+  if (!outputs[sessionId][jobId]) {
+    outputs[sessionId][jobId] = { prompt: jobId, chunks: [], done: false };
+  }
+}
+
+// ── REST helpers ──────────────────────────────────────────────────────────────
+async function apiFetch(path, opts = {}) {
+  const res = await fetch(API + path, {
+    ...opts,
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json', ...(opts.headers || {}) },
+  });
+  return res.json();
+}
+
+async function loadSessions() {
+  const data = await apiFetch('/api/sessions');
+  if (!Array.isArray(data)) return;
+  for (const s of data) sessions[s.sessionId] = s;
+  renderSidebar();
+
+  if (activeSessionId) {
+    // Always try to sync the active session from server (even if it's in sessions map or not)
+    await selectSession(activeSessionId);
+  } else if (data.length === 1) {
+    await selectSession(data[0].sessionId);
+  }
+}
+
+// ── Sidebar ───────────────────────────────────────────────────────────────────
+function renderSidebar() {
+  const items = Object.values(sessions).sort((a, b) => (b.connectedAt || '').localeCompare(a.connectedAt || ''));
+  document.getElementById('session-count').textContent = items.length ? `(${items.length})` : '';
+  if (items.length === 0) {
+    sessionList.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:11px;">No sessions yet</div>';
+    return;
+  }
+  sessionList.innerHTML = items.map(s => {
+    const displayName = s.name || s.hostname || '?';
+    const hasUnread = unread[s.sessionId];
+    return `
+    <div class="session-item ${s.sessionId === activeSessionId ? 'active' : ''}" data-id="${s.sessionId}">
+      <div class="session-top-row">
+        <div class="session-name-row">
+          ${s.name ? `<span class="session-name">${esc(s.name)}</span>` : `<span class="session-host-name">${esc(displayName)}</span>`}
+          ${hasUnread ? '<span class="unread-dot"></span>' : ''}
+        </div>
+        <button class="session-edit-btn" data-edit-session="${s.sessionId}" title="Edit session">&#9998;</button>
+      </div>
+      <div class="session-id">${s.sessionId.slice(0, 8)}${s.screenName ? ` · ${esc(s.screenName)}` : ''}</div>
+      ${s.role ? `<div class="session-role-badge">${esc(s.role)}</div>` : ''}
+      ${s.name ? `<div class="session-host">${esc(s.hostname || '')}</div>` : ''}
+      <div class="session-dir">${esc(s.workdir || s.remoteWorkdir || '')}</div>
+    </div>`;
+  }).join('');
+  sessionList.querySelectorAll('.session-item').forEach(el => {
+    el.addEventListener('click', (e) => {
+      // Don't select session when clicking edit button
+      if (e.target.closest('.session-edit-btn')) return;
+      selectSession(el.dataset.id);
+    });
+  });
+  sessionList.querySelectorAll('.session-edit-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openSessionEditModal(btn.dataset.editSession);
+    });
+  });
+}
+
+function buildContentTitle(s, id) {
+  const name = s?.name;
+  const prefix = id.slice(0, 8);
+  const host = s?.hostname || '?';
+  const dir = s?.workdir || s?.remoteWorkdir || '';
+  return name ? `${name} — ${prefix}` : `${prefix} — ${host} ${dir}`;
+}
+
+async function selectSession(id) {
+  activeSessionId = id;
+  localStorage.setItem('banana_active_session', id);
+  markRead(id);
+  _lastRenderedJobKey = ''; // force full re-render on session switch
+
+  // 1. Restore from localStorage immediately — zero-latency render
+  restoreOutputs(id);
+  const s = sessions[id];
+  contentTitle.textContent = buildContentTitle(s, id);
+  killBtn.style.display = 'inline-block';
+  renderSidebar();
+  updateInputState();
+  renderOutput();
+
+  // 2. Fetch full history from API and merge (server is source of truth)
+  try {
+    const detail = await apiFetch(`/api/sessions/${id}`);
+    if (detail && Array.isArray(detail.jobs)) {
+      if (!sessions[id] && detail.sessionId) {
+        sessions[id] = detail;
+      } else if (sessions[id]) {
+        // Merge server metadata into local copy
+        Object.assign(sessions[id], {
+          name: detail.name, type: detail.type, machineId: detail.machineId,
+          claudeSessionId: detail.claudeSessionId, remoteWorkdir: detail.remoteWorkdir,
+          hostname: detail.hostname, workdir: detail.workdir, status: detail.status,
+        });
+      }
+      contentTitle.textContent = buildContentTitle(sessions[id], id);
+      renderSidebar();
+      if (!outputs[id]) outputs[id] = {};
+      for (const job of detail.jobs) {
+        outputs[id][job.jobId] = {
+          prompt: job.prompt,
+          chunks: job.chunks || [],
+          done: job.finishedAt != null,
+          exitCode: job.exitCode,
+          error: job.error,
+        };
+      }
+      saveOutputs(id);
+      updateInputState();
+      renderOutput();
+    }
+  } catch (e) {
+    console.error('Failed to load session history', e);
+  }
+}
+
+// ── Input state ───────────────────────────────────────────────────────────────
+function isJobRunning() {
+  const jobs = outputs[activeSessionId];
+  if (!jobs) return false;
+  return Object.values(jobs).some(j => !j.done && !j.error);
+}
+
+function updateInputState() {
+  promptInput.disabled = false;
+  sendBtn.disabled = false;
+  promptInput.placeholder = 'Send a prompt...';
+  const running = isJobRunning();
+  stopBtn.style.display = running ? 'inline-block' : 'none';
+}
+
+// ── Output ────────────────────────────────────────────────────────────────────
+let _renderPending = false;
+let _lastRenderedJobKey = ''; // tracks which jobs we've already built DOM for
+
+function renderOutput() {
+  // Throttle: during streaming, limit to ~10 renders/sec
+  if (_renderPending) return;
+  _renderPending = true;
+  requestAnimationFrame(() => {
+    _renderPending = false;
+    _doRenderOutput();
+  });
+}
+
+function _doRenderOutput() {
+  const jobs = outputs[activeSessionId];
+  if (!jobs || Object.keys(jobs).length === 0) {
+    outputDiv.innerHTML = '<div class="empty-state"><div class="big">🍌</div><div>No output yet</div></div>';
+    _lastRenderedJobKey = '';
+    return;
+  }
+
+  const entries = Object.entries(jobs);
+  const jobKey = activeSessionId + ':' + entries.map(e => e[0]).join(',');
+
+  // If the set of jobs hasn't changed, do an incremental update on the last job
+  if (jobKey === _lastRenderedJobKey && entries.length > 0) {
+    const [jobId, job] = entries[entries.length - 1];
+    const block = document.getElementById('job-' + jobId);
+    if (block) {
+      // Update status in header
+      const statusEl = block.querySelector('.job-status');
+      if (statusEl) statusEl.innerHTML = _jobStatus(job);
+      // Update body content
+      const body = block.querySelector('.output-body');
+      if (body) {
+        const wasAtBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 30;
+        body.innerHTML = renderChunks(job.chunks) || '<span style="color:var(--muted);font-size:11px;">(no output)</span>';
+        if (wasAtBottom) body.scrollTop = body.scrollHeight;
+      }
+      // Keep outer scroll at bottom if it was there
+      const outerAtBottom = outputDiv.scrollHeight - outputDiv.scrollTop - outputDiv.clientHeight < 50;
+      if (outerAtBottom) outputDiv.scrollTop = outputDiv.scrollHeight;
+      return;
+    }
+  }
+
+  // Full render (new jobs or first render)
+  const html = entries.map(([jobId, job]) => `
+    <div class="output-block" id="job-${jobId}">
+      <div class="output-header">
+        <span class="job-id">${jobId.slice(0, 8)}</span>
+        <span class="job-prompt">${esc(job.prompt)}</span>
+        <span class="job-status">${_jobStatus(job)}</span>
+      </div>
+      <div class="output-body">${renderChunks(job.chunks) || '<span style="color:var(--muted);font-size:11px;">(no output)</span>'}</div>
+    </div>`).join('');
+
+  outputDiv.innerHTML = html;
+  _lastRenderedJobKey = jobKey;
+
+  // Scroll outer container and last job body to bottom
+  outputDiv.scrollTop = outputDiv.scrollHeight;
+  const bodies = outputDiv.querySelectorAll('.output-body');
+  if (bodies.length) {
+    const lastBody = bodies[bodies.length - 1];
+    lastBody.scrollTop = lastBody.scrollHeight;
+  }
+}
+
+function _jobStatus(job) {
+  if (job.error) return `<span style="color:var(--red)">error: ${esc(job.error)}</span>`;
+  if (job.done)  return `<span style="color:var(--green)">done (exit ${job.exitCode ?? 0})</span>`;
+  return `<span style="color:var(--accent)">running…</span>`;
+}
+
+function renderChunks(chunks) {
+  return chunks.map(c => {
+    if (!c || typeof c !== 'object') return '';
+
+    // ── stream_event (Claude streaming API envelope) ────────────────────
+    if (c.type === 'stream_event') {
+      const evt = c.event;
+      if (!evt) return '';
+      if (evt.type === 'content_block_delta') {
+        const d = evt.delta;
+        if (d?.type === 'text_delta' && d.text) return `<span class="chunk-text">${esc(d.text)}</span>`;
+        if (d?.type === 'input_json_delta' && d.partial_json) return `<span class="chunk-tool">${esc(d.partial_json)}</span>`;
+        return '';
+      }
+      if (evt.type === 'content_block_start') {
+        const cb = evt.content_block;
+        if (cb?.type === 'tool_use') return `<span class="chunk-tool">\n⚙ ${esc(cb.name)}(</span>`;
+        return '';
+      }
+      if (evt.type === 'content_block_stop') {
+        return `<span class="chunk-tool">)</span>\n`;
+      }
+      // message_start, message_delta, message_stop, ping — skip
+      return '';
+    }
+
+    // ── assistant (full message snapshot) ───────────────────────────────
+    if (c.type === 'assistant') {
+      const content = c.message?.content;
+      if (!Array.isArray(content)) return '';
+      return content.map(b => {
+        if (b.type === 'text') return `<span class="chunk-text">${esc(b.text)}</span>`;
+        if (b.type === 'tool_use') return `<span class="chunk-tool">\n⚙ ${esc(b.name)}(${esc(JSON.stringify(b.input))})</span>\n`;
+        return '';
+      }).join('');
+    }
+    if (c.type === 'tool_result') return `<span class="chunk-result">\n→ ${esc(JSON.stringify(c.content)).slice(0, 200)}</span>\n`;
+    if (c.type === 'result') return c.is_error ? `<span class="chunk-stderr">Error: ${esc(c.result || '')}</span>` : '';
+    if (c.type === 'system') return '';
+    if (c.type === 'stderr') return `<span class="chunk-stderr">${esc(c.text)}</span>`;
+    return `<span class="chunk-raw">${esc(JSON.stringify(c))}</span>`;
+  }).join('');
+}
+
+// ── Actions ───────────────────────────────────────────────────────────────────
+sendBtn.addEventListener('click', sendPrompt);
+promptInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); } });
+
+async function sendPrompt() {
+  const prompt = promptInput.value.trim();
+  if (!prompt || !activeSessionId) return;
+  promptInput.value = '';
+  const data = await apiFetch(`/api/sessions/${activeSessionId}/send`, {
+    method: 'POST',
+    body: JSON.stringify({ prompt }),
+  });
+  if (data.jobId) {
+    if (!outputs[activeSessionId]) outputs[activeSessionId] = {};
+    outputs[activeSessionId][data.jobId] = { prompt, chunks: [], done: false };
+    saveOutputs(activeSessionId);
+    updateInputState();
+    renderOutput();
+  }
+}
+
+// ── Stop (abort running job) ──────────────────────────────────────────────────
+stopBtn.addEventListener('click', stopJob);
+
+async function stopJob() {
+  if (!activeSessionId || !isJobRunning()) return;
+  stopBtn.disabled = true;
+  stopBtn.textContent = 'Stopping…';
+  await apiFetch(`/api/sessions/${activeSessionId}/abort`, { method: 'POST' });
+  stopBtn.disabled = false;
+  stopBtn.textContent = 'Stop';
+  // The OUTPUT_DONE/ERROR event from the server will update the UI via handleEvent
+}
+
+killBtn.addEventListener('click', async () => {
+  if (!activeSessionId) return;
+  if (!confirm(`Kill session ${activeSessionId.slice(0, 8)}?`)) return;
+  await apiFetch(`/api/sessions/${activeSessionId}`, { method: 'DELETE' });
+  localStorage.removeItem(`banana_out_${activeSessionId}`);
+  delete sessions[activeSessionId];
+  activeSessionId = null;
+  localStorage.removeItem('banana_active_session');
+  contentTitle.textContent = 'Select a session';
+  killBtn.style.display = 'none';
+  renderSidebar();
+  outputDiv.innerHTML = '<div class="empty-state"><div class="big">🍌</div><div>Select a session</div></div>';
+});
+
+// ── Utils ─────────────────────────────────────────────────────────────────────
+function fmtDuration(ms) {
+  const s = Math.round(ms / 1000);
+  return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
+}
+
+function esc(str) {
+  return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// ── Modal helpers ─────────────────────────────────────────────────────────────
+function openModal(id) { document.getElementById(id).style.display = 'flex'; }
+function closeModal(id) { document.getElementById(id).style.display = 'none'; }
+
+document.querySelectorAll('.modal-close').forEach(btn => {
+  btn.addEventListener('click', () => closeModal(btn.dataset.close));
+});
+document.querySelectorAll('.modal').forEach(modal => {
+  modal.addEventListener('click', e => { if (e.target === modal) modal.style.display = 'none'; });
+});
+
+// ── Session Edit Modal ───────────────────────────────────────────────────────
+async function openSessionEditModal(sessionId) {
+  const s = sessions[sessionId];
+  if (!s) return;
+  if (machines.length === 0) await loadMachines();
+  document.getElementById('se-id').value = sessionId;
+  document.getElementById('se-session-id').textContent = sessionId;
+  document.getElementById('se-name').value = s.name || '';
+  document.getElementById('se-role').value = s.role || '';
+  document.getElementById('se-screen-name').value = s.screenName || '';
+  document.getElementById('se-interests').value = (s.interests || []).join(', ');
+  document.getElementById('se-channels').value = (s.channels || []).join(', ');
+  document.getElementById('se-role-prompt').value = s.rolePrompt || '';
+  document.getElementById('se-model').value = s.model || '';
+  document.getElementById('se-workdir').value = s.remoteWorkdir || s.workdir || '';
+
+  // Populate machine dropdown
+  const sel = document.getElementById('se-machine');
+  sel.innerHTML = '<option value="">(none)</option>' +
+    machines.map(m => `<option value="${m.id}" ${m.id === s.machineId ? 'selected' : ''}>${esc(m.name)} (${esc(m.alias)})</option>`).join('');
+
+  // Show claude session id if available
+  const claudeInfo = document.getElementById('se-claude-info');
+  if (s.claudeSessionId) {
+    claudeInfo.style.display = 'block';
+    claudeInfo.textContent = `Claude session: ${s.claudeSessionId}`;
+  } else {
+    claudeInfo.style.display = 'none';
+  }
+
+  document.getElementById('se-status').textContent = '';
+  openModal('session-edit-modal');
+}
+
+document.getElementById('se-save').addEventListener('click', async () => {
+  const sessionId = document.getElementById('se-id').value;
+  const name = document.getElementById('se-name').value.trim();
+  const role = document.getElementById('se-role').value.trim();
+  const screenName = document.getElementById('se-screen-name').value.trim();
+  const interests = document.getElementById('se-interests').value.split(',').map(s => s.trim()).filter(Boolean);
+  const channels = document.getElementById('se-channels').value.split(',').map(s => s.trim()).filter(Boolean);
+  const rolePrompt = document.getElementById('se-role-prompt').value.trim();
+  const model = document.getElementById('se-model').value;
+
+  const patchBody = { name, role, screenName, interests, channels, rolePrompt, model };
+  await apiFetch(`/api/sessions/${sessionId}`, {
+    method: 'PATCH',
+    body: JSON.stringify(patchBody),
+  });
+
+  if (sessions[sessionId]) {
+    Object.assign(sessions[sessionId], { name, role, screenName, interests, channels, rolePrompt, model });
+  }
+
+  renderSidebar();
+  if (sessionId === activeSessionId) {
+    contentTitle.textContent = buildContentTitle(sessions[sessionId], sessionId);
+  }
+
+  closeModal('session-edit-modal');
+});
+
+// ── Header model selector ─────────────────────────────────────────────────────
+// Persists in localStorage. Used as the default `model` for newly created
+// sessions; existing sessions keep their stored model unless edited.
+(function initModelSelect() {
+  const sel = document.getElementById('model-select');
+  if (!sel) return;
+  sel.value = localStorage.getItem('banana_model') || '';
+  sel.addEventListener('change', () => {
+    localStorage.setItem('banana_model', sel.value);
+  });
+})();
+
+// ── Machine Management ────────────────────────────────────────────────────────
+let machines = [];
+
+document.getElementById('machines-btn').addEventListener('click', () => {
+  loadMachines();
+  openModal('machines-modal');
+});
+
+async function loadMachines() {
+  machines = await apiFetch('/api/machines');
+  if (!Array.isArray(machines)) machines = [];
+  renderMachinesList();
+}
+
+function renderMachinesList() {
+  const list = document.getElementById('machines-list');
+  if (machines.length === 0) {
+    list.innerHTML = '<div style="color:var(--muted);font-size:11px;">No machines configured</div>';
+    return;
+  }
+  list.innerHTML = machines.map(m => {
+    const rtBadges = (m.runtimes && m.runtimes.length > 0)
+      ? m.runtimes.map(r => `<span class="rt-badge rt-${r.runtime}">${esc(r.runtime)} ${esc(r.version)}</span>`).join(' ')
+      : '<span class="rt-badge rt-unknown">not detected</span>';
+    const claudeBadge = m.claudePath
+      ? `<span class="rt-badge rt-node">claude</span>`
+      : '';
+    const si = m.systemInfo || {};
+    const sysLine = si.os
+      ? `${esc(si.os)} | ${esc(si.cpu || '?')} (${si.cpuCores || '?'} cores) | RAM ${esc(si.memoryTotal || '?')} | Disk ${esc(si.diskUsed || '?')}/${esc(si.diskTotal || '?')}`
+      : '';
+    return `
+    <div class="machine-row">
+      <div class="machine-info">
+        <div class="machine-top">
+          <span class="machine-name">${esc(m.name)}</span>
+          <span class="machine-alias">${esc(m.alias)}</span>
+          <span class="machine-host">${esc(m.username)}@${esc(m.ip)}:${m.port}</span>
+        </div>
+        ${sysLine ? `<div class="machine-sys">${sysLine}</div>` : ''}
+      </div>
+      <span class="machine-runtimes">${rtBadges} ${claudeBadge}</span>
+      <button class="btn btn-sm btn-setup" data-setup="${m.id}">Setup</button>
+      <button class="btn btn-sm" data-detect="${m.id}">Detect</button>
+      <button class="btn btn-sm" data-edit="${m.id}">Edit</button>
+      <button class="btn btn-sm btn-danger" data-del="${m.id}">Del</button>
+    </div>`;
+  }).join('');
+  list.querySelectorAll('[data-setup]').forEach(btn => {
+    btn.addEventListener('click', () => setupMachine(btn.dataset.setup));
+  });
+  list.querySelectorAll('[data-detect]').forEach(btn => {
+    btn.addEventListener('click', () => detectMachineRuntimes(btn.dataset.detect));
+  });
+  list.querySelectorAll('[data-edit]').forEach(btn => {
+    btn.addEventListener('click', () => editMachine(btn.dataset.edit));
+  });
+  list.querySelectorAll('[data-del]').forEach(btn => {
+    btn.addEventListener('click', () => deleteMachine(btn.dataset.del));
+  });
+}
+
+function showMachineForm(machine) {
+  document.getElementById('machine-form').style.display = 'block';
+  document.getElementById('machine-form-title').textContent = machine ? 'Edit Machine' : 'Add Machine';
+  document.getElementById('mf-id').value = machine?.id || '';
+  document.getElementById('mf-name').value = machine?.name || '';
+  document.getElementById('mf-alias').value = machine?.alias || '';
+  document.getElementById('mf-ip').value = machine?.ip || '';
+  document.getElementById('mf-port').value = machine?.port || 22;
+  document.getElementById('mf-username').value = machine?.username || '';
+  document.getElementById('mf-password').value = '';
+  document.getElementById('mf-sshkey').value = machine?.sshKeyPath || '';
+  document.getElementById('mf-passphrase').value = '';
+  document.getElementById('mf-workdir').value = machine?.defaultWorkdir || '';
+  document.getElementById('mf-os').value = machine?.os || '';
+  document.getElementById('mf-mac').value = machine?.macAddress || '';
+  document.getElementById('mf-notes').value = machine?.notes || '';
+  document.getElementById('mf-status').textContent = '';
+
+  // Show runtime/system info if available
+  const infoPanel = document.getElementById('mf-runtime-info');
+  const infoContent = document.getElementById('mf-runtime-content');
+  const hasInfo = machine && (machine.runtimes?.length || machine.claudePath || machine.systemInfo?.os);
+  if (hasInfo) {
+    const lines = [];
+    const si = machine.systemInfo || {};
+    if (si.os) lines.push(`<div><strong>OS:</strong> ${esc(si.os)}${si.kernel ? ` (${esc(si.kernel)})` : ''}</div>`);
+    if (si.cpu) lines.push(`<div><strong>CPU:</strong> ${esc(si.cpu)} (${si.cpuCores || '?'} cores)</div>`);
+    if (si.memoryTotal) lines.push(`<div><strong>RAM:</strong> ${esc(si.memoryTotal)}</div>`);
+    if (si.diskTotal) lines.push(`<div><strong>Disk:</strong> ${esc(si.diskUsed || '?')} / ${esc(si.diskTotal)}</div>`);
+    if (machine.runtimes?.length) {
+      const rts = machine.runtimes.map(r => `${esc(r.runtime)} ${esc(r.version)} <span style="color:var(--muted)">(${esc(r.path)})</span>`).join(', ');
+      lines.push(`<div><strong>Runtimes:</strong> ${rts}</div>`);
+    }
+    if (machine.claudePath) lines.push(`<div><strong>Claude:</strong> ${esc(machine.claudePath)}</div>`);
+    if (machine.runtimeDetectedAt) lines.push(`<div style="color:var(--muted);margin-top:4px">Detected: ${new Date(machine.runtimeDetectedAt).toLocaleString()}</div>`);
+    infoContent.innerHTML = lines.join('');
+    infoPanel.style.display = 'block';
+  } else {
+    infoPanel.style.display = 'none';
+  }
+}
+
+function hideMachineForm() {
+  document.getElementById('machine-form').style.display = 'none';
+}
+
+document.getElementById('add-machine-btn').addEventListener('click', () => showMachineForm(null));
+document.getElementById('mf-cancel').addEventListener('click', hideMachineForm);
+
+function editMachine(id) {
+  const m = machines.find(x => x.id === id);
+  if (m) showMachineForm(m);
+}
+
+async function detectMachineRuntimes(id) {
+  const btn = document.querySelector(`[data-detect="${id}"]`);
+  if (btn) { btn.textContent = 'Detecting…'; btn.disabled = true; }
+  try {
+    await apiFetch(`/api/machines/${id}/detect`, { method: 'POST' });
+    await loadMachines();
+  } catch (e) {
+    console.error('Detection failed', e);
+  }
+  if (btn) { btn.textContent = 'Detect'; btn.disabled = false; }
+}
+
+async function setupMachine(id) {
+  const btn = document.querySelector(`[data-setup="${id}"]`);
+  if (btn) { btn.textContent = 'Setting up…'; btn.disabled = true; }
+  try {
+    const res = await apiFetch(`/api/machines/${id}/setup`, { method: 'POST' });
+    if (res.error) {
+      notify('Setup failed', res.error);
+    } else {
+      const steps = res.steps || [];
+      const summary = steps.map(s => `${s.phase}: ${s.message}`).join('\n');
+      notify('Setup complete', summary.slice(0, 200));
+    }
+    await loadMachines();
+  } catch (e) {
+    console.error('Setup failed', e);
+    notify('Setup error', String(e));
+  }
+  if (btn) { btn.textContent = 'Setup'; btn.disabled = false; }
+}
+
+async function deleteMachine(id) {
+  if (!confirm('Delete this machine?')) return;
+  await apiFetch(`/api/machines/${id}`, { method: 'DELETE' });
+  await loadMachines();
+}
+
+document.getElementById('mf-save').addEventListener('click', async () => {
+  const id = document.getElementById('mf-id').value;
+  const body = {
+    name: document.getElementById('mf-name').value,
+    alias: document.getElementById('mf-alias').value,
+    ip: document.getElementById('mf-ip').value,
+    port: parseInt(document.getElementById('mf-port').value) || 22,
+    username: document.getElementById('mf-username').value,
+    sshKeyPath: document.getElementById('mf-sshkey').value || undefined,
+    defaultWorkdir: document.getElementById('mf-workdir').value || undefined,
+    os: document.getElementById('mf-os').value || undefined,
+    macAddress: document.getElementById('mf-mac').value || undefined,
+    notes: document.getElementById('mf-notes').value || undefined,
+  };
+  const pw = document.getElementById('mf-password').value;
+  if (pw) body.password = pw;
+  const pp = document.getElementById('mf-passphrase').value;
+  if (pp) body.passphrase = pp;
+
+  if (!body.name || !body.ip || !body.username) {
+    document.getElementById('mf-status').textContent = 'Name, Host, and Username are required';
+    return;
+  }
+
+  if (id) {
+    await apiFetch(`/api/machines/${id}`, { method: 'PUT', body: JSON.stringify(body) });
+  } else {
+    await apiFetch('/api/machines', { method: 'POST', body: JSON.stringify(body) });
+  }
+  hideMachineForm();
+  await loadMachines();
+});
+
+document.getElementById('mf-test').addEventListener('click', async () => {
+  const id = document.getElementById('mf-id').value;
+  const status = document.getElementById('mf-status');
+  if (!id) { status.textContent = 'Save the machine first before testing'; return; }
+  status.textContent = 'Testing…';
+  status.style.color = 'var(--muted)';
+  const res = await apiFetch(`/api/machines/${id}/test`, { method: 'POST' });
+  if (res.ok) {
+    status.textContent = `Connected: ${res.output}`;
+    status.style.color = 'var(--green)';
+    // Refresh machine list to show detected runtimes
+    await loadMachines();
+  } else {
+    status.textContent = `Failed: ${res.error}`;
+    status.style.color = 'var(--red)';
+  }
+});
+
+// ── New Remote Session ────────────────────────────────────────────────────────
+document.getElementById('new-session-btn').addEventListener('click', async () => {
+  await loadMachines();
+  const sel = document.getElementById('ns-machine');
+  sel.innerHTML = machines.length === 0
+    ? '<option value="">No machines — add one first</option>'
+    : machines.map(m => `<option value="${m.id}">${esc(m.name)} (${esc(m.alias)})</option>`).join('');
+  document.getElementById('ns-name').value = '';
+  document.getElementById('ns-workdir').value = '';
+  openModal('new-session-modal');
+});
+
+document.getElementById('ns-create').addEventListener('click', async () => {
+  const machineId = document.getElementById('ns-machine').value;
+  if (!machineId) return;
+  const name = document.getElementById('ns-name').value.trim();
+  const workdir = document.getElementById('ns-workdir').value.trim();
+  const role = document.getElementById('ns-role').value.trim();
+  const screenName = document.getElementById('ns-screen-name').value.trim();
+  const interests = document.getElementById('ns-interests').value.split(',').map(s => s.trim()).filter(Boolean);
+  const channels = document.getElementById('ns-channels').value.split(',').map(s => s.trim()).filter(Boolean);
+  const rolePrompt = document.getElementById('ns-role-prompt').value.trim();
+  const body = { machineId };
+  if (name) body.name = name;
+  if (workdir) body.workdir = workdir;
+  if (role) body.role = role;
+  if (screenName) body.screenName = screenName;
+  if (interests.length) body.interests = interests;
+  if (channels.length) body.channels = channels;
+  if (rolePrompt) body.rolePrompt = rolePrompt;
+  // Inherit the header model dropdown as the per-session default.
+  const headerModel = document.getElementById('model-select')?.value || '';
+  if (headerModel) body.model = headerModel;
+  const session = await apiFetch('/api/sessions', { method: 'POST', body: JSON.stringify(body) });
+  if (session.sessionId) {
+    sessions[session.sessionId] = session;
+    renderSidebar();
+    await selectSession(session.sessionId);
+  }
+  closeModal('new-session-modal');
+});
+
+// ── Hub ───────────────────────────────────────────────────────────────────────
+document.getElementById('hub-btn').addEventListener('click', () => {
+  hubVisible = !hubVisible;
+  document.getElementById('main').style.display = hubVisible ? 'none' : 'flex';
+  document.getElementById('hub-panel').style.display = hubVisible ? 'flex' : 'none';
+  document.getElementById('hub-btn').style.background = hubVisible ? 'var(--accent)' : 'var(--blue)';
+  if (hubVisible) loadHubChannels();
+});
+
+async function loadHubChannels() {
+  hubChannels = await apiFetch('/api/hub/channels');
+  if (!Array.isArray(hubChannels)) hubChannels = [];
+  renderHubChannels();
+}
+
+function renderHubChannels() {
+  const list = document.getElementById('hub-channel-list');
+  if (hubChannels.length === 0) {
+    list.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:11px;">No channels yet</div>';
+    return;
+  }
+  list.innerHTML = hubChannels.map(ch => `
+    <div class="hub-channel-item ${ch.id === activeChannelId ? 'active' : ''}" data-channel="${ch.id}">
+      <span class="hub-channel-name">${esc(ch.name)}</span>
+      ${ch.description ? `<span class="hub-channel-desc">${esc(ch.description)}</span>` : ''}
+    </div>
+  `).join('');
+  list.querySelectorAll('.hub-channel-item').forEach(el => {
+    el.addEventListener('click', () => selectHubChannel(el.dataset.channel));
+  });
+}
+
+async function selectHubChannel(channelId) {
+  activeChannelId = channelId;
+  renderHubChannels();
+  const ch = hubChannels.find(c => c.id === channelId);
+  document.getElementById('hub-channel-title').textContent = ch?.name ?? channelId;
+  const msgs = await apiFetch(`/api/hub/channels/${channelId}/messages`);
+  hubMessages[channelId] = Array.isArray(msgs) ? msgs : [];
+  renderHubMessages();
+  // Refresh whatever view is currently active
+  if (hubViewMode === 'tasks') loadChannelTasks(channelId);
+  if (hubViewMode === 'docs') loadChannelDocs(channelId);
+}
+
+function renderHubMessages() {
+  const container = document.getElementById('hub-messages');
+  const msgs = hubMessages[activeChannelId] ?? [];
+  if (msgs.length === 0) {
+    container.innerHTML = '<div class="empty-state"><div>No messages</div></div>';
+    return;
+  }
+  container.innerHTML = msgs.map(m => {
+    const indent = Math.min(m.depth, 5) * 16;
+    const dispBadges = m.dispatches.map(d => {
+      const colors = { queued: 'var(--muted)', running: 'var(--blue)', acted: 'var(--green)', skipped: 'var(--muted)', error: 'var(--red)' };
+      return `<span class="hub-dispatch-badge" style="color:${colors[d.status] || 'var(--muted)'}">${d.sessionId.slice(0,6)}:${d.status}</span>`;
+    }).join(' ');
+    const tagBadges = m.tags.map(t => `<span class="hub-tag">${esc(t)}</span>`).join('');
+    const mentionBadges = m.mentions.map(n => `<span class="hub-mention">@${esc(n)}</span>`).join('');
+    return `
+    <div class="hub-msg" style="margin-left:${indent}px" data-msg-id="${m.id}">
+      <div class="hub-msg-header">
+        <button class="hub-retry-btn" data-retry="${m.id}" title="Retry / continue — re-dispatch a session that previously ran on this message (e.g. after rate limit reset)">↻</button>
+        <span class="hub-msg-from">${esc(m.fromName)}</span>
+        <span class="hub-msg-time">${new Date(m.timestamp).toLocaleTimeString()}</span>
+        <span class="hub-msg-status hub-status-${m.status}">${m.status}</span>
+        <button class="hub-trigger-btn" data-trigger="${m.id}" title="Trigger a session to act on this message">▶ Trigger</button>
+      </div>
+      <div class="hub-msg-content">${esc(m.content)}</div>
+      <div class="hub-msg-meta">${tagBadges} ${mentionBadges} ${dispBadges}</div>
+    </div>`;
+  }).join('');
+  container.scrollTop = container.scrollHeight;
+  container.querySelectorAll('.hub-trigger-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      openTriggerPicker(btn.dataset.trigger, btn);
+    });
+  });
+  container.querySelectorAll('.hub-retry-btn').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      openRetryPicker(btn.dataset.retry, btn);
+    });
+  });
+}
+
+let _triggerPickerEl = null;
+
+function closeTriggerPicker() {
+  if (_triggerPickerEl) {
+    _triggerPickerEl.remove();
+    _triggerPickerEl = null;
+    document.removeEventListener('click', _onDocClickClosePicker);
+  }
+}
+
+function _onDocClickClosePicker(e) {
+  if (_triggerPickerEl && !_triggerPickerEl.contains(e.target)) closeTriggerPicker();
+}
+
+function openTriggerPicker(messageId, anchorEl) {
+  closeTriggerPicker();
+  const remoteSessions = Object.values(sessions).filter(s => s.type === 'remote' && s.machineId);
+  if (remoteSessions.length === 0) {
+    alert('No remote sessions available to trigger.');
+    return;
+  }
+  const picker = document.createElement('div');
+  picker.className = 'hub-trigger-picker';
+  picker.innerHTML = `
+    <div class="hub-trigger-picker-header">Trigger which session?</div>
+    ${remoteSessions.map(s => {
+      const label = s.screenName || s.name || s.sessionId.slice(0, 8);
+      const role = s.role ? ` <span class="hub-trigger-picker-role">${esc(s.role)}</span>` : '';
+      return `<div class="hub-trigger-picker-item" data-session="${s.sessionId}">${esc(label)}${role}</div>`;
+    }).join('')}
+  `;
+  document.body.appendChild(picker);
+  const rect = anchorEl.getBoundingClientRect();
+  picker.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+  picker.style.left = (rect.left + window.scrollX) + 'px';
+  _triggerPickerEl = picker;
+  picker.querySelectorAll('.hub-trigger-picker-item').forEach(el => {
+    el.addEventListener('click', async () => {
+      const sessionId = el.dataset.session;
+      closeTriggerPicker();
+      try {
+        const result = await apiFetch(`/api/hub/messages/${messageId}/trigger`, {
+          method: 'POST',
+          body: JSON.stringify({ sessionId }),
+        });
+        if (result?.error) alert('Trigger failed: ' + result.error);
+      } catch (err) {
+        alert('Trigger failed: ' + err.message);
+      }
+    });
+  });
+  setTimeout(() => document.addEventListener('click', _onDocClickClosePicker), 0);
+}
+
+function openRetryPicker(messageId, anchorEl) {
+  closeTriggerPicker();
+  const msg = (hubMessages[activeChannelId] ?? []).find(m => m.id === messageId);
+  if (!msg) {
+    alert('Message not found.');
+    return;
+  }
+  // Build candidate list: prefer sessions that previously dispatched on this message
+  // (errored/timed-out first), then fall back to all remote sessions.
+  const dispatches = msg.dispatches ?? [];
+  const statusOrder = { error: 0, running: 1, queued: 2, acted: 3, skipped: 4 };
+  const dispatchedSessions = dispatches
+    .map(d => ({ d, s: sessions[d.sessionId] }))
+    .filter(x => x.s && x.s.type === 'remote' && x.s.machineId)
+    .sort((a, b) => (statusOrder[a.d.status] ?? 9) - (statusOrder[b.d.status] ?? 9));
+  const dispatchedIds = new Set(dispatchedSessions.map(x => x.s.sessionId));
+  const otherRemote = Object.values(sessions)
+    .filter(s => s.type === 'remote' && s.machineId && !dispatchedIds.has(s.sessionId));
+
+  if (dispatchedSessions.length === 0 && otherRemote.length === 0) {
+    alert('No remote sessions available to retry.');
+    return;
+  }
+
+  const picker = document.createElement('div');
+  picker.className = 'hub-trigger-picker';
+  const header = `<div class="hub-trigger-picker-header">Retry / continue — pick session</div>`;
+  const previousItems = dispatchedSessions.map(({ d, s }) => {
+    const label = s.screenName || s.name || s.sessionId.slice(0, 8);
+    const role = s.role ? ` <span class="hub-trigger-picker-role">${esc(s.role)}</span>` : '';
+    const badge = ` <span class="hub-trigger-picker-role" style="color:${d.status === 'error' ? 'var(--red)' : 'var(--muted)'}">${d.status}</span>`;
+    return `<div class="hub-trigger-picker-item" data-session="${s.sessionId}">${esc(label)}${role}${badge}</div>`;
+  }).join('');
+  const divider = (dispatchedSessions.length > 0 && otherRemote.length > 0)
+    ? `<div class="hub-trigger-picker-header" style="font-size:10px;opacity:0.6">other sessions</div>`
+    : '';
+  const otherItems = otherRemote.map(s => {
+    const label = s.screenName || s.name || s.sessionId.slice(0, 8);
+    const role = s.role ? ` <span class="hub-trigger-picker-role">${esc(s.role)}</span>` : '';
+    return `<div class="hub-trigger-picker-item" data-session="${s.sessionId}">${esc(label)}${role}</div>`;
+  }).join('');
+  picker.innerHTML = header + previousItems + divider + otherItems;
+  document.body.appendChild(picker);
+  const rect = anchorEl.getBoundingClientRect();
+  picker.style.top = (rect.bottom + window.scrollY + 4) + 'px';
+  picker.style.left = (rect.left + window.scrollX) + 'px';
+  _triggerPickerEl = picker;
+  picker.querySelectorAll('.hub-trigger-picker-item').forEach(el => {
+    el.addEventListener('click', async () => {
+      const sessionId = el.dataset.session;
+      closeTriggerPicker();
+      try {
+        const result = await apiFetch(`/api/hub/messages/${messageId}/trigger`, {
+          method: 'POST',
+          body: JSON.stringify({ sessionId }),
+        });
+        if (result?.error) alert('Retry failed: ' + result.error);
+      } catch (err) {
+        alert('Retry failed: ' + err.message);
+      }
+    });
+  });
+  setTimeout(() => document.addEventListener('click', _onDocClickClosePicker), 0);
+}
+
+function handleHubEvent(msg) {
+  if (msg.event === 'HUB_MESSAGE' && msg.message) {
+    const m = msg.message;
+    if (!hubMessages[m.channelId]) hubMessages[m.channelId] = [];
+    hubMessages[m.channelId].push(m);
+    if (m.channelId === activeChannelId && hubVisible) renderHubMessages();
+    // Auto-add channel if not known
+    if (!hubChannels.find(c => c.id === m.channelId)) {
+      loadHubChannels();
+    }
+  }
+  if (msg.event === 'TASKS_CHANGED' && msg.channelId === activeChannelId && hubVisible) {
+    loadChannelTasks(msg.channelId);
+  }
+  if (msg.event === 'DOCS_CHANGED' && msg.channelId === activeChannelId && hubVisible) {
+    loadChannelDocs(msg.channelId);
+  }
+}
+
+// ── Hub tab switching ─────────────────────────────────────────────────────
+function switchHubView(view) {
+  hubViewMode = view;
+  document.querySelectorAll('.hub-tab').forEach(t => {
+    t.classList.toggle('active', t.dataset.view === view);
+  });
+  document.getElementById('hub-messages-view').style.display = view === 'messages' ? 'flex' : 'none';
+  document.getElementById('hub-tasks-view').style.display = view === 'tasks' ? 'flex' : 'none';
+  document.getElementById('hub-docs-view').style.display = view === 'docs' ? 'flex' : 'none';
+  if (!activeChannelId) return;
+  if (view === 'tasks') loadChannelTasks(activeChannelId);
+  if (view === 'docs') loadChannelDocs(activeChannelId);
+}
+
+document.querySelectorAll('.hub-tab').forEach(btn => {
+  btn.addEventListener('click', () => switchHubView(btn.dataset.view));
+});
+
+// ── Tasks ────────────────────────────────────────────────────────────────
+async function loadChannelTasks(channelId) {
+  const params = new URLSearchParams();
+  const status = document.getElementById('hub-task-status-filter').value;
+  if (status) params.set('status', status);
+  const q = document.getElementById('hub-task-search').value.trim();
+  if (q) params.set('q', q);
+  const qs = params.toString();
+  const tasks = await apiFetch(`/api/hub/channels/${channelId}/tasks${qs ? `?${qs}` : ''}`);
+  channelTasks[channelId] = Array.isArray(tasks) ? tasks : [];
+  renderTasks();
+}
+
+function renderTasks() {
+  const container = document.getElementById('hub-task-list');
+  const tasks = channelTasks[activeChannelId] ?? [];
+  if (tasks.length === 0) {
+    container.innerHTML = '<div class="empty-state"><div>No tasks</div></div>';
+    return;
+  }
+  container.innerHTML = tasks.map(t => {
+    const tags = t.tags.map(tag => `<span class="task-tag-chip">${esc(tag)}</span>`).join('');
+    const assignee = t.assignee ? `<span class="task-assignee-chip">@${esc(t.assignee)}</span>` : '';
+    const prio = t.priority ? `<span class="task-priority-${t.priority}">!${t.priority}</span>` : '';
+    return `
+      <div class="task-card" data-task-id="${esc(t.id)}">
+        <span class="task-card-id">${esc(t.id)}</span>
+        <span class="task-card-title">${esc(t.title)}</span>
+        <div class="task-card-meta">
+          <span class="task-status-badge task-status-${t.status}">${esc(t.status)}</span>
+          ${assignee}${tags}${prio}
+        </div>
+      </div>`;
+  }).join('');
+  container.querySelectorAll('.task-card').forEach(el => {
+    el.addEventListener('click', () => openTaskModal(el.dataset.taskId));
+  });
+}
+
+document.getElementById('hub-task-status-filter').addEventListener('change', () => {
+  if (activeChannelId) loadChannelTasks(activeChannelId);
+});
+document.getElementById('hub-task-search').addEventListener('input', debounce(() => {
+  if (activeChannelId) loadChannelTasks(activeChannelId);
+}, 300));
+
+document.getElementById('hub-new-task-btn').addEventListener('click', () => {
+  if (!activeChannelId) { alert('Select a channel first'); return; }
+  openTaskModal(null);
+});
+
+let _editingTaskId = null;
+async function openTaskModal(taskId) {
+  _editingTaskId = taskId;
+  let task = null;
+  if (taskId) {
+    task = await apiFetch(`/api/hub/tasks/${taskId}`);
+    document.getElementById('te-title').textContent = `${task.id} — ${task.title}`;
+  } else {
+    document.getElementById('te-title').textContent = 'New Task';
+  }
+  document.getElementById('te-title-input').value = task?.title ?? '';
+  document.getElementById('te-description').value = task?.description ?? '';
+  document.getElementById('te-status').value = task?.status ?? 'open';
+  document.getElementById('te-assignee').value = task?.assignee ?? '';
+  document.getElementById('te-tags').value = (task?.tags ?? []).join(',');
+  document.getElementById('te-priority').value = task?.priority ?? '';
+  document.getElementById('te-comment').value = '';
+  document.getElementById('te-delete').style.display = taskId ? '' : 'none';
+  const activityEl = document.getElementById('te-activity');
+  if (task && task.activity?.length) {
+    activityEl.innerHTML = task.activity.map(a => {
+      const time = new Date(a.at).toLocaleString();
+      let line = `${time} · ${esc(a.by)} · ${esc(a.kind)}`;
+      if (a.from !== undefined || a.to !== undefined) line += `: ${esc(a.from ?? '∅')} → ${esc(a.to ?? '∅')}`;
+      if (a.text) line += `: ${esc(a.text)}`;
+      return `<div>${line}</div>`;
+    }).join('');
+  } else {
+    activityEl.innerHTML = '';
+  }
+  openModal('task-edit-modal');
+}
+
+document.getElementById('te-save').addEventListener('click', async () => {
+  const body = {
+    title: document.getElementById('te-title-input').value.trim(),
+    description: document.getElementById('te-description').value,
+    status: document.getElementById('te-status').value,
+    assignee: document.getElementById('te-assignee').value.trim() || undefined,
+    tags: document.getElementById('te-tags').value.split(',').map(s => s.trim()).filter(Boolean),
+    priority: document.getElementById('te-priority').value || undefined,
+  };
+  if (!body.title) { alert('Title required'); return; }
+  if (_editingTaskId) {
+    await apiFetch(`/api/hub/tasks/${_editingTaskId}`, { method: 'PATCH', body: JSON.stringify(body) });
+    const cmt = document.getElementById('te-comment').value.trim();
+    if (cmt) {
+      await apiFetch(`/api/hub/tasks/${_editingTaskId}/comments`, { method: 'POST', body: JSON.stringify({ text: cmt }) });
+    }
+  } else {
+    await apiFetch(`/api/hub/channels/${activeChannelId}/tasks`, { method: 'POST', body: JSON.stringify(body) });
+  }
+  closeModal('task-edit-modal');
+  loadChannelTasks(activeChannelId);
+});
+
+document.getElementById('te-delete').addEventListener('click', async () => {
+  if (!_editingTaskId) return;
+  if (!confirm('Delete this task?')) return;
+  await apiFetch(`/api/hub/tasks/${_editingTaskId}`, { method: 'DELETE' });
+  closeModal('task-edit-modal');
+  loadChannelTasks(activeChannelId);
+});
+
+// ── Docs ─────────────────────────────────────────────────────────────────
+async function loadChannelDocs(channelId) {
+  const params = new URLSearchParams();
+  const q = document.getElementById('hub-doc-search').value.trim();
+  if (q) params.set('q', q);
+  const qs = params.toString();
+  const docs = await apiFetch(`/api/hub/channels/${channelId}/docs${qs ? `?${qs}` : ''}`);
+  channelDocs[channelId] = Array.isArray(docs) ? docs : [];
+  renderDocs();
+}
+
+function renderDocs() {
+  const container = document.getElementById('hub-doc-list');
+  const docs = channelDocs[activeChannelId] ?? [];
+  if (docs.length === 0) {
+    container.innerHTML = '<div class="empty-state"><div>No docs</div></div>';
+    document.getElementById('hub-doc-body').innerHTML = '<div style="color:var(--muted);padding:16px">No docs yet.</div>';
+    return;
+  }
+  container.innerHTML = docs.map(d => `
+    <div class="doc-row${d.id === currentDocId ? ' active' : ''}" data-doc-id="${esc(d.id)}">
+      <div class="doc-row-title">${esc(d.title)}</div>
+      <div class="doc-row-meta">${esc(d.id)} · v${d.version} · ${esc(d.author)}</div>
+    </div>
+  `).join('');
+  container.querySelectorAll('.doc-row').forEach(el => {
+    el.addEventListener('click', () => showDoc(el.dataset.docId));
+  });
+  if (currentDocId && docs.find(d => d.id === currentDocId)) {
+    showDoc(currentDocId);
+  }
+}
+
+async function showDoc(docId) {
+  currentDocId = docId;
+  const doc = await apiFetch(`/api/hub/docs/${docId}`);
+  const bodyEl = document.getElementById('hub-doc-body');
+  bodyEl.innerHTML = `
+    <div style="margin-bottom:12px">
+      <div style="font-size:14px;font-weight:600">${esc(doc.title)}</div>
+      <div style="font-size:11px;color:var(--muted)">${esc(doc.id)} · v${doc.version} · ${esc(doc.author)} · ${new Date(doc.updatedAt).toLocaleString()}</div>
+      <button class="btn btn-sm" id="hub-doc-edit-btn" style="margin-top:6px">Edit</button>
+    </div>
+    <pre style="white-space:pre-wrap;font-family:var(--font-mono);font-size:12px">${esc(doc.body)}</pre>
+  `;
+  document.getElementById('hub-doc-edit-btn').addEventListener('click', () => openDocModal(docId));
+  // Re-render list to update active highlight
+  document.querySelectorAll('.doc-row').forEach(el => {
+    el.classList.toggle('active', el.dataset.docId === docId);
+  });
+}
+
+document.getElementById('hub-doc-search').addEventListener('input', debounce(() => {
+  if (activeChannelId) loadChannelDocs(activeChannelId);
+}, 300));
+
+document.getElementById('hub-new-doc-btn').addEventListener('click', () => {
+  if (!activeChannelId) { alert('Select a channel first'); return; }
+  openDocModal(null);
+});
+
+let _editingDocId = null;
+async function openDocModal(docId) {
+  _editingDocId = docId;
+  let doc = null;
+  if (docId) {
+    doc = await apiFetch(`/api/hub/docs/${docId}`);
+    document.getElementById('de-title').textContent = `${doc.id} v${doc.version}`;
+    document.getElementById('de-version').textContent = `Version ${doc.version} — saving will create v${doc.version + 1}`;
+  } else {
+    document.getElementById('de-title').textContent = 'New Doc';
+    document.getElementById('de-version').textContent = '';
+  }
+  document.getElementById('de-title-input').value = doc?.title ?? '';
+  document.getElementById('de-tags').value = (doc?.tags ?? []).join(',');
+  document.getElementById('de-body').value = doc?.body ?? '';
+  document.getElementById('de-delete').style.display = docId ? '' : 'none';
+  openModal('doc-edit-modal');
+}
+
+document.getElementById('de-save').addEventListener('click', async () => {
+  const title = document.getElementById('de-title-input').value.trim();
+  const body = document.getElementById('de-body').value;
+  const tags = document.getElementById('de-tags').value.split(',').map(s => s.trim()).filter(Boolean);
+  if (!title) { alert('Title required'); return; }
+  if (_editingDocId) {
+    await apiFetch(`/api/hub/docs/${_editingDocId}`, {
+      method: 'PATCH',
+      body: JSON.stringify({ title, body, tags }),
+    });
+  } else {
+    await apiFetch(`/api/hub/channels/${activeChannelId}/docs`, {
+      method: 'POST',
+      body: JSON.stringify({ title, body, tags }),
+    });
+  }
+  closeModal('doc-edit-modal');
+  loadChannelDocs(activeChannelId);
+});
+
+document.getElementById('de-delete').addEventListener('click', async () => {
+  if (!_editingDocId) return;
+  if (!confirm('Delete this doc?')) return;
+  await apiFetch(`/api/hub/docs/${_editingDocId}`, { method: 'DELETE' });
+  closeModal('doc-edit-modal');
+  if (currentDocId === _editingDocId) currentDocId = null;
+  loadChannelDocs(activeChannelId);
+});
+
+function debounce(fn, ms) {
+  let t = null;
+  return (...args) => {
+    if (t) clearTimeout(t);
+    t = setTimeout(() => fn(...args), ms);
+  };
+}
+
+document.getElementById('hub-post-btn').addEventListener('click', hubPost);
+document.getElementById('hub-content-input').addEventListener('keydown', e => {
+  if (e.key === 'Enter') { e.preventDefault(); hubPost(); }
+});
+
+async function hubPost() {
+  const content = document.getElementById('hub-content-input').value.trim();
+  if (!content || !activeChannelId) return;
+  const tags = document.getElementById('hub-tags-input').value.split(',').map(s => s.trim()).filter(Boolean);
+  const mentions = document.getElementById('hub-mentions-input').value.split(',').map(s => s.trim().replace(/^@/, '')).filter(Boolean);
+  document.getElementById('hub-content-input').value = '';
+  document.getElementById('hub-tags-input').value = '';
+  document.getElementById('hub-mentions-input').value = '';
+  await apiFetch('/api/hub/messages', {
+    method: 'POST',
+    body: JSON.stringify({ channelIds: [activeChannelId], content, tags, mentions }),
+  });
+}
+
+document.getElementById('hub-new-channel-btn').addEventListener('click', () => openModal('new-channel-modal'));
+
+document.getElementById('nc-create').addEventListener('click', async () => {
+  const id = document.getElementById('nc-id').value.trim();
+  const name = document.getElementById('nc-name').value.trim();
+  const desc = document.getElementById('nc-desc').value.trim();
+  if (!id || !name) return;
+  await apiFetch('/api/hub/channels', {
+    method: 'POST',
+    body: JSON.stringify({ id, name, description: desc || undefined }),
+  });
+  closeModal('new-channel-modal');
+  await loadHubChannels();
+  selectHubChannel(id);
+});
+
+// ── Inline Session Rename ─────────────────────────────────────────────────────
+contentTitle.addEventListener('click', () => {
+  if (!activeSessionId) return;
+  const s = sessions[activeSessionId];
+  const currentName = s?.name || '';
+
+  const input = document.createElement('input');
+  input.className = 'rename-input';
+  input.value = currentName;
+  input.placeholder = 'Session name';
+
+  contentTitle.textContent = '';
+  contentTitle.appendChild(input);
+  input.focus();
+  input.select();
+
+  async function save() {
+    const newName = input.value.trim();
+    contentTitle.textContent = buildContentTitle(s, activeSessionId);
+
+    if (newName !== currentName) {
+      await apiFetch(`/api/sessions/${activeSessionId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({ name: newName }),
+      });
+      if (sessions[activeSessionId]) sessions[activeSessionId].name = newName;
+      contentTitle.textContent = buildContentTitle(sessions[activeSessionId], activeSessionId);
+      renderSidebar();
+    }
+  }
+
+  input.addEventListener('blur', save, { once: true });
+  input.addEventListener('keydown', e => {
+    if (e.key === 'Enter') { e.preventDefault(); input.blur(); }
+    if (e.key === 'Escape') { input.value = currentName; input.blur(); }
+  });
+});

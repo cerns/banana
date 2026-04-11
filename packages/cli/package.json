@@ -1,0 +1,14 @@
+{
+  "name": "@banana/cli",
+  "version": "1.0.0",
+  "private": true,
+  "main": "dist/index.js",
+  "bin": {
+    "banana": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "node dist/index.js",
+    "watch": "tsc --watch"
+  }
+}
