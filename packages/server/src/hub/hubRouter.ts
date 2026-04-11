@@ -18,6 +18,8 @@ import type { SessionRecord } from '../sessions/sessionStore.js';
 import { createJob } from '../sessions/sessionManager.js';
 import { broadcastToDashboards } from '../ws/dashboardBroadcast.js';
 import { isSessionBusy, onJobComplete, executeRemoteJob } from '../ssh/remoteSessionExecutor.js';
+import { machineStore } from '../machines/machineStore.js';
+import type { MachineRecord } from '../machines/machineStore.js';
 
 /** Track last dispatch time per session for cooldown. */
 const sessionCooldowns = new Map<string, number>();
@@ -1090,6 +1092,69 @@ function extractTextFromChunks(chunks: unknown[]): string {
 }
 
 /**
+ * Find a machine to run the channel compaction summarizer on. Walks
+ * candidates in order of relevance, resolving each against machineStore
+ * so stale references silently fall through. Returns undefined only when
+ * NOTHING resolves (no caller hint, no in-channel agent, no remote session
+ * anywhere, no registered machine at all).
+ *
+ * Logs every candidate it considers so "no machine available" failures
+ * are diagnosable from server logs.
+ */
+function pickMachineForCompaction(
+  channelId: string,
+  callerMachineId?: string,
+): MachineRecord | undefined {
+  const tried: string[] = [];
+  const tryResolve = (mid: string | undefined, why: string): MachineRecord | undefined => {
+    if (!mid) return undefined;
+    tried.push(`${why}=${mid}`);
+    return machineStore.get(mid);
+  };
+
+  // 1. Caller hint
+  let machine = tryResolve(callerMachineId, 'caller');
+
+  // 2. Sessions subscribed to this channel
+  if (!machine) {
+    const inChannel = sessionStore.getAll().filter(s =>
+      s.type === 'remote' && s.machineId && s.channels?.includes(channelId),
+    );
+    for (const s of inChannel) {
+      machine = tryResolve(s.machineId, `inChannel(${s.sessionId.slice(0, 8)})`);
+      if (machine) break;
+    }
+  }
+
+  // 3. Any remote session anywhere
+  if (!machine) {
+    for (const s of sessionStore.getAll()) {
+      if (s.type === 'remote' && s.machineId) {
+        machine = tryResolve(s.machineId, `remote(${s.sessionId.slice(0, 8)})`);
+        if (machine) break;
+      }
+    }
+  }
+
+  // 4. First registered machine — last resort
+  if (!machine) {
+    const all = machineStore.getAll();
+    if (all.length > 0) {
+      machine = all[0];
+      tried.push(`firstRegistered=${machine.id}`);
+    }
+  }
+
+  console.log(
+    `[hub] pickMachineForCompaction(${channelId}) → ` +
+    `${machine ? `${machine.id} (${machine.ip})` : 'NONE'} ` +
+    `[tried: ${tried.join(', ') || '<empty>'}]`,
+  );
+
+  return machine;
+}
+
+/**
  * Push a real-time progress event for a long-running channel compaction
  * to all connected dashboards. Lets the UI show "summarizing part 2/3 …"
  * instead of a single static "compacting…" placeholder.
@@ -1118,7 +1183,7 @@ function broadcastCompactProgress(
  */
 async function summarizeChunk(args: {
   channelName: string;
-  machine: import('../machines/machineStore.js').MachineRecord;
+  machine: MachineRecord;
   messages: HubMessage[];
   partIdx: number;
   totalParts: number;
@@ -1229,42 +1294,19 @@ export async function compactChannel(
   // We resolve every candidate against machineStore.get() so a stale
   // machineId on a session (machine deleted) silently falls through to
   // the next candidate instead of throwing "machine not found".
-  const { machineStore } = await import('../machines/machineStore.js');
-
-  const tryResolve = (mid: string | undefined) => {
-    if (!mid) return undefined;
-    return machineStore.get(mid);
-  };
-
-  let machine = tryResolve(machineId);
-
+  const machine = pickMachineForCompaction(channelId, machineId);
   if (!machine) {
-    // Sessions actually subscribed to this channel — most relevant.
-    const inChannel = sessionStore.getAll().filter(s =>
-      s.type === 'remote' && s.machineId && s.channels?.includes(channelId),
+    const allMachines = machineStore.getAll();
+    const allSessions = sessionStore.getAll();
+    const remoteSessions = allSessions.filter(s => s.type === 'remote');
+    const sessionsInChannel = allSessions.filter(s => s.channels?.includes(channelId));
+    throw new Error(
+      `no machine available to run summarizer ` +
+      `(machineStore=${allMachines.length}, ` +
+      `sessions=${allSessions.length} remote=${remoteSessions.length} ` +
+      `inChannel=${sessionsInChannel.length})`,
     );
-    for (const s of inChannel) {
-      machine = tryResolve(s.machineId);
-      if (machine) break;
-    }
   }
-
-  if (!machine) {
-    // Fallback: any remote session's machine
-    for (const s of sessionStore.getAll()) {
-      if (s.type === 'remote' && s.machineId) {
-        machine = tryResolve(s.machineId);
-        if (machine) break;
-      }
-    }
-  }
-
-  if (!machine) {
-    // Last resort: any registered machine
-    machine = machineStore.getAll()[0];
-  }
-
-  if (!machine) throw new Error('no machine available to run summarizer');
 
   // Include prior compaction summaries so the new compaction is cumulative.
   const priorSummaries = (channel.compactions ?? [])
