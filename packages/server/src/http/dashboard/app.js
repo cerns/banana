@@ -1232,6 +1232,16 @@ function handleHubEvent(msg) {
       selectHubChannel(msg.channelId);
     }
   }
+  if (msg.event === 'HUB_COMPACT_PROGRESS' && msg.channelId === activeChannelId) {
+    // Update the visible compaction status banner with chunk progress.
+    const statusEl = document.getElementById('hub-compact-status');
+    if (statusEl && statusEl.style.display !== 'none') {
+      statusEl.className = 'hub-compact-status running';
+      statusEl.textContent = msg.totalParts > 1
+        ? `⏳ ${msg.message} — part ${msg.partIdx}/${msg.totalParts}`
+        : `⏳ ${msg.message}`;
+    }
+  }
 }
 
 // ── Hub tab switching ─────────────────────────────────────────────────────

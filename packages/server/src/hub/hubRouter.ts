@@ -8,6 +8,11 @@ import { docStore } from './docStore.js';
 import type { ChannelDoc } from './docStore.js';
 import { extractArtifactActions } from './channelArtifactExtractor.js';
 import { compressPrompt, compressionStats } from './promptCompressor.js';
+import {
+  estimateTokens,
+  splitMessagesIntoChunks,
+  buildTranscript,
+} from './compactionPlanner.js';
 import { sessionStore } from '../sessions/sessionStore.js';
 import type { SessionRecord } from '../sessions/sessionStore.js';
 import { createJob } from '../sessions/sessionManager.js';
@@ -1085,6 +1090,106 @@ function extractTextFromChunks(chunks: unknown[]): string {
 }
 
 /**
+ * Push a real-time progress event for a long-running channel compaction
+ * to all connected dashboards. Lets the UI show "summarizing part 2/3 …"
+ * instead of a single static "compacting…" placeholder.
+ */
+function broadcastCompactProgress(
+  channelId: string,
+  partIdx: number,
+  totalParts: number,
+  message: string,
+): void {
+  broadcastToDashboards({
+    type: 'DASHBOARD_EVENT',
+    event: 'HUB_COMPACT_PROGRESS',
+    channelId,
+    partIdx,
+    totalParts,
+    message,
+  });
+}
+
+/**
+ * Run claude over SSH to produce a summary of a single chunk of channel
+ * messages. Used both for the unchunked single-pass case and for each
+ * chunk of a multi-chunk compaction. Returns the raw summary text (may be
+ * empty if the model produced nothing — caller decides how to react).
+ */
+async function summarizeChunk(args: {
+  channelName: string;
+  machine: import('../machines/machineStore.js').MachineRecord;
+  messages: HubMessage[];
+  partIdx: number;
+  totalParts: number;
+  priorSummaries: string;
+}): Promise<string> {
+  const { channelName, machine, messages, partIdx, totalParts, priorSummaries } = args;
+
+  const transcript = buildTranscript(messages);
+  const partHeader = totalParts > 1
+    ? `This is part ${partIdx} of ${totalParts} of a chunked compaction. Summarize ONLY the messages in THIS part — the other parts will be summarized in their own calls and concatenated together. Do not speculate about content from other parts.`
+    : '';
+
+  const rawPrompt = [
+    `You are compacting the conversation history of channel "${channelName}".`,
+    partHeader,
+    'Produce a faithful, dense summary that preserves EVERYTHING the agents will',
+    'need to keep working — open decisions, unresolved questions, action items,',
+    'next steps, blockers, and every reference to bJira-* tickets and bCONF-*',
+    'docs by ID. Use plain markdown with the following sections:',
+    '',
+    '  ## Context — what the channel is about',
+    '  ## Decisions reached',
+    '  ## Open questions',
+    '  ## Action items / next steps',
+    '  ## Active bJira tickets and bCONF docs (by ID)',
+    '',
+    'Be dense, not verbose. Skip pleasantries. Quote concrete numbers, paths,',
+    'commands, file names, and IDs verbatim. Length: aim for 1/4 to 1/8 of the',
+    'original transcript.',
+    '',
+    priorSummaries ? `## Earlier compaction summaries (already folded in)\n${priorSummaries}\n` : '',
+    '## Transcript to compact',
+    transcript,
+  ].filter(Boolean).join('\n');
+
+  const prompt = compressForDispatch(
+    rawPrompt,
+    totalParts > 1 ? `compact part ${partIdx}/${totalParts}` : 'compact',
+  );
+
+  const { runClaudeOverSsh } = await import('../ssh/sshRunner.js');
+  let summary = '';
+  await runClaudeOverSsh(machine, prompt, '', (chunk) => {
+    const c = chunk as Record<string, unknown>;
+    if (c.type === 'stream_event') {
+      const evt = c.event as Record<string, unknown> | undefined;
+      if (evt?.type === 'content_block_delta') {
+        const delta = evt.delta as Record<string, unknown> | undefined;
+        if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+          summary += delta.text;
+        }
+      }
+    }
+    if (c.type === 'assistant') {
+      const content = (c.message as Record<string, unknown>)?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block && typeof block === 'object' && (block as Record<string, unknown>).type === 'text') {
+            summary += (block as Record<string, unknown>).text as string;
+          }
+        }
+      }
+    }
+    if (c.type === 'result' && typeof c.result === 'string' && !summary) {
+      summary = c.result;
+    }
+  });
+  return summary;
+}
+
+/**
  * Compact (LLM-summarize) every live message in a channel into a single seed
  * message. Originals are NOT deleted — they are snapshotted into a
  * `ChannelCompaction` record on the channel so the full history is preserved
@@ -1130,77 +1235,71 @@ export async function compactChannel(
   }
   if (!mid) throw new Error('no machine available to run summarizer');
 
-  // Build transcript
-  const transcript = messages.map(m => {
-    const tagPart = m.tags.length > 0 ? ` [${m.tags.join(',')}]` : '';
-    return `[${m.fromName} @ ${m.timestamp}] (depth ${m.depth})${tagPart}\n${m.content}`;
-  }).join('\n\n---\n\n');
+  const machine = machineStore.get(mid);
+  if (!machine) throw new Error('machine not found');
 
   // Include prior compaction summaries so the new compaction is cumulative.
   const priorSummaries = (channel.compactions ?? [])
     .map((c, i) => `### Prior compaction ${i + 1} (${c.createdAt})\n${c.summary}`)
     .join('\n\n');
 
-  const rawPrompt = [
-    `You are compacting the conversation history of channel "${channel.name}".`,
-    'Produce a faithful, dense summary that preserves EVERYTHING the agents will',
-    'need to keep working — open decisions, unresolved questions, action items,',
-    'next steps, blockers, and every reference to bJira-* tickets and bCONF-*',
-    'docs by ID. Use plain markdown with the following sections:',
-    '',
-    '  ## Context — what the channel is about',
-    '  ## Decisions reached',
-    '  ## Open questions',
-    '  ## Action items / next steps',
-    '  ## Active bJira tickets and bCONF docs (by ID)',
-    '',
-    'Be dense, not verbose. Skip pleasantries. Quote concrete numbers, paths,',
-    'commands, file names, and IDs verbatim. Length: aim for 1/4 to 1/8 of the',
-    'original transcript.',
-    '',
-    priorSummaries ? `## Earlier compaction summaries (already folded in)\n${priorSummaries}\n` : '',
-    '## Transcript to compact',
-    transcript,
-  ].filter(Boolean).join('\n');
+  // Decide whether to chunk. We estimate the FULL transcript and split if it
+  // would push past `compactChunkTokens`. Each chunk is summarized in its own
+  // claude call, then chunk summaries are concatenated into a single combined
+  // summary that becomes the seed message — so the channel still ends up with
+  // exactly ONE post regardless of how many chunks we needed.
+  const fullTranscript = buildTranscript(messages);
+  const fullTokens = estimateTokens(fullTranscript);
+  const maxTokens = config.compactChunkTokens;
+  const chunks = fullTokens <= maxTokens
+    ? [messages]
+    : splitMessagesIntoChunks(messages, maxTokens);
 
-  const prompt = compressForDispatch(rawPrompt, `compact ${channelId}`);
+  console.log(
+    `[hub] compactChannel ${channelId} → ~${fullTokens} tokens, ` +
+    `chunking into ${chunks.length} part(s) (max ${maxTokens} tokens/chunk) ` +
+    `on machine ${machine.id} (${machine.ip})`,
+  );
 
-  const machine = machineStore.get(mid);
-  if (!machine) throw new Error('machine not found');
+  broadcastCompactProgress(channelId, 0, chunks.length, 'starting');
 
-  console.log(`[hub] compactChannel ${channelId} → running summarizer on machine ${machine.id} (${machine.ip})`);
+  const chunkSummaries: string[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const partIdx = i + 1;
+    const chunkMessages = chunks[i];
+    broadcastCompactProgress(
+      channelId,
+      partIdx,
+      chunks.length,
+      `summarizing part ${partIdx}/${chunks.length} (${chunkMessages.length} msgs)`,
+    );
+    console.log(`[hub] compactChannel ${channelId} → part ${partIdx}/${chunks.length} (${chunkMessages.length} msgs)`);
 
-  const { runClaudeOverSsh } = await import('../ssh/sshRunner.js');
-  let summary = '';
-  await runClaudeOverSsh(machine, prompt, '', (chunk) => {
-    const c = chunk as Record<string, unknown>;
-    if (c.type === 'stream_event') {
-      const evt = c.event as Record<string, unknown> | undefined;
-      if (evt?.type === 'content_block_delta') {
-        const delta = evt.delta as Record<string, unknown> | undefined;
-        if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
-          summary += delta.text;
-        }
-      }
+    const partSummary = await summarizeChunk({
+      channelName: channel.name,
+      machine,
+      messages: chunkMessages,
+      partIdx,
+      totalParts: chunks.length,
+      // Only include prior-compaction summaries on the FIRST chunk to save
+      // tokens; subsequent chunks reference the same channel.
+      priorSummaries: i === 0 ? priorSummaries : '',
+    });
+
+    if (!partSummary.trim()) {
+      throw new Error(`summarizer produced empty output on part ${partIdx}/${chunks.length}`);
     }
-    if (c.type === 'assistant') {
-      const content = (c.message as Record<string, unknown>)?.content;
-      if (Array.isArray(content)) {
-        for (const block of content) {
-          if (block && typeof block === 'object' && (block as Record<string, unknown>).type === 'text') {
-            summary += (block as Record<string, unknown>).text as string;
-          }
-        }
-      }
-    }
-    if (c.type === 'result' && typeof c.result === 'string' && !summary) {
-      summary = c.result;
-    }
-  });
+    console.log(`[hub] compactChannel ${channelId} ← part ${partIdx}/${chunks.length} returned ${partSummary.length} chars`);
 
-  console.log(`[hub] compactChannel ${channelId} ← summarizer returned ${summary.length} chars`);
+    chunkSummaries.push(
+      chunks.length > 1
+        ? `## Part ${partIdx}/${chunks.length} (${chunkMessages.length} messages)\n\n${partSummary}`
+        : partSummary,
+    );
+  }
 
-  if (!summary.trim()) throw new Error('summarizer produced empty output');
+  const summary = chunkSummaries.join('\n\n---\n\n');
+  broadcastCompactProgress(channelId, chunks.length, chunks.length, 'archiving');
 
   // Archive originals + drop them from live store
   const compaction = hubStore.compactChannel(channelId, summary, by);

@@ -38,6 +38,13 @@ export const config = {
   // Code blocks (``` and `inline`) are preserved verbatim. Set to "0" to
   // disable; default is enabled.
   promptCompressEnabled: process.env.BANANA_PROMPT_COMPRESS !== '0',
+  // Channel compaction chunking. When the transcript estimated tokens exceed
+  // this threshold, the compactor splits the messages into chunks ≤ this
+  // many tokens (never splitting a single message) and runs the LLM on each
+  // chunk in turn, then concatenates the chunk summaries into one. Default
+  // 80000 leaves headroom under common 100k context limits for the prompt
+  // scaffolding + the response.
+  compactChunkTokens: parseInt(process.env.BANANA_COMPACT_CHUNK_TOKENS ?? '80000', 10),
 };
 
 if (!config.token) {
