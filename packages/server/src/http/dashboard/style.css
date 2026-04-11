@@ -890,3 +890,48 @@ header h1 { font-size: 16px; color: var(--accent); }
   border-radius: 3px;
   background: rgba(139,148,158,0.1);
 }
+
+.hub-msg-inflight {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin-top: 6px;
+  padding: 4px 8px;
+  border-radius: 4px;
+  background: rgba(88,166,255,0.08);
+  border-left: 2px solid var(--blue);
+  font-size: 11px;
+}
+
+.hub-spinner {
+  display: inline-block;
+  animation: hub-spin 1.6s linear infinite;
+}
+
+@keyframes hub-spin {
+  0%   { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
+
+.hub-inflight-label {
+  color: var(--muted);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.hub-inflight-agent {
+  display: inline-block;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-weight: 600;
+  font-size: 10px;
+  background: rgba(88,166,255,0.18);
+  color: var(--blue);
+}
+
+.hub-inflight-agent.hub-inflight-queued {
+  background: rgba(139,148,158,0.18);
+  color: var(--muted);
+}

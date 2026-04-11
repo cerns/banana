@@ -192,6 +192,26 @@ function queueForSession(
     jobId: '',
     status: 'queued',
   });
+  broadcastDispatchUpdate(hubMessageId);
+}
+
+/**
+ * Push a real-time dispatch state-change event to dashboards so the
+ * "processing: <agent>" indicator next to a hub message updates as soon as
+ * a session goes queued → running → acted/skipped/error, without waiting for
+ * the next channel reload.
+ */
+function broadcastDispatchUpdate(messageId: string): void {
+  const msg = hubStore.getMessage(messageId);
+  if (!msg) return;
+  broadcastToDashboards({
+    type: 'DASHBOARD_EVENT',
+    event: 'HUB_DISPATCH_UPDATE',
+    messageId,
+    channelId: msg.channelId,
+    status: msg.status,
+    dispatches: msg.dispatches,
+  });
 }
 
 /** Maximum characters allowed in the formatted context block. */
@@ -545,6 +565,7 @@ function dispatchToSession(
     status: 'running',
     startedAt: new Date().toISOString(),
   });
+  broadcastDispatchUpdate(hubMessage.id);
 
   runningHubJobs++;
   sessionCooldowns.set(session.sessionId, Date.now());
@@ -581,11 +602,13 @@ function onSessionJobComplete(
       status: 'skipped',
       finishedAt: new Date().toISOString(),
     });
+    broadcastDispatchUpdate(hubMessage.id);
   } else {
     hubStore.updateDispatch(hubMessage.id, sessionId, {
       status: 'acted',
       finishedAt: new Date().toISOString(),
     });
+    broadcastDispatchUpdate(hubMessage.id);
 
     // Chain depth check before posting result back
     if (hubMessage.depth < config.hubMaxChainDepth) {
@@ -740,6 +763,7 @@ function continueTalking(
     status: 'running',
     startedAt: new Date().toISOString(),
   });
+  broadcastDispatchUpdate(originalMessage.id);
 
   runningHubJobs++;
   sessionCooldowns.set(sessionId, Date.now());
@@ -773,6 +797,7 @@ function onTalkingJobComplete(
       status: 'skipped',
       finishedAt: new Date().toISOString(),
     });
+    broadcastDispatchUpdate(originalMessage.id);
     processQueue(sessionId);
     drainGlobalQueue();
     return;
@@ -782,6 +807,7 @@ function onTalkingJobComplete(
     status: 'acted',
     finishedAt: new Date().toISOString(),
   });
+  broadcastDispatchUpdate(originalMessage.id);
 
   const wantsContinue = detectTalkingMarker(rawOutput);
   // Strip BOTH self-trigger and talking markers from displayed content. We do

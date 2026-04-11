@@ -1016,12 +1016,35 @@ function renderHubMessages() {
     container.innerHTML = '<div class="empty-state"><div>No messages</div></div>';
     return;
   }
+  // Friendly label for a sessionId — prefers screenName, then name, then short id.
+  const labelFor = sid => {
+    const s = sessions[sid];
+    return s?.screenName || s?.name || sid.slice(0, 6);
+  };
   container.innerHTML = msgs.map(m => {
     const indent = Math.min(m.depth, 5) * 16;
-    const dispBadges = m.dispatches.map(d => {
-      const colors = { queued: 'var(--muted)', running: 'var(--blue)', acted: 'var(--green)', skipped: 'var(--muted)', error: 'var(--red)' };
-      return `<span class="hub-dispatch-badge" style="color:${colors[d.status] || 'var(--muted)'}">${d.sessionId.slice(0,6)}:${d.status}</span>`;
-    }).join(' ');
+    const dispatches = m.dispatches ?? [];
+    const colors = { queued: 'var(--muted)', running: 'var(--blue)', acted: 'var(--green)', skipped: 'var(--muted)', error: 'var(--red)' };
+    const dispBadges = dispatches.map(d =>
+      `<span class="hub-dispatch-badge" style="color:${colors[d.status] || 'var(--muted)'}" title="${esc(d.sessionId)}">${esc(labelFor(d.sessionId))}:${d.status}</span>`
+    ).join(' ');
+
+    // While the message is not yet 'complete', surface any in-flight workers
+    // (running + queued) prominently with a spinner so it's obvious WHO we're
+    // waiting on right now. The high-level msg.status is 'pending' before any
+    // dispatch is added and 'dispatched' once at least one is in flight; we
+    // care about both.
+    const inFlight = m.status !== 'complete'
+      ? dispatches.filter(d => d.status === 'running' || d.status === 'queued')
+      : [];
+    const inFlightBlock = inFlight.length > 0
+      ? `<div class="hub-msg-inflight">
+           <span class="hub-spinner">⏳</span>
+           <span class="hub-inflight-label">processing:</span>
+           ${inFlight.map(d => `<span class="hub-inflight-agent hub-inflight-${d.status}" title="${esc(d.sessionId)} — ${d.status}">${esc(labelFor(d.sessionId))}${d.status === 'queued' ? ' (queued)' : ''}</span>`).join('')}
+         </div>`
+      : '';
+
     const tagBadges = m.tags.map(t => `<span class="hub-tag">${esc(t)}</span>`).join('');
     const mentionBadges = m.mentions.map(n => `<span class="hub-mention">@${esc(n)}</span>`).join('');
     return `
@@ -1034,6 +1057,7 @@ function renderHubMessages() {
         <button class="hub-trigger-btn" data-trigger="${m.id}" title="Trigger a session to act on this message">▶ Trigger</button>
       </div>
       <div class="hub-msg-content">${esc(m.content)}</div>
+      ${inFlightBlock}
       <div class="hub-msg-meta">${tagBadges} ${mentionBadges} ${dispBadges}</div>
     </div>`;
   }).join('');
@@ -1180,6 +1204,19 @@ function handleHubEvent(msg) {
     // Auto-add channel if not known
     if (!hubChannels.find(c => c.id === m.channelId)) {
       loadHubChannels();
+    }
+  }
+  if (msg.event === 'HUB_DISPATCH_UPDATE' && msg.messageId) {
+    // Patch the in-memory copy of the message so the "processing: <agent>"
+    // indicator updates without refetching the whole channel.
+    const list = hubMessages[msg.channelId];
+    if (list) {
+      const target = list.find(x => x.id === msg.messageId);
+      if (target) {
+        target.dispatches = msg.dispatches;
+        if (msg.status) target.status = msg.status;
+        if (msg.channelId === activeChannelId && hubVisible) renderHubMessages();
+      }
     }
   }
   if (msg.event === 'TASKS_CHANGED' && msg.channelId === activeChannelId && hubVisible) {
