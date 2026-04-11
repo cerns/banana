@@ -82,6 +82,10 @@
       <div id="hub-messages-area">
         <div id="hub-messages-header">
           <span id="hub-channel-title" style="color:var(--muted)">Select a channel</span>
+          <div id="hub-channel-actions">
+            <button id="hub-compact-btn" class="btn btn-sm" title="Compact this channel: LLM-summarize all messages into a single seed message. Originals are archived to the channel chat-log and can be viewed via the History button.">⊟ Compact</button>
+            <button id="hub-history-btn" class="btn btn-sm" title="View past compactions for this channel">📜 History</button>
+          </div>
           <div id="hub-tabs">
             <button data-view="messages" class="hub-tab active">Messages</button>
             <button data-view="tasks" class="hub-tab">bJira</button>
@@ -183,6 +187,20 @@
           <button id="de-delete" class="btn" style="background:#a33;color:#fff">Delete</button>
           <button class="btn modal-close" data-close="doc-edit-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Compaction history modal -->
+  <div id="compaction-history-modal" class="modal" style="display:none">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <span id="ch-title">Channel compactions</span>
+        <button class="modal-close" data-close="compaction-history-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="ch-empty" style="color:var(--muted);display:none">No compactions yet for this channel.</div>
+        <div id="ch-list"></div>
       </div>
     </div>
   </div>

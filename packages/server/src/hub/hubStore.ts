@@ -8,6 +8,28 @@ export interface HubChannel {
   description?: string;
   createdAt: string;
   createdBy: string;
+  /**
+   * Ordered chat-log of past compactions for this channel. Each entry holds
+   * a verbatim snapshot of the messages it replaced PLUS the summary text
+   * the LLM produced for them, so the original conversation can always be
+   * recovered for audit / replay even after the channel has been "reset".
+   */
+  compactions?: ChannelCompaction[];
+}
+
+export interface ChannelCompaction {
+  id: string;
+  channelId: string;
+  createdAt: string;
+  createdBy: string;
+  /** LLM-generated summary that becomes the new seed message in the channel. */
+  summary: string;
+  /** IDs of the messages that were folded into this compaction. */
+  messageIds: string[];
+  /** Verbatim snapshot of those messages — preserved so history is never lost. */
+  messages: HubMessage[];
+  /** Link to the immediately prior compaction, if any. */
+  previousCompactionId?: string;
 }
 
 export interface HubDispatch {
@@ -164,6 +186,60 @@ class HubStore {
     if (!msg) return;
     msg.contextSummary = summary;
     this.persist();
+  }
+
+  // ── Channel compaction ────────────────────────────────────────────────────
+
+  /**
+   * Compact a channel: snapshot every current message into a new compaction
+   * record stored on the channel, drop those messages from the live store, and
+   * return the compaction record so the caller can post a fresh seed message
+   * built from the summary.
+   *
+   * The compaction is appended to `channel.compactions` (ordered oldest →
+   * newest) and linked back to the previous compaction so the full history
+   * forms a chain that can always be walked.
+   */
+  compactChannel(
+    channelId: string,
+    summary: string,
+    createdBy: string,
+  ): ChannelCompaction | undefined {
+    const channel = this.channels.get(channelId);
+    if (!channel) return undefined;
+
+    const liveMessages = this.getByChannel(channelId);
+    if (liveMessages.length === 0) return undefined;
+
+    const previous = channel.compactions?.[channel.compactions.length - 1];
+
+    const compaction: ChannelCompaction = {
+      id: `bCOMPACT-${(channel.compactions?.length ?? 0) + 1}`,
+      channelId,
+      createdAt: new Date().toISOString(),
+      createdBy,
+      summary,
+      messageIds: liveMessages.map(m => m.id),
+      // Deep-clone via JSON so future mutations to the live message map
+      // (e.g. dispatch updates that race with persistence) cannot retroactively
+      // alter the archived snapshot.
+      messages: JSON.parse(JSON.stringify(liveMessages)),
+      previousCompactionId: previous?.id,
+    };
+
+    channel.compactions = [...(channel.compactions ?? []), compaction];
+
+    // Drop the live messages now that they are safely archived
+    for (const m of liveMessages) {
+      this.messages.delete(m.id);
+    }
+
+    this.persist();
+    return compaction;
+  }
+
+  getCompactions(channelId: string): ChannelCompaction[] {
+    return this.channels.get(channelId)?.compactions ?? [];
   }
 
   // ── Persistence ───────────────────────────────────────────────────────────

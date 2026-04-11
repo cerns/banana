@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
 import { config } from '../config.js';
 import { hubStore } from './hubStore.js';
-import type { HubMessage } from './hubStore.js';
+import type { HubMessage, ChannelCompaction } from './hubStore.js';
 import { taskStore } from './taskStore.js';
 import type { ChannelTask } from './taskStore.js';
 import { docStore } from './docStore.js';
@@ -1061,6 +1061,144 @@ function extractTextFromChunks(chunks: unknown[]): string {
 
   const joined = parts.join('');
   return joined || resultFallback || '';
+}
+
+/**
+ * Compact (LLM-summarize) every live message in a channel into a single seed
+ * message. Originals are NOT deleted — they are snapshotted into a
+ * `ChannelCompaction` record on the channel so the full history is preserved
+ * and can always be replayed/audited.
+ *
+ * Flow:
+ *   1. Snapshot all live messages in the channel (in chronological order)
+ *   2. Build a transcript and ask Claude to produce a faithful summary that
+ *      preserves: open decisions, unresolved questions, action items, and
+ *      every bJira/bConfluence reference
+ *   3. Archive the originals via `hubStore.compactChannel`
+ *   4. Post a NEW seed message containing the summary so the channel reads
+ *      "like new" with one starter message that captures everything that
+ *      came before
+ *
+ * Returns the new seed message + the compaction record. Throws if no machine
+ * is available to run the summarizer.
+ */
+export async function compactChannel(
+  channelId: string,
+  by: string,
+  machineId?: string,
+): Promise<{ seedMessage: HubMessage; compaction: ChannelCompaction }> {
+  const channel = hubStore.getChannel(channelId);
+  if (!channel) throw new Error('channel not found');
+
+  const messages = hubStore.getByChannel(channelId);
+  if (messages.length === 0) throw new Error('channel has no messages to compact');
+
+  // Pick a machine: caller-supplied first, then any available remote session's
+  // machine, then any registered machine.
+  const { machineStore } = await import('../machines/machineStore.js');
+  let mid = machineId;
+  if (!mid) {
+    const remote = sessionStore.getAll().find(s => s.type === 'remote' && s.machineId);
+    mid = remote?.machineId;
+  }
+  if (!mid) {
+    const machines = machineStore.getAll();
+    mid = machines[0]?.id;
+  }
+  if (!mid) throw new Error('no machine available to run summarizer');
+
+  // Build transcript
+  const transcript = messages.map(m => {
+    const tagPart = m.tags.length > 0 ? ` [${m.tags.join(',')}]` : '';
+    return `[${m.fromName} @ ${m.timestamp}] (depth ${m.depth})${tagPart}\n${m.content}`;
+  }).join('\n\n---\n\n');
+
+  // Include prior compaction summaries so the new compaction is cumulative.
+  const priorSummaries = (channel.compactions ?? [])
+    .map((c, i) => `### Prior compaction ${i + 1} (${c.createdAt})\n${c.summary}`)
+    .join('\n\n');
+
+  const prompt = [
+    `You are compacting the conversation history of channel "${channel.name}".`,
+    'Produce a faithful, dense summary that preserves EVERYTHING the agents will',
+    'need to keep working — open decisions, unresolved questions, action items,',
+    'next steps, blockers, and every reference to bJira-* tickets and bCONF-*',
+    'docs by ID. Use plain markdown with the following sections:',
+    '',
+    '  ## Context — what the channel is about',
+    '  ## Decisions reached',
+    '  ## Open questions',
+    '  ## Action items / next steps',
+    '  ## Active bJira tickets and bCONF docs (by ID)',
+    '',
+    'Be dense, not verbose. Skip pleasantries. Quote concrete numbers, paths,',
+    'commands, file names, and IDs verbatim. Length: aim for 1/4 to 1/8 of the',
+    'original transcript.',
+    '',
+    priorSummaries ? `## Earlier compaction summaries (already folded in)\n${priorSummaries}\n` : '',
+    '## Transcript to compact',
+    transcript,
+  ].filter(Boolean).join('\n');
+
+  const machine = machineStore.get(mid);
+  if (!machine) throw new Error('machine not found');
+
+  const { runClaudeOverSsh } = await import('../ssh/sshRunner.js');
+  let summary = '';
+  await runClaudeOverSsh(machine, prompt, '', (chunk) => {
+    const c = chunk as Record<string, unknown>;
+    if (c.type === 'stream_event') {
+      const evt = c.event as Record<string, unknown> | undefined;
+      if (evt?.type === 'content_block_delta') {
+        const delta = evt.delta as Record<string, unknown> | undefined;
+        if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+          summary += delta.text;
+        }
+      }
+    }
+    if (c.type === 'assistant') {
+      const content = (c.message as Record<string, unknown>)?.content;
+      if (Array.isArray(content)) {
+        for (const block of content) {
+          if (block && typeof block === 'object' && (block as Record<string, unknown>).type === 'text') {
+            summary += (block as Record<string, unknown>).text as string;
+          }
+        }
+      }
+    }
+    if (c.type === 'result' && typeof c.result === 'string' && !summary) {
+      summary = c.result;
+    }
+  });
+
+  if (!summary.trim()) throw new Error('summarizer produced empty output');
+
+  // Archive originals + drop them from live store
+  const compaction = hubStore.compactChannel(channelId, summary, by);
+  if (!compaction) throw new Error('compaction failed');
+
+  // Post the new seed message — depth=0 (root), no parent.
+  // Mark the message so the dashboard can render a "📜 compacted from N
+  // messages" badge instead of treating it as a normal user post.
+  const seedContent = `📜 **Channel compacted** — ${compaction.messageIds.length} messages folded into ${compaction.id}\n\n${summary}`;
+  const seedMessage = postHubMessage({
+    from: by,
+    fromName: by,
+    content: seedContent,
+    channelIds: [channelId],
+    tags: ['compaction'],
+  });
+
+  // Broadcast a channel-changed event so dashboards reload the message list
+  broadcastToDashboards({
+    type: 'DASHBOARD_EVENT',
+    event: 'CHANNEL_COMPACTED',
+    channelId,
+    compactionId: compaction.id,
+    seedMessageId: seedMessage.id,
+  });
+
+  return { seedMessage, compaction };
 }
 
 /** Compact output using a utility Claude CLI on the same machine. */

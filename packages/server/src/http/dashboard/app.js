@@ -1225,6 +1225,13 @@ function handleHubEvent(msg) {
   if (msg.event === 'DOCS_CHANGED' && msg.channelId === activeChannelId && hubVisible) {
     loadChannelDocs(msg.channelId);
   }
+  if (msg.event === 'CHANNEL_COMPACTED') {
+    // Drop the old in-memory message list — the server has archived them.
+    delete hubMessages[msg.channelId];
+    if (msg.channelId === activeChannelId && hubVisible) {
+      selectChannel(msg.channelId);
+    }
+  }
 }
 
 // ── Hub tab switching ─────────────────────────────────────────────────────
@@ -1244,6 +1251,99 @@ function switchHubView(view) {
 document.querySelectorAll('.hub-tab').forEach(btn => {
   btn.addEventListener('click', () => switchHubView(btn.dataset.view));
 });
+
+// ── Channel compaction ───────────────────────────────────────────────────
+document.getElementById('hub-compact-btn')?.addEventListener('click', async () => {
+  if (!activeChannelId) {
+    alert('Select a channel first.');
+    return;
+  }
+  const msgs = hubMessages[activeChannelId] ?? [];
+  if (msgs.length === 0) {
+    alert('Channel has no messages to compact.');
+    return;
+  }
+  const ok = confirm(
+    `Compact #${activeChannelId}?\n\n` +
+    `This will:\n` +
+    `  • Run an LLM to summarize all ${msgs.length} message(s)\n` +
+    `  • Archive the originals into the channel chat-log (recoverable via History)\n` +
+    `  • Replace the live channel with a single seed message containing the summary\n\n` +
+    `Continue?`
+  );
+  if (!ok) return;
+
+  const btn = document.getElementById('hub-compact-btn');
+  const originalLabel = btn.textContent;
+  btn.disabled = true;
+  btn.textContent = '⏳ compacting…';
+  try {
+    await apiFetch(`/api/hub/channels/${activeChannelId}/compact`, {
+      method: 'POST',
+      body: JSON.stringify({ by: 'user' }),
+    });
+    // The CHANNEL_COMPACTED ws event will reload the channel; trigger it now too
+    // in case the WS is dropped or the user has the modal blocking the event.
+    await selectChannel(activeChannelId);
+  } catch (err) {
+    alert('Compact failed: ' + err.message);
+  } finally {
+    btn.disabled = false;
+    btn.textContent = originalLabel;
+  }
+});
+
+document.getElementById('hub-history-btn')?.addEventListener('click', async () => {
+  if (!activeChannelId) {
+    alert('Select a channel first.');
+    return;
+  }
+  await openCompactionHistory(activeChannelId);
+});
+
+async function openCompactionHistory(channelId) {
+  const compactions = await apiFetch(`/api/hub/channels/${channelId}/compactions`);
+  const modal = document.getElementById('compaction-history-modal');
+  const titleEl = document.getElementById('ch-title');
+  const listEl = document.getElementById('ch-list');
+  const emptyEl = document.getElementById('ch-empty');
+  const channel = hubChannels.find(c => c.id === channelId);
+  titleEl.textContent = `Compactions for ${channel?.name ?? channelId}`;
+  if (!Array.isArray(compactions) || compactions.length === 0) {
+    listEl.innerHTML = '';
+    emptyEl.style.display = 'block';
+  } else {
+    emptyEl.style.display = 'none';
+    listEl.innerHTML = compactions.map((c, i) => `
+      <div class="compaction-row">
+        <div class="compaction-row-header">
+          <span class="compaction-id">${esc(c.id)}</span>
+          <span class="compaction-meta">${new Date(c.createdAt).toLocaleString()} · by ${esc(c.createdBy)} · ${c.messageIds.length} msgs</span>
+        </div>
+        <details>
+          <summary>Summary</summary>
+          <pre class="compaction-summary">${esc(c.summary)}</pre>
+        </details>
+        <details>
+          <summary>Original messages (${c.messages.length})</summary>
+          <div class="compaction-originals">
+            ${c.messages.map(m => `
+              <div class="compaction-original-msg">
+                <div class="compaction-original-header">
+                  <strong>${esc(m.fromName)}</strong>
+                  <span style="color:var(--muted)">${new Date(m.timestamp).toLocaleString()}</span>
+                  <span style="color:var(--muted)">depth ${m.depth}</span>
+                </div>
+                <pre class="compaction-original-content">${esc(m.content)}</pre>
+              </div>
+            `).join('')}
+          </div>
+        </details>
+      </div>
+    `).join('');
+  }
+  modal.style.display = 'flex';
+}
 
 // ── Tasks ────────────────────────────────────────────────────────────────
 async function loadChannelTasks(channelId) {

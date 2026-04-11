@@ -8,7 +8,7 @@ import { taskStore } from '../hub/taskStore.js';
 import type { TaskStatus, TaskPriority, UpdateTaskFields } from '../hub/taskStore.js';
 import { docStore } from '../hub/docStore.js';
 import type { UpdateDocFields } from '../hub/docStore.js';
-import { postHubMessage, resolveScreenName, triggerSessionOnMessage } from '../hub/hubRouter.js';
+import { postHubMessage, resolveScreenName, triggerSessionOnMessage, compactChannel } from '../hub/hubRouter.js';
 import { broadcastToDashboards } from '../ws/dashboardBroadcast.js';
 import { pushManager } from '../push/pushManager.js';
 import type webpush from 'web-push';
@@ -405,6 +405,28 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     const channelId = hubChannelMsgMatch[1];
     const since = url.searchParams.get('since') ?? undefined;
     json(res, 200, hubStore.getByChannel(channelId, since));
+    return true;
+  }
+
+  // POST /api/hub/channels/:id/compact — LLM-summarize the channel and reset
+  const hubCompactMatch = pathname.match(/^\/api\/hub\/channels\/([^/]+)\/compact$/);
+  if (hubCompactMatch && method === 'POST') {
+    const channelId = hubCompactMatch[1];
+    const body = await readBody(req) as { by?: string; machineId?: string };
+    try {
+      const result = await compactChannel(channelId, body.by ?? 'user', body.machineId);
+      json(res, 200, result);
+    } catch (e) {
+      json(res, 400, { error: (e as Error).message });
+    }
+    return true;
+  }
+
+  // GET /api/hub/channels/:id/compactions — list past compactions for the channel
+  const hubCompactionsMatch = pathname.match(/^\/api\/hub\/channels\/([^/]+)\/compactions$/);
+  if (hubCompactionsMatch && method === 'GET') {
+    const channelId = hubCompactionsMatch[1];
+    json(res, 200, hubStore.getCompactions(channelId));
     return true;
   }
 

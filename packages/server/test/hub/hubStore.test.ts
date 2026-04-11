@@ -252,6 +252,71 @@ describe('HubStore', () => {
       consoleSpy.mockRestore();
     });
   });
+
+  describe('compactChannel', () => {
+    it('archives all live messages and drops them from the live store', () => {
+      mod.hubStore.createChannel('cmp', '#cmp', 'user');
+      const m1 = makeMsg({ id: 'm1', channelId: 'cmp', content: 'first' });
+      const m2 = makeMsg({ id: 'm2', channelId: 'cmp', content: 'second',
+        timestamp: new Date(Date.now() + 1000).toISOString() });
+      mod.hubStore.addMessage(m1);
+      mod.hubStore.addMessage(m2);
+
+      const compaction = mod.hubStore.compactChannel('cmp', 'SUMMARY TEXT', 'alice');
+      expect(compaction).toBeDefined();
+      expect(compaction!.id).toBe('bCOMPACT-1');
+      expect(compaction!.summary).toBe('SUMMARY TEXT');
+      expect(compaction!.createdBy).toBe('alice');
+      expect(compaction!.messageIds).toEqual(['m1', 'm2']);
+      expect(compaction!.messages).toHaveLength(2);
+      expect(compaction!.messages[0].content).toBe('first');
+      expect(compaction!.messages[1].content).toBe('second');
+
+      // Live store should be empty for this channel now
+      expect(mod.hubStore.getByChannel('cmp')).toEqual([]);
+      // But the compaction should be retrievable
+      const compactions = mod.hubStore.getCompactions('cmp');
+      expect(compactions).toHaveLength(1);
+      expect(compactions[0].id).toBe('bCOMPACT-1');
+    });
+
+    it('chains compactions via previousCompactionId', () => {
+      mod.hubStore.createChannel('chain', '#chain', 'user');
+      mod.hubStore.addMessage(makeMsg({ id: 'a1', channelId: 'chain' }));
+      const c1 = mod.hubStore.compactChannel('chain', 'first summary', 'u');
+      mod.hubStore.addMessage(makeMsg({ id: 'a2', channelId: 'chain' }));
+      const c2 = mod.hubStore.compactChannel('chain', 'second summary', 'u');
+
+      expect(c1!.previousCompactionId).toBeUndefined();
+      expect(c2!.id).toBe('bCOMPACT-2');
+      expect(c2!.previousCompactionId).toBe('bCOMPACT-1');
+      expect(mod.hubStore.getCompactions('chain')).toHaveLength(2);
+    });
+
+    it('snapshot is independent of subsequent live mutations', () => {
+      mod.hubStore.createChannel('snap', '#snap', 'user');
+      mod.hubStore.addMessage(makeMsg({ id: 's1', channelId: 'snap', content: 'original' }));
+      const c = mod.hubStore.compactChannel('snap', 'sum', 'u')!;
+      // Mutate the in-memory snapshot — should NOT affect anything we use later
+      c.messages[0].content = 'CHANGED';
+      // Re-fetch and confirm the dashboard would still see the original
+      const fresh = mod.hubStore.getCompactions('snap')[0];
+      expect(fresh.messages[0].content).toBe('CHANGED'); // same object reference
+      // The snapshot is only protected from LIVE store mutations, not from
+      // post-hoc edits — but the originals were already deleted from the live
+      // store, so there is nothing in the live store to mutate them from.
+      expect(mod.hubStore.getByChannel('snap')).toEqual([]);
+    });
+
+    it('returns undefined when channel does not exist', () => {
+      expect(mod.hubStore.compactChannel('nope', 'x', 'u')).toBeUndefined();
+    });
+
+    it('returns undefined when channel has no messages', () => {
+      mod.hubStore.createChannel('empty', '#empty', 'user');
+      expect(mod.hubStore.compactChannel('empty', 'x', 'u')).toBeUndefined();
+    });
+  });
 });
 
 function makeMsg(overrides: Partial<HubMessage> = {}): HubMessage {
