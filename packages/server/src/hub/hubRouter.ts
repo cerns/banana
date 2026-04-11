@@ -1221,22 +1221,50 @@ export async function compactChannel(
 
   console.log(`[hub] compactChannel ${channelId} starting — ${messages.length} live messages, ${(channel.compactions ?? []).length} prior compactions`);
 
-  // Pick a machine: caller-supplied first, then any available remote session's
-  // machine, then any registered machine.
+  // Pick a machine for the summarizer. Preference order:
+  //   1. Caller-supplied machineId (if it actually exists)
+  //   2. A machine used by any agent that is subscribed to THIS channel
+  //   3. A machine used by any remote session anywhere
+  //   4. The first registered machine in machineStore
+  // We resolve every candidate against machineStore.get() so a stale
+  // machineId on a session (machine deleted) silently falls through to
+  // the next candidate instead of throwing "machine not found".
   const { machineStore } = await import('../machines/machineStore.js');
-  let mid = machineId;
-  if (!mid) {
-    const remote = sessionStore.getAll().find(s => s.type === 'remote' && s.machineId);
-    mid = remote?.machineId;
-  }
-  if (!mid) {
-    const machines = machineStore.getAll();
-    mid = machines[0]?.id;
-  }
-  if (!mid) throw new Error('no machine available to run summarizer');
 
-  const machine = machineStore.get(mid);
-  if (!machine) throw new Error('machine not found');
+  const tryResolve = (mid: string | undefined) => {
+    if (!mid) return undefined;
+    return machineStore.get(mid);
+  };
+
+  let machine = tryResolve(machineId);
+
+  if (!machine) {
+    // Sessions actually subscribed to this channel — most relevant.
+    const inChannel = sessionStore.getAll().filter(s =>
+      s.type === 'remote' && s.machineId && s.channels?.includes(channelId),
+    );
+    for (const s of inChannel) {
+      machine = tryResolve(s.machineId);
+      if (machine) break;
+    }
+  }
+
+  if (!machine) {
+    // Fallback: any remote session's machine
+    for (const s of sessionStore.getAll()) {
+      if (s.type === 'remote' && s.machineId) {
+        machine = tryResolve(s.machineId);
+        if (machine) break;
+      }
+    }
+  }
+
+  if (!machine) {
+    // Last resort: any registered machine
+    machine = machineStore.getAll()[0];
+  }
+
+  if (!machine) throw new Error('no machine available to run summarizer');
 
   // Include prior compaction summaries so the new compaction is cumulative.
   const priorSummaries = (channel.compactions ?? [])
