@@ -35,6 +35,18 @@ function createMockStream() {
   stream.stderr = new EventEmitter();
   stream.signal = vi.fn();
   stream.close = vi.fn();
+  // Writable stdin half — used by the large-prompt path. Tracks every write
+  // so tests can assert what was piped over the channel.
+  const stdin = new EventEmitter() as any;
+  stdin.writes = [] as string[];
+  stdin.ended = false;
+  stdin.write = vi.fn((data: string | Buffer, cb?: (err?: Error | null) => void) => {
+    stdin.writes.push(typeof data === 'string' ? data : data.toString());
+    if (cb) cb();
+    return true;
+  });
+  stdin.end = vi.fn(() => { stdin.ended = true; });
+  stream.stdin = stdin;
   return stream;
 }
 
@@ -430,6 +442,60 @@ describe('sshRunner', () => {
 
       const result = await promise;
       expect(result.exitCode).toBe(0);
+      consoleSpy.mockRestore();
+    });
+
+    it('should pipe large prompts via stdin instead of argv', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine();
+      // 32KB prompt — well over the 16KB stdin threshold
+      const bigPrompt = 'x'.repeat(32 * 1024);
+      const promise = sshRunner.runClaudeOverSsh(machine, bigPrompt, '/work', () => {});
+
+      let cmd = '';
+      let execOpts: any;
+      const stream = createMockStream();
+      mockClientInstance.exec.mockImplementation((c: string, opts: any, cb: Function) => {
+        cmd = c;
+        execOpts = opts;
+        cb(null, stream);
+      });
+      mockClientInstance.emit('ready');
+      await flush();
+      stream.emit('close', 0);
+
+      const result = await promise;
+      expect(result.exitCode).toBe(0);
+      // The huge prompt is NOT embedded in the command
+      expect(cmd).not.toContain('xxxxxxxxxxxxxxxx');
+      // PTY is disabled in the stdin path
+      expect(execOpts).toEqual({});
+      // The full prompt was written to stdin and the stream was ended
+      const total = stream.stdin.writes.join('');
+      expect(total.length).toBe(bigPrompt.length);
+      expect(stream.stdin.ended).toBe(true);
+      consoleSpy.mockRestore();
+    });
+
+    it('should reject when stdin write errors (EPIPE)', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine();
+      const bigPrompt = 'y'.repeat(32 * 1024);
+      const promise = sshRunner.runClaudeOverSsh(machine, bigPrompt, '/work', () => {});
+
+      const stream = createMockStream();
+      // First write callback reports EPIPE
+      stream.stdin.write = vi.fn((_data: string, cb?: (err?: Error | null) => void) => {
+        if (cb) cb(new Error('write EPIPE'));
+        return true;
+      });
+      mockClientInstance.exec.mockImplementation((_c: string, _opts: any, cb: Function) => {
+        cb(null, stream);
+      });
+      mockClientInstance.emit('ready');
+      await flush();
+
+      await expect(promise).rejects.toThrow('write EPIPE');
       consoleSpy.mockRestore();
     });
 

@@ -139,6 +139,13 @@ function getClaudeBin(machine: MachineRecord): string {
   return 'claude';
 }
 
+/** Threshold (in chars) above which the prompt is sent via stdin instead of
+ * being embedded as a shell argument. Avoids EPIPE / argv-too-long failures
+ * when prompts are large (e.g. channel compaction transcripts). The SSH
+ * exec request packet has a practical ~32KB ceiling, and PTY input has line
+ * discipline limits, so anything above ~16KB gets piped via stdin instead. */
+const STDIN_PROMPT_THRESHOLD = 16 * 1024;
+
 /** Run Claude CLI over SSH, streaming output chunks. Supports abort via AbortSignal. */
 export async function runClaudeOverSsh(
   machine: MachineRecord,
@@ -153,6 +160,7 @@ export async function runClaudeOverSsh(
 
   const startedAt = Date.now();
   const claudeBin = getClaudeBin(machine);
+  const useStdin = prompt.length > STDIN_PROMPT_THRESHOLD;
 
   const args = [
     '--print',
@@ -170,7 +178,11 @@ export async function runClaudeOverSsh(
     args.push('--resume', shellEscape(resumeId));
   }
 
-  args.push(shellEscape(prompt));
+  // Large prompts are streamed via stdin instead of being embedded in argv.
+  // claude --print reads from stdin when no positional prompt is provided.
+  if (!useStdin) {
+    args.push(shellEscape(prompt));
+  }
 
   const pathPrefix = 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$PATH"';
   const cmdParts = [pathPrefix];
@@ -179,7 +191,7 @@ export async function runClaudeOverSsh(
   const command = cmdParts.join(' && ');
 
   console.log(`[ssh-runner] Connecting to ${machine.username}@${machine.ip}:${machine.port}`);
-  console.log(`[ssh-runner] Command: ${command}`);
+  console.log(`[ssh-runner] Command: ${command}${useStdin ? ` (prompt ${prompt.length} chars via stdin)` : ''}`);
 
   const conn = await connectWithRetry(machine, signal);
 
@@ -191,8 +203,40 @@ export async function runClaudeOverSsh(
       settle(() => { try { conn.end(); } catch { /* noop */ } reject(err); });
     });
 
-    conn.exec(command, { pty: true }, (err, stream) => {
+    // PTY mangles binary stdin via line discipline (CR/LF translation, ^D
+    // on EOT, canonical-mode line buffering). For the stdin path we run in
+    // raw exec mode without PTY allocation.
+    const execOpts = useStdin ? {} : { pty: true };
+    conn.exec(command, execOpts, (err, stream) => {
       if (err) { settle(() => { conn.end(); reject(err); }); return; }
+
+      // Pipe the prompt via stdin in chunked writes so we never block the
+      // SSH channel buffer with one massive write. Surface write errors
+      // (e.g. EPIPE if claude exits early) by rejecting the outer promise.
+      if (useStdin) {
+        const CHUNK = 32 * 1024;
+        let offset = 0;
+        const writeNext = () => {
+          while (offset < prompt.length) {
+            const slice = prompt.slice(offset, offset + CHUNK);
+            offset += slice.length;
+            const ok = stream.stdin.write(slice, (writeErr?: Error | null) => {
+              if (writeErr) {
+                settle(() => { try { conn.end(); } catch { /* noop */ } reject(writeErr); });
+              }
+            });
+            if (!ok) {
+              stream.stdin.once('drain', writeNext);
+              return;
+            }
+          }
+          stream.stdin.end();
+        };
+        stream.stdin.on('error', (writeErr: Error) => {
+          settle(() => { try { conn.end(); } catch { /* noop */ } reject(writeErr); });
+        });
+        writeNext();
+      }
 
       let buffer = '';
       let claudeSessionId: string | undefined;
