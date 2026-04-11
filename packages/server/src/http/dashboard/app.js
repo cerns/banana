@@ -1229,7 +1229,7 @@ function handleHubEvent(msg) {
     // Drop the old in-memory message list — the server has archived them.
     delete hubMessages[msg.channelId];
     if (msg.channelId === activeChannelId && hubVisible) {
-      selectChannel(msg.channelId);
+      selectHubChannel(msg.channelId);
     }
   }
 }
@@ -1274,21 +1274,46 @@ document.getElementById('hub-compact-btn')?.addEventListener('click', async () =
   if (!ok) return;
 
   const btn = document.getElementById('hub-compact-btn');
+  const historyBtn = document.getElementById('hub-history-btn');
+  const statusEl = document.getElementById('hub-compact-status');
   const originalLabel = btn.textContent;
   btn.disabled = true;
+  if (historyBtn) historyBtn.disabled = true;
   btn.textContent = '⏳ compacting…';
+  if (statusEl) {
+    statusEl.style.display = 'inline-flex';
+    statusEl.className = 'hub-compact-status running';
+    statusEl.textContent = `⏳ summarizing ${msgs.length} messages — this may take 30–90s`;
+  }
+  const startedAt = Date.now();
   try {
-    await apiFetch(`/api/hub/channels/${activeChannelId}/compact`, {
+    const result = await apiFetch(`/api/hub/channels/${activeChannelId}/compact`, {
       method: 'POST',
       body: JSON.stringify({ by: 'user' }),
     });
+    // apiFetch does not throw on HTTP errors — surface backend errors here.
+    if (result && typeof result === 'object' && result.error) {
+      throw new Error(result.error);
+    }
+    const elapsed = Math.round((Date.now() - startedAt) / 1000);
+    if (statusEl) {
+      statusEl.className = 'hub-compact-status ok';
+      statusEl.textContent = `✓ compacted in ${elapsed}s`;
+      setTimeout(() => { statusEl.style.display = 'none'; }, 5000);
+    }
     // The CHANNEL_COMPACTED ws event will reload the channel; trigger it now too
     // in case the WS is dropped or the user has the modal blocking the event.
-    await selectChannel(activeChannelId);
+    delete hubMessages[activeChannelId];
+    await selectHubChannel(activeChannelId);
   } catch (err) {
+    if (statusEl) {
+      statusEl.className = 'hub-compact-status error';
+      statusEl.textContent = `✗ ${err.message}`;
+    }
     alert('Compact failed: ' + err.message);
   } finally {
     btn.disabled = false;
+    if (historyBtn) historyBtn.disabled = false;
     btn.textContent = originalLabel;
   }
 });
@@ -1302,13 +1327,23 @@ document.getElementById('hub-history-btn')?.addEventListener('click', async () =
 });
 
 async function openCompactionHistory(channelId) {
-  const compactions = await apiFetch(`/api/hub/channels/${channelId}/compactions`);
+  let compactions;
+  try {
+    compactions = await apiFetch(`/api/hub/channels/${channelId}/compactions`);
+  } catch (err) {
+    alert('Failed to load history: ' + err.message);
+    return;
+  }
+  if (compactions && typeof compactions === 'object' && compactions.error) {
+    alert('Failed to load history: ' + compactions.error);
+    return;
+  }
   const modal = document.getElementById('compaction-history-modal');
   const titleEl = document.getElementById('ch-title');
   const listEl = document.getElementById('ch-list');
   const emptyEl = document.getElementById('ch-empty');
   const channel = hubChannels.find(c => c.id === channelId);
-  titleEl.textContent = `Compactions for ${channel?.name ?? channelId}`;
+  titleEl.textContent = `Compactions for ${channel?.name ?? channelId} (${Array.isArray(compactions) ? compactions.length : 0})`;
   if (!Array.isArray(compactions) || compactions.length === 0) {
     listEl.innerHTML = '';
     emptyEl.style.display = 'block';

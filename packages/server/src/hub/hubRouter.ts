@@ -1114,6 +1114,8 @@ export async function compactChannel(
   const messages = hubStore.getByChannel(channelId);
   if (messages.length === 0) throw new Error('channel has no messages to compact');
 
+  console.log(`[hub] compactChannel ${channelId} starting — ${messages.length} live messages, ${(channel.compactions ?? []).length} prior compactions`);
+
   // Pick a machine: caller-supplied first, then any available remote session's
   // machine, then any registered machine.
   const { machineStore } = await import('../machines/machineStore.js');
@@ -1166,6 +1168,8 @@ export async function compactChannel(
   const machine = machineStore.get(mid);
   if (!machine) throw new Error('machine not found');
 
+  console.log(`[hub] compactChannel ${channelId} → running summarizer on machine ${machine.id} (${machine.ip})`);
+
   const { runClaudeOverSsh } = await import('../ssh/sshRunner.js');
   let summary = '';
   await runClaudeOverSsh(machine, prompt, '', (chunk) => {
@@ -1194,11 +1198,20 @@ export async function compactChannel(
     }
   });
 
+  console.log(`[hub] compactChannel ${channelId} ← summarizer returned ${summary.length} chars`);
+
   if (!summary.trim()) throw new Error('summarizer produced empty output');
 
   // Archive originals + drop them from live store
   const compaction = hubStore.compactChannel(channelId, summary, by);
   if (!compaction) throw new Error('compaction failed');
+
+  // Force-flush so the new compaction is on disk before we return — protects
+  // against the dashboard race where the user opens History within the 250ms
+  // debounce window and reads stale state.
+  await hubStore.persistNow();
+
+  console.log(`[hub] compactChannel ${channelId} ✓ archived ${compaction.messageIds.length} messages → ${compaction.id}`);
 
   // Post the new seed message — depth=0 (root), no parent.
   // Mark the message so the dashboard can render a "📜 compacted from N

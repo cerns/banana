@@ -588,6 +588,36 @@ header h1 { font-size: 16px; color: var(--accent); }
 #hub-channel-actions {
   display: flex;
   gap: 4px;
+  align-items: center;
+}
+
+.hub-compact-status {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 8px;
+  border-radius: 3px;
+  font-size: 11px;
+  margin-left: 6px;
+}
+.hub-compact-status.running {
+  background: rgba(255, 200, 0, 0.15);
+  color: #ffc800;
+  border: 1px solid rgba(255, 200, 0, 0.3);
+  animation: hub-compact-pulse 1.5s ease-in-out infinite;
+}
+.hub-compact-status.ok {
+  background: rgba(0, 200, 100, 0.15);
+  color: #00c864;
+  border: 1px solid rgba(0, 200, 100, 0.3);
+}
+.hub-compact-status.error {
+  background: rgba(255, 80, 80, 0.15);
+  color: #ff5050;
+  border: 1px solid rgba(255, 80, 80, 0.3);
+}
+@keyframes hub-compact-pulse {
+  0%, 100% { opacity: 0.65; }
+  50% { opacity: 1; }
 }
 
 #hub-tabs {
