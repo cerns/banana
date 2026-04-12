@@ -1081,7 +1081,7 @@ describe('apiRouter', () => {
       expect(res._body).toHaveLength(2);
     });
 
-    it('DELETE /api/hub/docs/:id should remove doc', async () => {
+    it('DELETE /api/hub/docs/:id should soft-delete (archive) doc', async () => {
       const { docStore } = await import('../../src/hub/docStore.js');
       const d = docStore.createDoc('d-del', 'X', 'b', 'u');
 
@@ -1089,7 +1089,15 @@ describe('apiRouter', () => {
       const res = createRes();
       await handleApiRequest(req, res);
       expect(res._status).toBe(200);
-      expect(docStore.getDoc(d.id)).toBeUndefined();
+      expect(res._body.archived).toBe(true);
+      // Doc still exists but is archived
+      const doc = docStore.getDoc(d.id);
+      expect(doc).toBeDefined();
+      expect(doc!.archived).toBe(true);
+      // Archived docs are excluded from channel listing
+      expect(docStore.getByChannel('d-del').find(x => x.id === d.id)).toBeUndefined();
+      // But included with flag
+      expect(docStore.getByChannel('d-del', true).find(x => x.id === d.id)).toBeDefined();
     });
 
     it('DELETE /api/hub/docs/:id should 404 for unknown', async () => {

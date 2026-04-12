@@ -392,6 +392,8 @@ bConfluence (doc store — bCONF-N IDs, versioned):
   Added refresh-token rotation rule.
   [/bCONF_APPEND]
 
+  [bCONF_DELETE id=bCONF-3]
+
 WHEN to use these vs plain chat:
   - Decisions / specs / threshold values others will need later → bConfluence.
   - Concrete actionable work that needs status tracking → bJira.
@@ -1101,6 +1103,9 @@ function applyArtifactActions(
   }
   for (const a of actions.docAppends) {
     if (docStore.appendDoc(a.id, a.text, by)) docsChanged = true;
+  }
+  for (const d of actions.docDeletes) {
+    if (docStore.archiveDoc(d.id, by)) docsChanged = true;
   }
 
   if (tasksChanged) {

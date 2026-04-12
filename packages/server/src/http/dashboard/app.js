@@ -1665,8 +1665,8 @@ function renderDocs() {
     return;
   }
   container.innerHTML = docs.map(d => `
-    <div class="doc-row${d.id === currentDocId ? ' active' : ''}" data-doc-id="${esc(d.id)}">
-      <div class="doc-row-title">${esc(d.title)}</div>
+    <div class="doc-row${d.id === currentDocId ? ' active' : ''}${d.archived ? ' doc-archived' : ''}" data-doc-id="${esc(d.id)}">
+      <div class="doc-row-title">${esc(d.title)}${d.archived ? ' <span style="color:var(--red);font-size:10px">[archived]</span>' : ''}</div>
       <div class="doc-row-meta">${esc(d.id)} · v${d.version} · ${esc(d.author)}</div>
     </div>
   `).join('');
@@ -1682,19 +1682,67 @@ async function showDoc(docId) {
   currentDocId = docId;
   const doc = await apiFetch(`/api/hub/docs/${docId}`);
   const bodyEl = document.getElementById('hub-doc-body');
+  const archivedBadge = doc.archived
+    ? `<span style="background:var(--red);color:#000;padding:1px 5px;border-radius:3px;font-size:10px;margin-left:6px">ARCHIVED</span>` : '';
+  const restoreBtn = doc.archived
+    ? `<button class="btn btn-sm" id="hub-doc-restore-btn" style="background:var(--green);color:#000">Restore</button>` : '';
   bodyEl.innerHTML = `
     <div style="margin-bottom:12px">
-      <div style="font-size:14px;font-weight:600">${esc(doc.title)}</div>
+      <div style="font-size:14px;font-weight:600">${esc(doc.title)}${archivedBadge}</div>
       <div style="font-size:11px;color:var(--muted)">${esc(doc.id)} · v${doc.version} · ${esc(doc.author)} · ${new Date(doc.updatedAt).toLocaleString()}</div>
-      <button class="btn btn-sm" id="hub-doc-edit-btn" style="margin-top:6px">Edit</button>
+      <div style="margin-top:6px;display:flex;gap:6px">
+        <button class="btn btn-sm" id="hub-doc-edit-btn">Edit</button>
+        <button class="btn btn-sm" id="hub-doc-history-btn" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">History (v${doc.version})</button>
+        ${restoreBtn}
+      </div>
     </div>
     <pre style="white-space:pre-wrap;font-family:var(--font-mono);font-size:12px">${esc(doc.body)}</pre>
   `;
   document.getElementById('hub-doc-edit-btn').addEventListener('click', () => openDocModal(docId));
+  document.getElementById('hub-doc-history-btn').addEventListener('click', () => showDocHistory(docId));
+  document.getElementById('hub-doc-restore-btn')?.addEventListener('click', async () => {
+    await apiFetch(`/api/hub/docs/${docId}/restore`, { method: 'POST' });
+    loadChannelDocs(activeChannelId);
+    showDoc(docId);
+  });
   // Re-render list to update active highlight
   document.querySelectorAll('.doc-row').forEach(el => {
     el.classList.toggle('active', el.dataset.docId === docId);
   });
+}
+
+async function showDocHistory(docId) {
+  const history = await apiFetch(`/api/hub/docs/${docId}/history`);
+  const doc = await apiFetch(`/api/hub/docs/${docId}`);
+  const bodyEl = document.getElementById('hub-doc-body');
+  if (!Array.isArray(history) || history.length === 0) {
+    bodyEl.innerHTML = `
+      <div style="margin-bottom:8px"><button class="btn btn-sm doc-back-btn">Back</button> <b>${esc(doc.title)}</b> — Version History</div>
+      <div style="color:var(--muted);padding:20px;text-align:center">No prior versions</div>
+    `;
+    bodyEl.querySelector('.doc-back-btn').addEventListener('click', () => showDoc(docId));
+    return;
+  }
+  // Show current version + all history versions, newest first
+  const versions = [
+    { version: doc.version, at: doc.updatedAt, by: doc.author, body: doc.body, current: true },
+    ...history.slice().reverse(),
+  ];
+  bodyEl.innerHTML = `
+    <div style="margin-bottom:8px"><button class="btn btn-sm doc-back-btn">Back</button> <b>${esc(doc.title)}</b> — Version History (${versions.length} versions)</div>
+    <div class="doc-history-list">
+      ${versions.map(v => `
+        <div class="doc-history-entry" data-version="${v.version}">
+          <div class="doc-history-header">
+            <span style="font-weight:600">v${v.version}${v.current ? ' (current)' : ''}</span>
+            <span style="color:var(--muted);font-size:11px">${esc(v.by)} · ${new Date(v.at).toLocaleString()}</span>
+          </div>
+          <pre class="doc-history-body">${esc(v.body)}</pre>
+        </div>
+      `).join('')}
+    </div>
+  `;
+  bodyEl.querySelector('.doc-back-btn').addEventListener('click', () => showDoc(docId));
 }
 
 document.getElementById('hub-doc-search').addEventListener('input', debounce(() => {

@@ -20,6 +20,9 @@ export interface ChannelDoc {
   updatedAt: string;
   version: number;
   history: DocRevision[];
+  archived?: boolean;         // soft-deleted
+  archivedAt?: string;
+  archivedBy?: string;
 }
 
 export interface UpdateDocFields {
@@ -134,14 +137,41 @@ class DocStore {
     }
   }
 
+  /** Soft-delete: marks doc as archived (preserves history). */
+  archiveDoc(id: string, by: string): ChannelDoc | undefined {
+    const doc = this.findDoc(id);
+    if (!doc || doc.archived) return undefined;
+    doc.archived = true;
+    doc.archivedAt = new Date().toISOString();
+    doc.archivedBy = by;
+    doc.updatedAt = doc.archivedAt;
+    this.persist();
+    return doc;
+  }
+
+  /** Undo soft-delete. */
+  restoreDoc(id: string): ChannelDoc | undefined {
+    const doc = this.findDoc(id);
+    if (!doc || !doc.archived) return undefined;
+    doc.archived = false;
+    doc.archivedAt = undefined;
+    doc.archivedBy = undefined;
+    doc.updatedAt = new Date().toISOString();
+    this.persist();
+    return doc;
+  }
+
   getDoc(id: string, channelId?: string): ChannelDoc | undefined {
     return this.findDoc(id, channelId);
   }
 
-  getByChannel(channelId: string): ChannelDoc[] {
+  getByChannel(channelId: string, includeArchived = false): ChannelDoc[] {
     const out: ChannelDoc[] = [];
     for (const doc of this.docs.values()) {
-      if (doc.channelId === channelId) out.push(doc);
+      if (doc.channelId === channelId) {
+        if (!includeArchived && doc.archived) continue;
+        out.push(doc);
+      }
     }
     return out.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   }
@@ -152,6 +182,7 @@ class DocStore {
     const out: ChannelDoc[] = [];
     for (const doc of this.docs.values()) {
       if (doc.channelId !== channelId) continue;
+      if (doc.archived) continue;
       if (tagSet) {
         const overlap = doc.tags.some(t => tagSet.has(t));
         if (!overlap) continue;

@@ -21,6 +21,7 @@ export interface ArtifactActions {
   docWrites: Array<{ title: string; body: string; tags?: string[] }>;
   docUpdates: Array<{ id: string; title?: string; body?: string; tags?: string[] }>;
   docAppends: Array<{ id: string; text: string }>;
+  docDeletes: Array<{ id: string }>;
   /** Reply with all recognized markers stripped — used as the chat post body. */
   cleanedText: string;
 }
@@ -66,6 +67,7 @@ export function extractArtifactActions(reply: string): ArtifactActions {
     docWrites: [],
     docUpdates: [],
     docAppends: [],
+    docDeletes: [],
     cleanedText: reply,
   };
 
@@ -164,6 +166,16 @@ export function extractArtifactActions(reply: string): ArtifactActions {
         actions.docAppends.push({ id: attrs.id, text: body });
       },
     },
+    {
+      tag: 'bCONF_DELETE',
+      apply: (attrs) => {
+        if (!attrs.id) {
+          console.warn('[extractor] bCONF_DELETE missing id — dropped');
+          return;
+        }
+        actions.docDeletes.push({ id: attrs.id });
+      },
+    },
   ];
 
   for (const { tag, apply } of blockHandlers) {
@@ -177,6 +189,23 @@ export function extractArtifactActions(reply: string): ArtifactActions {
       return '';
     });
   }
+
+  // ── Self-closing bCONF_DELETE ────────────────────────────────────────
+  // [bCONF_DELETE id=bCONF-3] (no closing tag needed)
+  const deleteSelfRe = /\[bCONF_DELETE([^\]]*)\](?!\s*[\s\S]*?\[\/bCONF_DELETE\])/gi;
+  actions.cleanedText = actions.cleanedText.replace(deleteSelfRe, (_full, rawAttrs: string) => {
+    try {
+      const attrs = parseAttrs(rawAttrs);
+      if (!attrs.id) {
+        console.warn('[extractor] bCONF_DELETE (self-closing) missing id — dropped');
+        return '';
+      }
+      actions.docDeletes.push({ id: attrs.id });
+    } catch (e) {
+      console.warn('[extractor] error parsing bCONF_DELETE:', e);
+    }
+    return '';
+  });
 
   // ── Self-closing bJIRA_UPDATE ────────────────────────────────────────
   // [bJIRA_UPDATE id=bJIRA-12 status=done] (no closing tag, no body)
