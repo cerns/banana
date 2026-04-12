@@ -582,9 +582,14 @@ async function sendPrompt() {
   const prompt = promptInput.value.trim();
   if (!prompt || !activeSessionId) return;
   promptInput.value = '';
+  // Use the session's stored model, falling back to the header dropdown selection.
+  const session = sessions[activeSessionId];
+  const model = session?.model || document.getElementById('model-select')?.value || '';
+  const sendBody = { prompt };
+  if (model) sendBody.model = model;
   const data = await apiFetch(`/api/sessions/${activeSessionId}/send`, {
     method: 'POST',
-    body: JSON.stringify({ prompt }),
+    body: JSON.stringify(sendBody),
   });
   if (data.jobId) {
     if (!outputs[activeSessionId]) outputs[activeSessionId] = {};

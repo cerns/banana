@@ -688,7 +688,7 @@ describe('apiRouter', () => {
       await handleApiRequest(req, res);
       expect(res._status).toBe(200);
       expect(res._body.jobId).toBeDefined();
-      expect(mockExecuteRemoteJob).toHaveBeenCalledWith('sess-remote', expect.any(String), 'do it');
+      expect(mockExecuteRemoteJob).toHaveBeenCalledWith('sess-remote', expect.any(String), 'do it', undefined);
     });
 
     it('should 404 for unknown session', async () => {

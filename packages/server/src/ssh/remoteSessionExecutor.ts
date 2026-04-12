@@ -44,14 +44,14 @@ function fmtDuration(ms: number): string {
  * Fire-and-forget — the caller does not await this. Output is streamed
  * to the session store and broadcast to connected dashboards.
  */
-export function executeRemoteJob(sessionId: string, jobId: string, prompt: string): void {
+export function executeRemoteJob(sessionId: string, jobId: string, prompt: string, modelOverride?: string): void {
   // Intentionally not awaited — runs in background
-  runJob(sessionId, jobId, prompt).catch((err) => {
+  runJob(sessionId, jobId, prompt, modelOverride).catch((err) => {
     console.error(`[remote-executor] Unexpected error for session=${sessionId} job=${jobId}:`, err);
   });
 }
 
-async function runJob(sessionId: string, jobId: string, prompt: string): Promise<void> {
+async function runJob(sessionId: string, jobId: string, prompt: string, modelOverride?: string): Promise<void> {
   const session = sessionStore.get(sessionId);
   if (!session || session.type !== 'remote' || !session.machineId) {
     sessionStore.errorJob(sessionId, jobId, 'Invalid remote session configuration');
@@ -93,7 +93,7 @@ async function runJob(sessionId: string, jobId: string, prompt: string): Promise
       },
       resumeId,
       controller.signal,
-      session.model,
+      modelOverride || session.model,
     );
 
     sessionStore.finishJob(sessionId, jobId, result.exitCode, result.durationMs);

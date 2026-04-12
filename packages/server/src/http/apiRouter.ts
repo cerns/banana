@@ -357,7 +357,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     const sessionId = resolveSessionId(prefix);
     if (!sessionId) { json(res, 404, { error: 'Session not found' }); return true; }
 
-    const body = await readBody(req) as { prompt?: string; options?: unknown };
+    const body = await readBody(req) as { prompt?: string; model?: string; options?: unknown };
     if (!body.prompt) { json(res, 400, { error: 'prompt required' }); return true; }
 
     const session = sessionStore.get(sessionId);
@@ -369,7 +369,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     const job = createJob(sessionId, body.prompt);
 
     const { executeRemoteJob } = await import('../ssh/remoteSessionExecutor.js');
-    executeRemoteJob(sessionId, job.jobId, body.prompt);
+    executeRemoteJob(sessionId, job.jobId, body.prompt, body.model);
     json(res, 200, { jobId: job.jobId });
     return true;
   }
