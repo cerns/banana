@@ -210,6 +210,9 @@ header h1 { font-size: 16px; color: var(--accent); }
   font-family: var(--font-mono);
   font-size: 13px;
   border-radius: 4px;
+  resize: none;
+  overflow: hidden;
+  line-height: 1.4;
 }
 
 #prompt-input:focus {
