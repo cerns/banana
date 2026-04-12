@@ -28,7 +28,7 @@
   <form id="auth-panel" style="display:none" autocomplete="off" onsubmit="return false">
     <div style="color:var(--accent);font-size:18px;margin-bottom:4px;">🍌 banana</div>
     <div style="color:var(--muted);margin-bottom:16px;font-size:12px;">Enter your BANANA_TOKEN to connect</div>
-    <input id="token-input" type="password" placeholder="BANANA_TOKEN" autocomplete="off" data-1p-ignore data-lpignore="true" />
+    <input id="token-input" type="text" placeholder="BANANA_TOKEN" autocomplete="off" data-1p-ignore data-lpignore="true" style="-webkit-text-security:disc; text-security:disc;" />
     <button id="auth-btn" class="btn" type="button">Connect</button>
   </form>
 
