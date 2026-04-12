@@ -79,6 +79,41 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     return true;
   }
 
+  // GET /api/jobs/active — list currently running SSH jobs
+  if (method === 'GET' && pathname === '/api/jobs/active') {
+    const { getActiveSessionIds } = await import('../ssh/remoteSessionExecutor.js');
+    const activeIds = getActiveSessionIds();
+    const jobs = activeIds.map(sessionId => {
+      const session = sessionStore.get(sessionId);
+      if (!session) return null;
+      // Find the most recent running job (no finishedAt)
+      const runningJob = [...(session.jobs || [])].reverse().find(j => !j.finishedAt);
+      if (!runningJob) return null;
+      const elapsedMs = Date.now() - new Date(runningJob.startedAt).getTime();
+      const chunkCount = runningJob.chunks?.length ?? 0;
+      // Last few text chunks for preview
+      const lastChunks = (runningJob.chunks || []).slice(-5);
+      const lastText = lastChunks
+        .filter((c: any) => c?.type === 'stream_event' && c?.event?.type === 'content_block_delta')
+        .map((c: any) => c?.event?.delta?.text ?? '')
+        .join('');
+      return {
+        sessionId,
+        sessionName: session.name || session.hostname,
+        machineId: session.machineId,
+        model: session.model,
+        jobId: runningJob.jobId,
+        prompt: runningJob.prompt?.slice(0, 200),
+        startedAt: runningJob.startedAt,
+        elapsedMs,
+        chunkCount,
+        lastText: lastText.slice(-200),
+      };
+    }).filter(Boolean);
+    json(res, 200, jobs);
+    return true;
+  }
+
   // ── Machine CRUD ───────────────────────────────────────────────────────────
 
   // GET /api/machines

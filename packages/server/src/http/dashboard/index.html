@@ -12,6 +12,7 @@
     <h1>🍌 banana</h1>
     <button id="hub-btn" class="btn btn-sm" style="background:var(--blue);color:#000">Hub</button>
     <button id="machines-btn" class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Machines</button>
+    <button id="jobs-btn" class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Jobs <span id="jobs-count" style="display:none;background:var(--red);color:#000;border-radius:8px;padding:0 5px;font-size:10px;margin-left:2px"></span></button>
     <select id="model-select" class="model-select" title="Default model for newly created sessions. Override per-session in the session edit modal. opusplan = Opus for planning, Sonnet for execution (conserves Opus quota).">
       <option value="">default</option>
       <option value="opus">opus</option>
@@ -318,6 +319,37 @@
           <button class="btn modal-close" data-close="session-edit-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
         </div>
         <div id="se-status" style="margin-top:8px;font-size:11px;color:var(--muted)"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Running Jobs modal -->
+  <div id="jobs-modal" class="modal" style="display:none">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <span>Running Jobs</span>
+        <button class="modal-close" data-close="jobs-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="jobs-list" style="min-height:60px"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Job detail modal -->
+  <div id="job-detail-modal" class="modal" style="display:none">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <span id="job-detail-title">Job Detail</span>
+        <button class="modal-close" data-close="job-detail-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div id="job-detail-info" style="font-size:12px;margin-bottom:10px"></div>
+        <div id="job-detail-output" style="max-height:50vh;overflow-y:auto;background:var(--bg);padding:8px;border-radius:4px;font-size:11px;font-family:monospace;white-space:pre-wrap;word-break:break-word"></div>
+        <div style="margin-top:10px;display:flex;gap:8px">
+          <button id="job-detail-abort" class="btn" style="background:var(--red);color:#000">Abort</button>
+          <button class="btn modal-close" data-close="job-detail-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Close</button>
+        </div>
       </div>
     </div>
   </div>

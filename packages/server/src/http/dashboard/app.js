@@ -969,6 +969,127 @@ document.getElementById('ns-create').addEventListener('click', async () => {
   closeModal('new-session-modal');
 });
 
+// ── Running Jobs Modal ────────────────────────────────────────────────────────
+let jobsRefreshTimer = null;
+
+document.getElementById('jobs-btn').addEventListener('click', () => {
+  loadActiveJobs();
+  openModal('jobs-modal');
+  // Auto-refresh every 3s while modal is open
+  jobsRefreshTimer = setInterval(loadActiveJobs, 3000);
+});
+
+// Stop auto-refresh when modal closes
+document.querySelector('[data-close="jobs-modal"]').addEventListener('click', () => {
+  if (jobsRefreshTimer) { clearInterval(jobsRefreshTimer); jobsRefreshTimer = null; }
+});
+
+function fmtElapsed(ms) {
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  return m + 'm ' + (s % 60) + 's';
+}
+
+async function loadActiveJobs() {
+  const jobs = await apiFetch('/api/jobs/active');
+  const el = document.getElementById('jobs-list');
+  if (!Array.isArray(jobs) || jobs.length === 0) {
+    el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:20px">No running jobs</div>';
+    updateJobsBadge(0);
+    return;
+  }
+  updateJobsBadge(jobs.length);
+  el.innerHTML = jobs.map(j => `
+    <div class="job-card" data-session-id="${esc(j.sessionId)}" data-job-id="${esc(j.jobId)}">
+      <div class="job-card-header">
+        <span class="job-session-name">${esc(j.sessionName)}</span>
+        <span class="job-model">${j.model ? esc(j.model) : 'default'}</span>
+        <span class="job-elapsed">${fmtElapsed(j.elapsedMs)}</span>
+        <span class="job-chunks">${j.chunkCount} chunks</span>
+      </div>
+      <div class="job-prompt">${esc(j.prompt || '(no prompt)')}</div>
+      ${j.lastText ? `<div class="job-last-text">${esc(j.lastText)}</div>` : ''}
+      <div class="job-card-actions">
+        <button class="btn btn-sm job-detail-btn" data-session-id="${esc(j.sessionId)}" data-job-id="${esc(j.jobId)}">Detail</button>
+        <button class="btn btn-sm job-abort-btn" data-session-id="${esc(j.sessionId)}" style="background:var(--red);color:#000">Abort</button>
+      </div>
+    </div>
+  `).join('');
+
+  // Wire detail buttons
+  el.querySelectorAll('.job-detail-btn').forEach(btn => {
+    btn.addEventListener('click', () => openJobDetail(btn.dataset.sessionId, btn.dataset.jobId));
+  });
+  // Wire abort buttons
+  el.querySelectorAll('.job-abort-btn').forEach(btn => {
+    btn.addEventListener('click', async () => {
+      if (!confirm('Abort this job?')) return;
+      await apiFetch(`/api/sessions/${btn.dataset.sessionId}/abort`, { method: 'POST' });
+      loadActiveJobs();
+    });
+  });
+}
+
+function updateJobsBadge(count) {
+  const badge = document.getElementById('jobs-count');
+  if (count > 0) {
+    badge.textContent = count;
+    badge.style.display = 'inline';
+  } else {
+    badge.style.display = 'none';
+  }
+}
+
+async function openJobDetail(sessionId, jobId) {
+  document.getElementById('job-detail-title').textContent = 'Job Detail';
+  const session = sessions[sessionId];
+  const jobData = outputs[sessionId]?.[jobId];
+
+  let infoHtml = `<b>Session:</b> ${esc(session?.name || sessionId)}<br>`;
+  infoHtml += `<b>Job:</b> ${esc(jobId)}<br>`;
+  if (session?.model) infoHtml += `<b>Model:</b> ${esc(session.model)}<br>`;
+
+  // Extract text from chunks for output preview
+  let outputText = '';
+  if (jobData?.chunks) {
+    for (const c of jobData.chunks) {
+      if (c?.type === 'stream_event' && c?.event?.type === 'content_block_delta' && c?.event?.delta?.text) {
+        outputText += c.event.delta.text;
+      } else if (c?.type === 'assistant' && c?.message?.content) {
+        // Don't add assistant snapshots if we already have stream text — avoid duplication
+      } else if (c?.type === 'stderr') {
+        outputText += `\n[stderr] ${c.text || ''}`;
+      }
+    }
+  }
+  if (!outputText && jobData?.chunks?.length) {
+    outputText = `(${jobData.chunks.length} chunks, no text extracted)`;
+  }
+
+  document.getElementById('job-detail-info').innerHTML = infoHtml;
+  document.getElementById('job-detail-output').textContent = outputText || '(no output yet)';
+
+  // Wire abort button
+  const abortBtn = document.getElementById('job-detail-abort');
+  abortBtn.onclick = async () => {
+    if (!confirm('Abort this job?')) return;
+    await apiFetch(`/api/sessions/${sessionId}/abort`, { method: 'POST' });
+    closeModal('job-detail-modal');
+    loadActiveJobs();
+  };
+
+  openModal('job-detail-modal');
+}
+
+// Periodically update the jobs badge (every 30s) even when modal is closed
+setInterval(async () => {
+  try {
+    const jobs = await apiFetch('/api/jobs/active');
+    if (Array.isArray(jobs)) updateJobsBadge(jobs.length);
+  } catch {}
+}, 30000);
+
 // ── Hub ───────────────────────────────────────────────────────────────────────
 document.getElementById('hub-btn').addEventListener('click', () => {
   hubVisible = !hubVisible;

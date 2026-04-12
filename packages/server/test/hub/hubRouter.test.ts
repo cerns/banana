@@ -1301,4 +1301,52 @@ describe('hubRouter', () => {
       expect(updated.history).toHaveLength(1);
     });
   });
+
+  describe('extractTextFromChunks', () => {
+    it('should prefer stream_event deltas over assistant snapshots to avoid duplication', () => {
+      const chunks = [
+        // Stream deltas (incremental)
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Hello' } } },
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: ' world' } } },
+        // Assistant snapshot (complete) — should be ignored when deltas exist
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'Hello world' }] } },
+      ];
+      const text = hubRouter.extractTextFromChunks(chunks);
+      expect(text).toBe('Hello world');
+    });
+
+    it('should fall back to assistant snapshot when no stream deltas exist', () => {
+      const chunks = [
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'Only snapshot' }] } },
+      ];
+      const text = hubRouter.extractTextFromChunks(chunks);
+      expect(text).toBe('Only snapshot');
+    });
+
+    it('should fall back to result.result when no text chunks exist', () => {
+      const chunks = [
+        { type: 'result', result: 'fallback text' },
+      ];
+      const text = hubRouter.extractTextFromChunks(chunks);
+      expect(text).toBe('fallback text');
+    });
+
+    it('should return empty string for empty chunks', () => {
+      expect(hubRouter.extractTextFromChunks([])).toBe('');
+    });
+
+    it('should NOT duplicate when both stream_event and assistant are present', () => {
+      // This is the exact scenario that caused the bug: --include-partial-messages
+      // emits both stream deltas and assistant snapshots
+      const chunks = [
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Create ' } } },
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Jira ticket' } } },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'Create Jira ticket' }] } },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'Create Jira ticket' }] } },
+        { type: 'result', result: 'Create Jira ticket' },
+      ];
+      const text = hubRouter.extractTextFromChunks(chunks);
+      expect(text).toBe('Create Jira ticket');
+    });
+  });
 });

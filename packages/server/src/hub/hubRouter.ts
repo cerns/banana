@@ -1143,10 +1143,14 @@ export function resolveScreenName(name: string): string | undefined {
   return match?.sessionId;
 }
 
-function extractTextFromChunks(chunks: unknown[]): string {
-  const parts: string[] = [];
-  // Capture the final `result` chunk's text as a fallback in case no
-  // assistant/stream_event chunks were emitted (e.g. rate-limited very early).
+export function extractTextFromChunks(chunks: unknown[]): string {
+  // With --include-partial-messages, Claude CLI emits BOTH stream_event
+  // text deltas (incremental) AND assistant snapshot chunks (complete).
+  // Collecting both would duplicate the text. Prefer stream deltas (they
+  // represent the actual streaming output); fall back to assistant snapshots
+  // only when no deltas were captured; use result.result as last resort.
+  const streamParts: string[] = [];
+  const assistantParts: string[] = [];
   let resultFallback: string | null = null;
 
   for (const chunk of chunks) {
@@ -1158,32 +1162,33 @@ function extractTextFromChunks(chunks: unknown[]): string {
       if (Array.isArray(content)) {
         for (const block of content) {
           if (block && typeof block === 'object' && (block as Record<string, unknown>).type === 'text') {
-            parts.push((block as Record<string, unknown>).text as string);
+            assistantParts.push((block as Record<string, unknown>).text as string);
           }
         }
       }
     }
 
-    // Handle stream_event text deltas
     if (c.type === 'stream_event') {
       const evt = c.event as Record<string, unknown> | undefined;
       if (evt?.type === 'content_block_delta') {
         const delta = evt.delta as Record<string, unknown> | undefined;
         if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
-          parts.push(delta.text);
+          streamParts.push(delta.text);
         }
       }
     }
 
-    // Claude CLI's terminal `result` chunk holds the aggregated final text.
-    // We use it only as a fallback when no streaming content was captured.
     if (c.type === 'result' && typeof c.result === 'string') {
       resultFallback = c.result;
     }
   }
 
-  const joined = parts.join('');
-  return joined || resultFallback || '';
+  // Prefer stream deltas → assistant snapshots → result fallback
+  const streamText = streamParts.join('');
+  if (streamText) return streamText;
+  const assistantText = assistantParts.join('');
+  if (assistantText) return assistantText;
+  return resultFallback || '';
 }
 
 /**
