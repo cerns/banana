@@ -208,7 +208,7 @@ describe('sshRunner', () => {
       const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '/work', c => chunks.push(c));
 
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
@@ -231,7 +231,7 @@ describe('sshRunner', () => {
       const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '', c => {});
 
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
@@ -253,7 +253,7 @@ describe('sshRunner', () => {
       const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '/work', c => chunks.push(c));
 
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
@@ -286,7 +286,7 @@ describe('sshRunner', () => {
 
       const stream = createMockStream();
       let executedCommand = '';
-      mockClientInstance.exec.mockImplementation((cmd: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((cmd: string, cb: Function) => {
         executedCommand = cmd;
         cb(null, stream);
       });
@@ -314,7 +314,7 @@ describe('sshRunner', () => {
       const machine = makeMachine();
       const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '/work', () => {});
 
-      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
         cb(new Error('Command failed'));
       });
       mockClientInstance.emit('ready');
@@ -330,7 +330,7 @@ describe('sshRunner', () => {
       const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '', c => chunks.push(c));
 
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
@@ -353,7 +353,7 @@ describe('sshRunner', () => {
       const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '', c => chunks.push(c));
 
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
@@ -374,7 +374,7 @@ describe('sshRunner', () => {
       const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '', () => {});
 
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
@@ -394,7 +394,7 @@ describe('sshRunner', () => {
       const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '', () => {});
 
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
@@ -415,7 +415,7 @@ describe('sshRunner', () => {
 
       let cmd = '';
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((c: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((c: string, cb: Function) => {
         cmd = c;
         cb(null, stream);
       });
@@ -435,7 +435,7 @@ describe('sshRunner', () => {
       const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '', () => {});
 
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
@@ -455,11 +455,9 @@ describe('sshRunner', () => {
       const promise = sshRunner.runClaudeOverSsh(machine, bigPrompt, '/work', () => {});
 
       let cmd = '';
-      let execOpts: any;
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((c: string, opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((c: string, cb: Function) => {
         cmd = c;
-        execOpts = opts;
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
@@ -470,8 +468,6 @@ describe('sshRunner', () => {
       expect(result.exitCode).toBe(0);
       // The huge prompt is NOT embedded in the command
       expect(cmd).not.toContain('xxxxxxxxxxxxxxxx');
-      // PTY is disabled in the stdin path
-      expect(execOpts).toEqual({});
       // The full prompt was written to stdin and the stream was ended
       const total = stream.stdin.writes.join('');
       expect(total.length).toBe(bigPrompt.length);
@@ -491,7 +487,7 @@ describe('sshRunner', () => {
         if (cb) cb(new Error('write EPIPE'));
         return true;
       });
-      mockClientInstance.exec.mockImplementation((_c: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((_c: string, cb: Function) => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
@@ -523,7 +519,7 @@ describe('sshRunner', () => {
       const promise = freshRunner.runClaudeOverSsh(machine, 'hello', '/work', c => chunks.push(c));
 
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
@@ -567,7 +563,7 @@ describe('sshRunner', () => {
       const promise = freshRunner.runClaudeOverSsh(machine, 'hello', '/work', () => {});
 
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
@@ -597,7 +593,7 @@ describe('sshRunner', () => {
 
       let cmd = '';
       const stream = createMockStream();
-      mockClientInstance.exec.mockImplementation((c: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((c: string, cb: Function) => {
         cmd = c;
         cb(null, stream);
       });
@@ -611,6 +607,52 @@ describe('sshRunner', () => {
       // The dangerous characters should be inside single quotes (safe)
       // Verify the full escaped prompt pattern: 'it'"'"'s a test; rm -rf /'
       expect(cmd).toMatch(/'it'"'"'s a test; rm -rf \/'/);
+      consoleSpy.mockRestore();
+    });
+
+    it('should reject on stream error during execution', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const machine = makeMachine();
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '/work', () => {});
+
+      const stream = createMockStream();
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
+        cb(null, stream);
+      });
+      mockClientInstance.emit('ready');
+      await flush();
+
+      // Simulate a transient SSH channel error mid-execution
+      stream.emit('error', new Error('channel read ECONNRESET'));
+
+      await expect(promise).rejects.toThrow('channel read ECONNRESET');
+      consoleSpy.mockRestore();
+      errorSpy.mockRestore();
+    });
+
+    it('should not allocate PTY (avoids SIGHUP on disconnect)', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine();
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '/work', () => {});
+
+      const stream = createMockStream();
+      let execArgs: unknown[] = [];
+      mockClientInstance.exec.mockImplementation((...args: unknown[]) => {
+        execArgs = args;
+        const cb = args[args.length - 1] as Function;
+        cb(null, stream);
+      });
+      mockClientInstance.emit('ready');
+      await flush();
+      stream.emit('close', 0);
+      await promise;
+
+      // exec should be called with exactly 2 args: (command, callback)
+      // No options object means no PTY allocation.
+      expect(execArgs).toHaveLength(2);
+      expect(typeof execArgs[0]).toBe('string');
+      expect(typeof execArgs[1]).toBe('function');
       consoleSpy.mockRestore();
     });
   });

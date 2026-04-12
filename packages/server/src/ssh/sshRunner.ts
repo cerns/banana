@@ -203,11 +203,13 @@ export async function runClaudeOverSsh(
       settle(() => { try { conn.end(); } catch { /* noop */ } reject(err); });
     });
 
-    // PTY mangles binary stdin via line discipline (CR/LF translation, ^D
-    // on EOT, canonical-mode line buffering). For the stdin path we run in
-    // raw exec mode without PTY allocation.
-    const execOpts = useStdin ? {} : { pty: true };
-    conn.exec(command, execOpts, (err, stream) => {
+    // Never allocate a PTY. PTY mode causes the remote shell to send SIGHUP
+    // to child processes (claude) whenever the SSH channel hiccups or the
+    // client disconnects — this kills claude mid-tool-call even during
+    // transient network blips. Raw exec mode lets the process survive brief
+    // disconnections gracefully. Output is stream-json so we don't need a
+    // terminal anyway.
+    conn.exec(command, (err, stream) => {
       if (err) { settle(() => { conn.end(); reject(err); }); return; }
 
       // Pipe the prompt via stdin in chunked writes so we never block the
@@ -246,6 +248,15 @@ export async function runClaudeOverSsh(
       // process stalled and send SIGTERM + close. Disabled when set to 0.
       let idleTimer: ReturnType<typeof setTimeout> | undefined;
       const idleMs = config.sshIdleTimeoutMs;
+
+      // Handle stream-level errors (transient SSH channel failures during
+      // execution). Without this, a channel error mid-tool-call would leave
+      // the promise hanging or emit an uncaught error.
+      stream.on('error', (streamErr: Error) => {
+        console.error(`[ssh-runner] stream error: ${streamErr.message}`);
+        if (idleTimer) clearTimeout(idleTimer);
+        settle(() => { try { conn.end(); } catch { /* noop */ } reject(streamErr); });
+      });
       const resetIdleTimer = () => {
         if (idleMs <= 0) return;
         if (idleTimer) clearTimeout(idleTimer);
