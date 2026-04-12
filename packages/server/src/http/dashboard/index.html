@@ -113,14 +113,14 @@
               <option value="done">Done</option>
               <option value="wontfix">Won't fix</option>
             </select>
-            <input id="hub-task-search" placeholder="search bJira..." />
+            <input id="hub-task-search" placeholder="search bJira..." autocomplete="off" data-1p-ignore />
             <button id="hub-new-task-btn" class="btn btn-sm">+ bJira</button>
           </div>
           <div id="hub-task-list"></div>
         </div>
         <div id="hub-docs-view" style="display:none">
           <div class="hub-toolbar">
-            <input id="hub-doc-search" placeholder="search bConfluence..." />
+            <input id="hub-doc-search" placeholder="search bConfluence..." autocomplete="off" data-1p-ignore />
             <button id="hub-new-doc-btn" class="btn btn-sm">+ bConfluence</button>
           </div>
           <div id="hub-docs-split">
@@ -140,8 +140,8 @@
         <button class="modal-close" data-close="task-edit-modal">&times;</button>
       </div>
       <div class="modal-body">
-        <div class="form-row"><label>Title</label><input id="te-title-input" /></div>
-        <div class="form-row"><label>Description</label><textarea id="te-description" rows="4"></textarea></div>
+        <div class="form-row"><label>Title</label><input id="te-title-input" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Description</label><textarea id="te-description" rows="4" autocomplete="off" data-1p-ignore></textarea></div>
         <div class="form-row"><label>Status</label>
           <select id="te-status">
             <option value="open">open</option>
@@ -151,8 +151,8 @@
             <option value="wontfix">wontfix</option>
           </select>
         </div>
-        <div class="form-row"><label>Assignee</label><input id="te-assignee" /></div>
-        <div class="form-row"><label>Tags</label><input id="te-tags" placeholder="comma-sep" /></div>
+        <div class="form-row"><label>Assignee</label><input id="te-assignee" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Tags</label><input id="te-tags" placeholder="comma-sep" autocomplete="off" data-1p-ignore /></div>
         <div class="form-row"><label>Priority</label>
           <select id="te-priority">
             <option value="">-</option>
@@ -161,7 +161,7 @@
             <option value="high">high</option>
           </select>
         </div>
-        <div class="form-row"><label>Comment</label><input id="te-comment" placeholder="add a comment..." /></div>
+        <div class="form-row"><label>Comment</label><input id="te-comment" placeholder="add a comment..." autocomplete="off" data-1p-ignore /></div>
         <div id="te-activity" style="max-height:200px;overflow:auto;margin-top:12px;font-size:12px;background:var(--surface);padding:8px;border-radius:4px"></div>
         <div style="display:flex;gap:8px;margin-top:12px">
           <button id="te-save" class="btn">Save</button>
@@ -180,9 +180,9 @@
         <button class="modal-close" data-close="doc-edit-modal">&times;</button>
       </div>
       <div class="modal-body">
-        <div class="form-row"><label>Title</label><input id="de-title-input" /></div>
-        <div class="form-row"><label>Tags</label><input id="de-tags" placeholder="comma-sep" /></div>
-        <div class="form-row"><label>Body (markdown)</label><textarea id="de-body" rows="14" style="font-family:monospace"></textarea></div>
+        <div class="form-row"><label>Title</label><input id="de-title-input" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Tags</label><input id="de-tags" placeholder="comma-sep" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Body (markdown)</label><textarea id="de-body" rows="14" style="font-family:monospace" autocomplete="off" data-1p-ignore></textarea></div>
         <div id="de-version" style="color:var(--muted);font-size:12px"></div>
         <div style="display:flex;gap:8px;margin-top:12px">
           <button id="de-save" class="btn">Save</button>
@@ -215,9 +215,9 @@
         <button class="modal-close" data-close="new-channel-modal">&times;</button>
       </div>
       <div class="modal-body">
-        <div class="form-row"><label>Channel ID (slug)</label><input id="nc-id" placeholder="general" /></div>
-        <div class="form-row"><label>Display Name</label><input id="nc-name" placeholder="#general" /></div>
-        <div class="form-row"><label>Description</label><input id="nc-desc" placeholder="(optional)" /></div>
+        <div class="form-row"><label>Channel ID (slug)</label><input id="nc-id" placeholder="general" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Display Name</label><input id="nc-name" placeholder="#general" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Description</label><input id="nc-desc" placeholder="(optional)" autocomplete="off" data-1p-ignore /></div>
         <div style="display:flex;gap:8px;margin-top:12px">
           <button id="nc-create" class="btn">Create</button>
           <button class="btn modal-close" data-close="new-channel-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
@@ -242,18 +242,18 @@
         <div class="modal-header"><span id="machine-form-title">Add Machine</span></div>
         <div class="modal-body">
           <input type="hidden" id="mf-id" />
-          <div class="form-row"><label>Name</label><input id="mf-name" placeholder="prod-web-1" /></div>
-          <div class="form-row"><label>Alias</label><input id="mf-alias" placeholder="prod1" /></div>
-          <div class="form-row"><label>Host / IP</label><input id="mf-ip" placeholder="192.168.1.100" /></div>
-          <div class="form-row"><label>Port</label><input id="mf-port" type="number" value="22" /></div>
-          <div class="form-row"><label>Username</label><input id="mf-username" placeholder="root" /></div>
-          <div class="form-row"><label>Password</label><input id="mf-password" type="password" placeholder="(optional)" /></div>
-          <div class="form-row"><label>SSH Key Path</label><input id="mf-sshkey" placeholder="/root/.ssh/id_rsa" /></div>
-          <div class="form-row"><label>Passphrase</label><input id="mf-passphrase" type="password" placeholder="(optional)" /></div>
-          <div class="form-row"><label>Default Workdir</label><input id="mf-workdir" placeholder="/home/user/project" /></div>
-          <div class="form-row"><label>OS</label><input id="mf-os" placeholder="ubuntu-22.04" /></div>
-          <div class="form-row"><label>MAC Address</label><input id="mf-mac" placeholder="(optional)" /></div>
-          <div class="form-row"><label>Notes</label><input id="mf-notes" placeholder="(optional)" /></div>
+          <div class="form-row"><label>Name</label><input id="mf-name" placeholder="prod-web-1" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>Alias</label><input id="mf-alias" placeholder="prod1" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>Host / IP</label><input id="mf-ip" placeholder="192.168.1.100" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>Port</label><input id="mf-port" type="number" value="22" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>Username</label><input id="mf-username" placeholder="root" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>Password</label><input id="mf-password" type="text" placeholder="(optional)" autocomplete="off" data-1p-ignore data-lpignore="true" style="-webkit-text-security:disc; text-security:disc;" /></div>
+          <div class="form-row"><label>SSH Key Path</label><input id="mf-sshkey" placeholder="/root/.ssh/id_rsa" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>Passphrase</label><input id="mf-passphrase" type="text" placeholder="(optional)" autocomplete="off" data-1p-ignore data-lpignore="true" style="-webkit-text-security:disc; text-security:disc;" /></div>
+          <div class="form-row"><label>Default Workdir</label><input id="mf-workdir" placeholder="/home/user/project" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>OS</label><input id="mf-os" placeholder="ubuntu-22.04" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>MAC Address</label><input id="mf-mac" placeholder="(optional)" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>Notes</label><input id="mf-notes" placeholder="(optional)" autocomplete="off" data-1p-ignore /></div>
           <div id="mf-runtime-info" style="display:none;margin-top:12px;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:11px">
             <div style="font-weight:600;margin-bottom:6px;color:var(--text)">Detected Info</div>
             <div id="mf-runtime-content"></div>
@@ -278,13 +278,13 @@
       </div>
       <div class="modal-body">
         <div class="form-row"><label>Machine</label><select id="ns-machine"></select></div>
-        <div class="form-row"><label>Session Name</label><input id="ns-name" placeholder="my-session" /></div>
-        <div class="form-row"><label>Working Dir</label><input id="ns-workdir" placeholder="(uses machine default)" /></div>
-        <div class="form-row"><label>Role</label><input id="ns-role" placeholder="Backend Dev, CEO, QA" /></div>
-        <div class="form-row"><label>Screen Name</label><input id="ns-screen-name" placeholder="backend-alice" /></div>
-        <div class="form-row"><label>Interests (comma-sep)</label><input id="ns-interests" placeholder="backend, api, auth" /></div>
-        <div class="form-row"><label>Channels (comma-sep)</label><input id="ns-channels" placeholder="general, backend" /></div>
-        <div class="form-row"><label>Role Prompt</label><textarea id="ns-role-prompt" placeholder="System prompt for this role" rows="4"></textarea></div>
+        <div class="form-row"><label>Session Name</label><input id="ns-name" placeholder="my-session" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Working Dir</label><input id="ns-workdir" placeholder="(uses machine default)" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Role</label><input id="ns-role" placeholder="Backend Dev, CEO, QA" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Screen Name</label><input id="ns-screen-name" placeholder="backend-alice" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Interests (comma-sep)</label><input id="ns-interests" placeholder="backend, api, auth" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Channels (comma-sep)</label><input id="ns-channels" placeholder="general, backend" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Role Prompt</label><textarea id="ns-role-prompt" placeholder="System prompt for this role" rows="4" autocomplete="off" data-1p-ignore></textarea></div>
         <div style="display:flex;gap:8px;margin-top:12px">
           <button id="ns-create" class="btn">Create Session</button>
           <button class="btn modal-close" data-close="new-session-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
@@ -303,14 +303,14 @@
       <div class="modal-body">
         <input type="hidden" id="se-id" />
         <div class="form-row"><label>Session ID</label><div id="se-session-id" style="font-size:11px;color:var(--accent);padding:4px 0;user-select:all"></div></div>
-        <div class="form-row"><label>Name</label><input id="se-name" placeholder="Session name" /></div>
-        <div class="form-row"><label>Role</label><input id="se-role" placeholder="Backend Dev, CEO, QA" /></div>
-        <div class="form-row"><label>Screen Name</label><input id="se-screen-name" placeholder="backend-alice" /></div>
-        <div class="form-row"><label>Interests (comma-sep)</label><input id="se-interests" placeholder="backend, api, auth" /></div>
-        <div class="form-row"><label>Channels (comma-sep)</label><input id="se-channels" placeholder="general, backend" /></div>
-        <div class="form-row"><label>Role Prompt</label><textarea id="se-role-prompt" placeholder="System prompt for this role" rows="4"></textarea></div>
+        <div class="form-row"><label>Name</label><input id="se-name" placeholder="Session name" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Role</label><input id="se-role" placeholder="Backend Dev, CEO, QA" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Screen Name</label><input id="se-screen-name" placeholder="backend-alice" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Interests (comma-sep)</label><input id="se-interests" placeholder="backend, api, auth" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Channels (comma-sep)</label><input id="se-channels" placeholder="general, backend" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Role Prompt</label><textarea id="se-role-prompt" placeholder="System prompt for this role" rows="4" autocomplete="off" data-1p-ignore></textarea></div>
         <div class="form-row"><label>Model</label><select id="se-model"><option value="">default</option><option value="opus">opus</option><option value="sonnet">sonnet</option><option value="haiku">haiku</option><option value="opusplan">opusplan (plan=Opus, exec=Sonnet)</option></select></div>
-        <div class="form-row"><label>Working Dir</label><input id="se-workdir" placeholder="/path/to/project" disabled style="opacity:0.6" /></div>
+        <div class="form-row"><label>Working Dir</label><input id="se-workdir" placeholder="/path/to/project" disabled style="opacity:0.6" autocomplete="off" data-1p-ignore /></div>
         <div class="form-row"><label>Machine</label><select id="se-machine" disabled style="opacity:0.6"></select></div>
         <div id="se-claude-info" style="display:none;font-size:10px;color:var(--muted);margin-top:8px;word-break:break-all"></div>
         <div style="display:flex;gap:8px;margin-top:12px">
