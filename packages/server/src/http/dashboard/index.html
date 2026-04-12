@@ -23,13 +23,14 @@
   </header>
   <div id="push-banner" style="display:none"></div>
 
-  <!-- Auth panel -->
-  <div id="auth-panel" style="display:none">
+  <!-- Auth panel — wrapped in its own form so the browser's password
+       autofill doesn't leak into unrelated inputs elsewhere on the page -->
+  <form id="auth-panel" style="display:none" autocomplete="off" onsubmit="return false">
     <div style="color:var(--accent);font-size:18px;margin-bottom:4px;">🍌 banana</div>
     <div style="color:var(--muted);margin-bottom:16px;font-size:12px;">Enter your BANANA_TOKEN to connect</div>
-    <input id="token-input" type="password" placeholder="BANANA_TOKEN" autocomplete="off" />
-    <button id="auth-btn" class="btn">Connect</button>
-  </div>
+    <input id="token-input" type="password" placeholder="BANANA_TOKEN" autocomplete="off" data-1p-ignore data-lpignore="true" />
+    <button id="auth-btn" class="btn" type="button">Connect</button>
+  </form>
 
   <!-- Main layout -->
   <div id="main" style="display:none">
@@ -61,7 +62,7 @@
       </div>
 
       <div id="prompt-bar">
-        <input id="prompt-input" type="text" placeholder="Send a prompt..." />
+        <input id="prompt-input" type="text" placeholder="Send a prompt..." autocomplete="off" data-1p-ignore data-lpignore="true" data-form-type="other" />
         <button id="send-btn" class="btn">Send</button>
         <button id="stop-btn" class="btn btn-danger" style="display:none" title="Stop running job (Esc)">Stop</button>
       </div>
@@ -96,9 +97,9 @@
         <div id="hub-messages-view">
           <div id="hub-messages"></div>
           <div id="hub-post-bar">
-            <input id="hub-content-input" type="text" placeholder="Post a message..." />
-            <input id="hub-tags-input" type="text" placeholder="tags (comma-sep)" style="width:120px" />
-            <input id="hub-mentions-input" type="text" placeholder="@mentions" style="width:120px" />
+            <input id="hub-content-input" type="text" placeholder="Post a message..." autocomplete="off" data-1p-ignore data-lpignore="true" data-form-type="other" />
+            <input id="hub-tags-input" type="text" placeholder="tags (comma-sep)" style="width:120px" autocomplete="off" data-1p-ignore />
+            <input id="hub-mentions-input" type="text" placeholder="@mentions" style="width:120px" autocomplete="off" data-1p-ignore />
             <button id="hub-post-btn" class="btn">Post</button>
           </div>
         </div>
