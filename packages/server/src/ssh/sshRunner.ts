@@ -184,7 +184,11 @@ export async function runClaudeOverSsh(
     args.push(shellEscape(prompt));
   }
 
-  const pathPrefix = 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$PATH"';
+  // `trap '' HUP` makes the shell (and child processes) ignore SIGHUP.
+  // This is critical because PTY mode sends SIGHUP on SSH disconnections,
+  // which would otherwise kill claude mid-tool-call during transient
+  // network blips. SIGTERM (used by abort) still works normally.
+  const pathPrefix = "trap '' HUP; export PATH=\"$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$PATH\"";
   const cmdParts = [pathPrefix];
   if (workdir) cmdParts.push(`cd ${shellEscape(workdir)}`);
   cmdParts.push(`${claudeBin} ${args.join(' ')}`);
@@ -203,13 +207,14 @@ export async function runClaudeOverSsh(
       settle(() => { try { conn.end(); } catch { /* noop */ } reject(err); });
     });
 
-    // Never allocate a PTY. PTY mode causes the remote shell to send SIGHUP
-    // to child processes (claude) whenever the SSH channel hiccups or the
-    // client disconnects — this kills claude mid-tool-call even during
-    // transient network blips. Raw exec mode lets the process survive brief
-    // disconnections gracefully. Output is stream-json so we don't need a
-    // terminal anyway.
-    conn.exec(command, (err, stream) => {
+    // PTY is needed for line-buffered streaming output (without PTY, stdout
+    // is fully buffered and nothing streams back until the process exits).
+    // SIGHUP from PTY disconnect is neutralized by `trap '' HUP` in the
+    // command prefix, so claude survives transient network blips.
+    // For the stdin path we still disable PTY because PTY's line discipline
+    // mangles binary data written to stdin.
+    const execOpts = useStdin ? {} : { pty: true };
+    conn.exec(command, execOpts, (err, stream) => {
       if (err) { settle(() => { conn.end(); reject(err); }); return; }
 
       // Pipe the prompt via stdin in chunked writes so we never block the
