@@ -1016,7 +1016,7 @@ export function processQueue(sessionId: string): void {
  * Global queue drain — called after any hub job completes so sessions that
  * were blocked on concurrency/cooldown get a chance to run.
  */
-function drainGlobalQueue(): void {
+export function drainGlobalQueue(): void {
   const allSessions = sessionStore.getAll();
   for (const session of allSessions) {
     if (runningHubJobs >= config.hubMaxConcurrentJobs) break;
