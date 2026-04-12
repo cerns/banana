@@ -33,6 +33,11 @@ export const config = {
   // connection errors (with exponential backoff + jitter). Auth errors and
   // post-connect failures are NOT retried.
   sshConnectRetries: parseInt(process.env.BANANA_SSH_CONNECT_RETRIES ?? '2', 10),
+  // SSH idle timeout — how many seconds of zero stdout/stderr output before
+  // the runner sends SIGTERM + closes the channel. Resets on every chunk of
+  // output, so long-running tool calls that produce occasional progress are
+  // fine. Default 600s (10 min). Set to 0 to disable.
+  sshIdleTimeoutMs: parseInt(process.env.BANANA_SSH_IDLE_TIMEOUT_MS ?? '600000', 10),
   // Heuristic prompt compression (LLMLingua-style). Strips filler words,
   // rewrites wordy phrases, collapses whitespace, dedupes adjacent lines.
   // Code blocks (``` and `inline`) are preserved verbatim. Set to "0" to

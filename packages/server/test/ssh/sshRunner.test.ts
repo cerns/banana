@@ -3,13 +3,15 @@ import { EventEmitter } from 'events';
 import type { MachineRecord } from '../../src/machines/machineStore.js';
 
 // Mock config
+const mockConfig = {
+  machinesPersistPath: '',
+  sshKeepaliveCountMax: 60,
+  sshReadyTimeoutMs: 30_000,
+  sshConnectRetries: 0,
+  sshIdleTimeoutMs: 0, // disabled by default in tests
+};
 vi.mock('../../src/config.js', () => ({
-  config: {
-    machinesPersistPath: '',
-    sshKeepaliveCountMax: 60,
-    sshReadyTimeoutMs: 30_000,
-    sshConnectRetries: 0,
-  },
+  config: mockConfig,
 }));
 
 // Mock fs for key file reading
@@ -496,6 +498,94 @@ describe('sshRunner', () => {
       await flush();
 
       await expect(promise).rejects.toThrow('write EPIPE');
+      consoleSpy.mockRestore();
+    });
+
+    it('should SIGTERM after idle timeout when no output arrives', async () => {
+      vi.useFakeTimers();
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      // Enable idle timeout at 5000ms for this test
+      mockConfig.sshIdleTimeoutMs = 5000;
+
+      // Need fresh module so config is picked up
+      vi.resetModules();
+      vi.doMock('ssh2', () => ({
+        Client: vi.fn().mockImplementation(() => {
+          mockClientInstance = createMockClient();
+          return mockClientInstance;
+        }),
+      }));
+      const freshRunner = await import('../../src/ssh/sshRunner.js');
+
+      const machine = makeMachine();
+      const chunks: unknown[] = [];
+      const promise = freshRunner.runClaudeOverSsh(machine, 'hello', '/work', c => chunks.push(c));
+
+      const stream = createMockStream();
+      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+        cb(null, stream);
+      });
+      mockClientInstance.emit('ready');
+      await flush();
+
+      // Some initial output
+      stream.emit('data', Buffer.from('{"type":"init"}\n'));
+      // Advance time past idle timeout — no more output
+      vi.advanceTimersByTime(5001);
+      // stream.signal should have been called
+      expect(stream.signal).toHaveBeenCalledWith('TERM');
+      // A synthetic stderr chunk should have been pushed
+      const idleChunk = chunks.find((c: any) => typeof c.text === 'string' && c.text.includes('idle timeout'));
+      expect(idleChunk).toBeDefined();
+
+      // Clean up — simulate close after TERM
+      stream.emit('close', 137);
+      await promise;
+
+      mockConfig.sshIdleTimeoutMs = 0; // restore
+      vi.useRealTimers();
+      consoleSpy.mockRestore();
+      warnSpy.mockRestore();
+    });
+
+    it('should reset idle timeout on every data event', async () => {
+      vi.useFakeTimers();
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      mockConfig.sshIdleTimeoutMs = 5000;
+
+      vi.resetModules();
+      vi.doMock('ssh2', () => ({
+        Client: vi.fn().mockImplementation(() => {
+          mockClientInstance = createMockClient();
+          return mockClientInstance;
+        }),
+      }));
+      const freshRunner = await import('../../src/ssh/sshRunner.js');
+
+      const machine = makeMachine();
+      const promise = freshRunner.runClaudeOverSsh(machine, 'hello', '/work', () => {});
+
+      const stream = createMockStream();
+      mockClientInstance.exec.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+        cb(null, stream);
+      });
+      mockClientInstance.emit('ready');
+      await flush();
+
+      // Emit output every 3s — each resets the 5s idle timer
+      for (let i = 0; i < 5; i++) {
+        vi.advanceTimersByTime(3000);
+        stream.emit('data', Buffer.from(`{"type":"chunk","i":${i}}\n`));
+      }
+      // 15s total elapsed but timer never exceeded 5s without output
+      expect(stream.signal).not.toHaveBeenCalled();
+
+      stream.emit('close', 0);
+      await promise;
+
+      mockConfig.sshIdleTimeoutMs = 0;
+      vi.useRealTimers();
       consoleSpy.mockRestore();
     });
 

@@ -241,7 +241,25 @@ export async function runClaudeOverSsh(
       let buffer = '';
       let claudeSessionId: string | undefined;
 
+      // ── Idle timeout: reset on every stdout/stderr data event ────────
+      // If no output arrives for `sshIdleTimeoutMs`, we consider the
+      // process stalled and send SIGTERM + close. Disabled when set to 0.
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      const idleMs = config.sshIdleTimeoutMs;
+      const resetIdleTimer = () => {
+        if (idleMs <= 0) return;
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          console.warn(`[ssh-runner] Idle timeout (${idleMs}ms no output) — killing process`);
+          onChunk({ type: 'stderr', text: `[banana] idle timeout: no output for ${Math.round(idleMs / 1000)}s — terminating\n` });
+          stream.signal('TERM');
+          setTimeout(() => stream.close(), 3000);
+        }, idleMs);
+      };
+      resetIdleTimer(); // start the clock
+
       stream.on('data', (data: Buffer) => {
+        resetIdleTimer();
         buffer += data.toString();
         const lines = buffer.split('\n');
         buffer = lines.pop() ?? '';
@@ -258,12 +276,14 @@ export async function runClaudeOverSsh(
       });
 
       stream.stderr.on('data', (data: Buffer) => {
+        resetIdleTimer();
         const text = data.toString();
         console.error(`[ssh-runner] stderr: ${text.trim()}`);
         onChunk({ type: 'stderr', text });
       });
 
       stream.on('close', (code: number | null) => {
+        if (idleTimer) clearTimeout(idleTimer);
         // Flush remaining buffer
         if (buffer.trim()) {
           const parsed = parseLine(buffer);
@@ -280,6 +300,7 @@ export async function runClaudeOverSsh(
 
       // Abort support — send SIGTERM equivalent via signal() on the SSH channel
       const onAbort = () => {
+        if (idleTimer) clearTimeout(idleTimer);
         console.log('[ssh-runner] Aborting SSH execution');
         stream.signal('TERM');
         setTimeout(() => stream.close(), 3000);
