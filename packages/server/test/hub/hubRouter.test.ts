@@ -638,12 +638,13 @@ describe('hubRouter', () => {
 
   describe('SKIP detection', () => {
     // Helper: dispatch a session, then fire its job-complete callback with a
-    // synthetic agent reply so we can observe whether a follow-up message is
-    // posted (acted) or suppressed (skipped).
+    // synthetic agent reply so we can observe whether a skip message is
+    // posted (with [SKIP][#REASON] tag) and dispatch marked "skipped".
     function runWithReply(replyText: string | unknown[]): {
       msgId: string;
       dispatchStatus: string | undefined;
       replyPosted: boolean;
+      postedContent: string | undefined;
     } {
       createSession({ sessionId: 'skip-detect', channels: ['ch1'] });
 
@@ -672,64 +673,84 @@ describe('hubRouter', () => {
 
       callback();
 
-      const after = hubStore.hubStore.getByChannel('ch1').length;
+      const afterMsgs = hubStore.hubStore.getByChannel('ch1');
       const stored = hubStore.hubStore.getMessage(msg.id)!;
       const dispatch = stored.dispatches.find(d => d.sessionId === 'skip-detect');
+      const newMsgs = afterMsgs.slice(before);
+      const lastPosted = newMsgs.length > 0 ? newMsgs[newMsgs.length - 1] : undefined;
 
       return {
         msgId: msg.id,
         dispatchStatus: dispatch?.status,
-        replyPosted: after > before,
+        replyPosted: newMsgs.length > 0,
+        postedContent: lastPosted?.content,
       };
     }
 
-    it('should suppress plain "SKIP"', () => {
+    it('should mark plain "SKIP" as skipped and post [SKIP][#LEGACY] to channel', () => {
       const r = runWithReply('SKIP');
       expect(r.dispatchStatus).toBe('skipped');
-      expect(r.replyPosted).toBe(false);
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP][#LEGACY]');
     });
 
-    it('should suppress "SKIPSKIP" (LLM stutter)', () => {
+    it('should mark "SKIPSKIP" as skipped and post to channel', () => {
       const r = runWithReply('SKIPSKIP');
       expect(r.dispatchStatus).toBe('skipped');
-      expect(r.replyPosted).toBe(false);
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP][#LEGACY]');
     });
 
-    it('should suppress "SKIP."', () => {
+    it('should mark "SKIP." as skipped and post to channel', () => {
       const r = runWithReply('SKIP.');
       expect(r.dispatchStatus).toBe('skipped');
-      expect(r.replyPosted).toBe(false);
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP]');
     });
 
-    it('should suppress "skip - not relevant"', () => {
+    it('should mark "skip - not relevant" as skipped with legacy reason', () => {
       const r = runWithReply('skip - not relevant');
       expect(r.dispatchStatus).toBe('skipped');
-      expect(r.replyPosted).toBe(false);
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP][#LEGACY]');
+      expect(r.postedContent).toContain('not relevant');
     });
 
-    it('should suppress empty reply', () => {
+    it('should mark empty reply as skipped', () => {
       const r = runWithReply('   ');
       expect(r.dispatchStatus).toBe('skipped');
-      expect(r.replyPosted).toBe(false);
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP][#EMPTY]');
+    });
+
+    it('should parse structured [SKIP][#OUT_OF_DOMAIN] marker', () => {
+      const r = runWithReply('[SKIP][#OUT_OF_DOMAIN]');
+      expect(r.dispatchStatus).toBe('skipped');
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toBe('[SKIP][#OUT_OF_DOMAIN]');
+    });
+
+    it('should parse structured [SKIP][#NO_ACTION_NEEDED] with explanation', () => {
+      const r = runWithReply('[SKIP][#NO_ACTION_NEEDED] Already handled by dev-alice.');
+      expect(r.dispatchStatus).toBe('skipped');
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toBe('[SKIP][#NO_ACTION_NEEDED] Already handled by dev-alice.');
     });
 
     it('should NOT suppress real content that mentions skipping', () => {
       const r = runWithReply('Skipping the build step is risky because tests need to run first.');
       expect(r.dispatchStatus).toBe('acted');
       expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).not.toContain('[SKIP]');
     });
 
     it('should NOT suppress short imperative starting with "Skip" (no separator)', () => {
-      // Real content beginning with the verb "skip" — must NOT be dropped.
       const r = runWithReply('Skip the cache and rebuild from source for accurate timing.');
       expect(r.dispatchStatus).toBe('acted');
       expect(r.replyPosted).toBe(true);
     });
 
     it('should NOT suppress long complex reply that begins with "skip"', () => {
-      // The exact regression: a long, multi-step reply from a complex
-      // agent process that happens to start with the word "skip" was being
-      // killed by the old `^skip\b` check.
       const longReply = [
         'Skip cache invalidation for now, here is the full plan:',
         '',
@@ -748,28 +769,26 @@ describe('hubRouter', () => {
     });
 
     it('should NOT suppress multi-paragraph reply', () => {
-      // Multi-paragraph (\n\n) replies are real content even if short.
       const r = runWithReply('skip the noise.\n\nHere is what I found in the logs.');
       expect(r.dispatchStatus).toBe('acted');
       expect(r.replyPosted).toBe(true);
     });
 
-    it('should suppress "skip: nothing to add" (explicit reason form)', () => {
+    it('should mark "skip: nothing to add" as skipped (legacy reason form)', () => {
       const r = runWithReply('skip: nothing to add here');
       expect(r.dispatchStatus).toBe('skipped');
-      expect(r.replyPosted).toBe(false);
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP][#LEGACY]');
     });
 
-    it('should suppress "SKIP — out of scope" (em-dash reason)', () => {
+    it('should mark "SKIP — out of scope" as skipped (em-dash reason)', () => {
       const r = runWithReply('SKIP — out of scope for me');
       expect(r.dispatchStatus).toBe('skipped');
-      expect(r.replyPosted).toBe(false);
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP]');
     });
 
-    it('should suppress double SKIP via stream_event text_deltas + tool_use + rate_limit_event', () => {
-      // Reproduces the real-world pattern reported by user: model emits two
-      // "\n\nSKIP" text deltas, then starts a tool_use that gets cut off by a
-      // rate_limit_event. We should still detect this as SKIP.
+    it('should mark double SKIP via stream_event text_deltas as skipped', () => {
       const r = runWithReply([
         { type: 'system', subtype: 'init', session_id: 'cs-1' },
         {
@@ -801,12 +820,11 @@ describe('hubRouter', () => {
         },
       ]);
       expect(r.dispatchStatus).toBe('skipped');
-      expect(r.replyPosted).toBe(false);
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP]');
     });
 
-    it('should suppress double SKIP via assistant snapshot with text + partial tool_use', () => {
-      // Same pattern but delivered via the post-turn `assistant` snapshot
-      // (Claude CLI emits both stream_events AND snapshots).
+    it('should mark double SKIP via assistant snapshot as skipped', () => {
       const r = runWithReply([
         {
           type: 'assistant',
@@ -821,7 +839,8 @@ describe('hubRouter', () => {
         { type: 'rate_limit_event', rate_limit_info: { status: 'allowed' } },
       ]);
       expect(r.dispatchStatus).toBe('skipped');
-      expect(r.replyPosted).toBe(false);
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP]');
     });
   });
 
@@ -981,7 +1000,7 @@ describe('hubRouter', () => {
       expect(calls).toHaveLength(0);
     });
 
-    it('SKIP during continuation drops out and posts nothing', async () => {
+    it('SKIP during continuation posts a [SKIP] message and stops talking', async () => {
       setupTalker();
       fireLastCallback('First beat. [IM_TALKING]');
       await new Promise(resolve => setImmediate(resolve));
@@ -991,9 +1010,10 @@ describe('hubRouter', () => {
 
       const channelMsgs = hubStore.hubStore.getByChannel('talk-ch');
       const replies = channelMsgs.filter(m => m.from === 'talk-sess');
-      // Only the first beat got posted; the SKIP'd round 2 was dropped
-      expect(replies.length).toBe(1);
+      // First beat + visible SKIP message
+      expect(replies.length).toBe(2);
       expect(replies[0].content).toContain('First beat');
+      expect(replies[1].content).toContain('[SKIP]');
     });
 
     it('does NOT loop if reply also contains [BEGIN_WORK] (self-trigger wins)', async () => {

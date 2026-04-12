@@ -952,6 +952,24 @@ header h1 { font-size: 16px; color: var(--accent); }
   line-height: 1.5;
 }
 
+/* SKIP messages — collapsed, muted, compact */
+.hub-msg-skip {
+  opacity: 0.5;
+  border-left-color: var(--muted) !important;
+}
+.hub-msg-skip .hub-msg-content { font-size: 11px; }
+.hub-skip-badge {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--bg);
+  background: var(--muted);
+  border-radius: 3px;
+  padding: 1px 5px;
+  margin-left: 4px;
+}
+.hub-skip-text { font-style: italic; color: var(--muted); }
+
 .hub-msg-meta {
   display: flex;
   flex-wrap: wrap;

@@ -464,7 +464,15 @@ commitment to do real, verifiable work — not vibes.
 `;
 
 function buildGuidance(engagement: EngagementLevel): string {
-  const fallback = 'If the message is not actionable for you or you have nothing to add, respond with exactly "SKIP".';
+  const skipInstruction = [
+    'If the message is not actionable for you or you have nothing to add,',
+    'respond with a SKIP marker: [SKIP][#REASON] where REASON is one of:',
+    '  OUT_OF_DOMAIN — not related to your role',
+    '  NO_ACTION_NEEDED — nothing to add or do',
+    '  DUPLICATE — already addressed by another agent',
+    '  WAITING — blocked on something else',
+    'Example: [SKIP][#OUT_OF_DOMAIN]',
+  ].join('\n');
   switch (engagement) {
     case 'triggered':
       return [
@@ -484,18 +492,18 @@ function buildGuidance(engagement: EngagementLevel): string {
         '  - What\'s done, what remains, and any blockers',
         '',
         'If the task is genuinely outside your role or impossible, briefly explain why instead of pretending to act.',
-        'Do NOT respond with "SKIP". Do NOT ask the user clarifying questions — make reasonable assumptions and proceed.',
+        'Do NOT respond with [SKIP]. Do NOT ask the user clarifying questions — make reasonable assumptions and proceed.',
       ].join('\n');
     case 'mentioned':
-      return `You were @mentioned directly. Respond to the question or request. ${fallback}${SELF_TRIGGER_HINT}`;
+      return `You were @mentioned directly. Respond to the question or request.\n${skipInstruction}${SELF_TRIGGER_HINT}`;
     case 'expert':
-      return `This message is in your area of expertise. Engage fully and provide substantive input from your role's perspective. ${fallback}${SELF_TRIGGER_HINT}`;
+      return `This message is in your area of expertise. Engage fully and provide substantive input from your role's perspective.\n${skipInstruction}${SELF_TRIGGER_HINT}`;
     case 'listen':
       return [
         'You are in the war-room listening to a discussion outside your core specialty.',
         'Only respond if you have a brief, concrete observation, concern, or suggestion from your role that others might miss (1-2 sentences max).',
-        fallback,
-      ].join(' ') + SELF_TRIGGER_HINT;
+        skipInstruction,
+      ].join('\n') + SELF_TRIGGER_HINT;
   }
 }
 
@@ -523,43 +531,66 @@ function stripTalkingMarkers(text: string): string {
  * signals are tiny by definition — anything substantive is real content. */
 const SKIP_MAX_LEN = 200;
 
+export interface SkipResult {
+  skipped: true;
+  reason: string;       // e.g. "OUT_OF_DOMAIN", "NO_ACTION_NEEDED", "LEGACY"
+  displayText: string;  // what to post in the channel (empty → use a default)
+}
+
 /**
- * Detect whether an agent's reply is a "SKIP" — meaning it should be silently
- * dropped rather than posted as a real message. Catches:
- *   - empty responses
- *   - "SKIP", "SKIP.", "SKIP!", "skip"
- *   - "SKIPSKIP", "SKIP SKIP", "SKIP\n\nSKIP" (LLM stuttering)
- *   - "SKIP - not relevant", "skip: nothing to add"
- * Does NOT match: "skipping the build", "skip ahead to ..." (real content),
- * long substantive replies that happen to begin with the word "skip", or
- * any multi-paragraph reply.
+ * Detect whether an agent's reply is a SKIP. Returns `null` if it's real
+ * content, or a `SkipResult` with reason and display text if it's a SKIP.
+ *
+ * Structured marker (preferred): `[SKIP][#REASON]` optionally followed by
+ * a brief explanation.
+ *   e.g. `[SKIP][#OUT_OF_DOMAIN]`
+ *   e.g. `[SKIP][#NO_ACTION_NEEDED] Already handled by dev.`
+ *
+ * Legacy forms (backward compat): bare "SKIP", "SKIP.", "SKIPSKIP",
+ * "skip: reason", "skip - reason", empty replies. These are still
+ * recognized but get a generic "LEGACY" reason.
  */
-function isSkipResponse(text: string): boolean {
+function parseSkipResponse(text: string): SkipResult | null {
   const trimmed = text.trim();
-  if (trimmed === '') return true;
 
-  // 1) Letters-only check — pure repetitions of SKIP regardless of
+  // Empty → skip
+  if (trimmed === '') {
+    return { skipped: true, reason: 'EMPTY', displayText: '' };
+  }
+
+  // 1) Structured marker: [SKIP][#REASON] optionally followed by explanation
+  const structuredMatch = trimmed.match(/^\[SKIP\]\[#([A-Z0-9_]+)\]\s*([\s\S]*)/i);
+  if (structuredMatch) {
+    const reason = structuredMatch[1].toUpperCase();
+    const explanation = structuredMatch[2]?.trim() ?? '';
+    return { skipped: true, reason, displayText: explanation };
+  }
+
+  // 2) Letters-only check — pure repetitions of SKIP regardless of
   //    intervening punctuation/whitespace. Catches "SKIP", "SKIP.",
-  //    "SKIP SKIP", "SKIPSKIP", "SKIP\n\nSKIP" (LLM stutter). This branch
-  //    runs without a length cap so we still catch the rare degenerate
-  //    case where the model emits hundreds of "SKIP"s in a row.
+  //    "SKIP SKIP", "SKIPSKIP", "SKIP\n\nSKIP" (LLM stutter).
   const lettersOnly = trimmed.replace(/[^a-z]/gi, '').toLowerCase();
-  if (lettersOnly.length > 0 && /^(skip)+$/.test(lettersOnly)) return true;
+  if (lettersOnly.length > 0 && /^(skip)+$/.test(lettersOnly)) {
+    return { skipped: true, reason: 'LEGACY', displayText: '' };
+  }
 
-  // 2) Anything substantive is real content. A genuine "skip + short reason"
-  //    is by nature tiny and single-paragraph; multi-paragraph or long
-  //    replies are work products that must NOT be silently dropped.
-  if (trimmed.length > SKIP_MAX_LEN) return false;
-  if (trimmed.includes('\n\n')) return false;
+  // 3) Anything substantive is real content. Long or multi-paragraph
+  //    replies are work products, not skips.
+  if (trimmed.length > SKIP_MAX_LEN) return null;
+  if (trimmed.includes('\n\n')) return null;
 
-  // 3) Explicit reason form: "skip: nothing to add", "skip - not relevant",
-  //    "skip — out of scope". Requires an explicit colon/dash separator
-  //    after the word "skip". This prevents instructional content like
-  //    "Skip the validation step and run the build" from being
-  //    misclassified — that one has neither punctuation nor a length match.
-  if (/^skip\s*[:\-–—]/i.test(trimmed)) return true;
+  // 4) Legacy explicit reason form: "skip: nothing to add", "skip - reason"
+  const legacyReasonMatch = trimmed.match(/^skip\s*[:\-–—]\s*(.*)/i);
+  if (legacyReasonMatch) {
+    return { skipped: true, reason: 'LEGACY', displayText: legacyReasonMatch[1]?.trim() ?? '' };
+  }
 
-  return false;
+  return null;
+}
+
+/** Backward-compat wrapper. */
+function isSkipResponse(text: string): boolean {
+  return parseSkipResponse(text) !== null;
 }
 
 function dispatchToSession(
@@ -643,15 +674,36 @@ function onSessionJobComplete(
   const job = storedSession?.jobs.find(j => j.jobId === jobId);
   const rawOutput = extractTextFromChunks(job?.chunks ?? []);
 
-  // SKIP detection — catches "SKIP", "SKIP.", "SKIPSKIP", "skip - not relevant", etc.
-  // Skipped responses are NEVER posted to the channel; they're just recorded
-  // on the dispatch row so the dashboard can show "X skipped".
-  if (isSkipResponse(rawOutput)) {
+  // SKIP detection — structured `[SKIP][#REASON]` or legacy bare "SKIP".
+  // Skipped responses ARE posted to the channel (so humans see who skipped
+  // and why) but don't trigger chain propagation, self-triggers, or talking
+  // continuation.
+  const skipResult = parseSkipResponse(rawOutput);
+  if (skipResult) {
     hubStore.updateDispatch(hubMessage.id, sessionId, {
       status: 'skipped',
       finishedAt: new Date().toISOString(),
     });
     broadcastDispatchUpdate(hubMessage.id);
+
+    // Post a visible skip message to the channel
+    const screenName = session.screenName ?? session.name ?? sessionId.slice(0, 8);
+    const skipContent = skipResult.displayText
+      ? `[SKIP][#${skipResult.reason}] ${skipResult.displayText}`
+      : `[SKIP][#${skipResult.reason}]`;
+
+    if (hubMessage.depth < config.hubMaxChainDepth) {
+      postHubMessage({
+        from: sessionId,
+        fromName: screenName,
+        content: skipContent,
+        channelIds: [hubMessage.channelId],
+        tags: hubMessage.tags,
+        mentions: [],
+        parentId: hubMessage.id,
+        depth: hubMessage.depth + 1,
+      });
+    }
   } else {
     hubStore.updateDispatch(hubMessage.id, sessionId, {
       status: 'acted',
@@ -789,7 +841,7 @@ function continueTalking(
     '',
     'You may continue holding the floor by including [IM_TALKING] or',
     '[IM_THINKING] again in this reply, or release it by writing your final',
-    'beat without the marker. Reply with SKIP to drop out entirely.',
+    'beat without the marker. Reply with [SKIP][#NO_ACTION_NEEDED] to drop out entirely.',
   ].join('\n');
 
   const rawPrompt = [
@@ -843,12 +895,32 @@ function onTalkingJobComplete(
   const job = session.jobs.find(j => j.jobId === jobId);
   const rawOutput = extractTextFromChunks(job?.chunks ?? []);
 
-  if (isSkipResponse(rawOutput)) {
+  const talkSkip = parseSkipResponse(rawOutput);
+  if (talkSkip) {
     hubStore.updateDispatch(originalMessage.id, sessionId, {
       status: 'skipped',
       finishedAt: new Date().toISOString(),
     });
     broadcastDispatchUpdate(originalMessage.id);
+
+    // Post visible skip in channel
+    const skipScreenName = session.screenName ?? session.name ?? sessionId.slice(0, 8);
+    const skipContent = talkSkip.displayText
+      ? `[SKIP][#${talkSkip.reason}] ${talkSkip.displayText}`
+      : `[SKIP][#${talkSkip.reason}]`;
+    if (originalMessage.depth < config.hubMaxChainDepth) {
+      postHubMessage({
+        from: sessionId,
+        fromName: skipScreenName,
+        content: skipContent,
+        channelIds: [originalMessage.channelId],
+        tags: originalMessage.tags,
+        mentions: [],
+        parentId: originalMessage.id,
+        depth: originalMessage.depth + 1,
+      });
+    }
+
     processQueue(sessionId);
     drainGlobalQueue();
     return;

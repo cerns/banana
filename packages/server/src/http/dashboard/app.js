@@ -1047,16 +1047,30 @@ function renderHubMessages() {
 
     const tagBadges = m.tags.map(t => `<span class="hub-tag">${esc(t)}</span>`).join('');
     const mentionBadges = m.mentions.map(n => `<span class="hub-mention">@${esc(n)}</span>`).join('');
+
+    // Detect [SKIP][#REASON] messages for special rendering
+    const skipMatch = m.content.match(/^\[SKIP\]\[#([A-Z0-9_]+)\]\s*(.*)/is);
+    const isSkipMsg = !!skipMatch;
+    const skipReason = skipMatch ? skipMatch[1] : '';
+    const skipExplanation = skipMatch ? skipMatch[2].trim() : '';
+    const skipBadge = isSkipMsg
+      ? `<span class="hub-skip-badge" title="${esc(skipExplanation || skipReason)}">SKIP #${esc(skipReason)}</span>`
+      : '';
+    const contentHtml = isSkipMsg
+      ? (skipExplanation ? `<span class="hub-skip-text">${esc(skipExplanation)}</span>` : '')
+      : esc(m.content);
+
     return `
-    <div class="hub-msg" style="margin-left:${indent}px" data-msg-id="${m.id}">
+    <div class="hub-msg${isSkipMsg ? ' hub-msg-skip' : ''}" style="margin-left:${indent}px" data-msg-id="${m.id}">
       <div class="hub-msg-header">
         <button class="hub-retry-btn" data-retry="${m.id}" title="Retry / continue — re-dispatch a session that previously ran on this message (e.g. after rate limit reset)">↻</button>
         <span class="hub-msg-from">${esc(m.fromName)}</span>
+        ${skipBadge}
         <span class="hub-msg-time">${new Date(m.timestamp).toLocaleTimeString()}</span>
         <span class="hub-msg-status hub-status-${m.status}">${m.status}</span>
         <button class="hub-trigger-btn" data-trigger="${m.id}" title="Trigger a session to act on this message">▶ Trigger</button>
       </div>
-      <div class="hub-msg-content">${esc(m.content)}</div>
+      <div class="hub-msg-content">${contentHtml}</div>
       ${inFlightBlock}
       <div class="hub-msg-meta">${tagBadges} ${mentionBadges} ${dispBadges}</div>
     </div>`;
