@@ -139,13 +139,6 @@ function getClaudeBin(machine: MachineRecord): string {
   return 'claude';
 }
 
-/** Threshold (in chars) above which the prompt is sent via stdin instead of
- * being embedded as a shell argument. Avoids EPIPE / argv-too-long failures
- * when prompts are large (e.g. channel compaction transcripts). The SSH
- * exec request packet has a practical ~32KB ceiling, and PTY input has line
- * discipline limits, so anything above ~16KB gets piped via stdin instead. */
-const STDIN_PROMPT_THRESHOLD = 16 * 1024;
-
 /** Run Claude CLI over SSH, streaming output chunks. Supports abort via AbortSignal. */
 export async function runClaudeOverSsh(
   machine: MachineRecord,
@@ -160,7 +153,6 @@ export async function runClaudeOverSsh(
 
   const startedAt = Date.now();
   const claudeBin = getClaudeBin(machine);
-  const useStdin = prompt.length > STDIN_PROMPT_THRESHOLD;
 
   const args = [
     '--print',
@@ -178,11 +170,12 @@ export async function runClaudeOverSsh(
     args.push('--resume', shellEscape(resumeId));
   }
 
-  // Large prompts are streamed via stdin instead of being embedded in argv.
-  // claude --print reads from stdin when no positional prompt is provided.
-  if (!useStdin) {
-    args.push(shellEscape(prompt));
-  }
+  // Prompt is written to a temp file on the remote via SFTP, then piped
+  // into claude via stdin redirection. This completely sidesteps shell
+  // escaping — single quotes, double quotes, backticks, dollar signs,
+  // newlines, and any other special characters are transferred as raw
+  // bytes over SFTP with zero shell interpretation.
+  const tmpFile = `/tmp/banana-prompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
   // `trap '' HUP` makes the shell (and child processes) ignore SIGHUP.
   // This is critical because PTY mode sends SIGHUP on SSH disconnections,
@@ -191,13 +184,24 @@ export async function runClaudeOverSsh(
   const pathPrefix = "trap '' HUP; export PATH=\"$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$PATH\"";
   const cmdParts = [pathPrefix];
   if (workdir) cmdParts.push(`cd ${shellEscape(workdir)}`);
-  cmdParts.push(`${claudeBin} ${args.join(' ')}`);
-  const command = cmdParts.join(' && ');
+  cmdParts.push(`${claudeBin} ${args.join(' ')} < ${shellEscape(tmpFile)}`);
+  // Clean up temp file (best-effort, runs even if claude exits with error)
+  const command = cmdParts.join(' && ') + `; rm -f ${shellEscape(tmpFile)}`;
 
   console.log(`[ssh-runner] Connecting to ${machine.username}@${machine.ip}:${machine.port}`);
-  console.log(`[ssh-runner] Command: ${command}${useStdin ? ` (prompt ${prompt.length} chars via stdin)` : ''}`);
+  console.log(`[ssh-runner] Command: ${claudeBin} ... (prompt ${prompt.length} chars via SFTP temp file)`);
 
   const conn = await connectWithRetry(machine, signal);
+
+  // Write prompt to remote temp file via SFTP (binary-safe, no shell involved)
+  await new Promise<void>((resolve, reject) => {
+    conn.sftp((err, sftp) => {
+      if (err) { reject(err); return; }
+      const ws = sftp.createWriteStream(tmpFile, { mode: 0o600 });
+      ws.on('error', (e: Error) => { sftp.end(); reject(e); });
+      ws.end(Buffer.from(prompt, 'utf8'), () => { sftp.end(); resolve(); });
+    });
+  });
 
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -211,39 +215,10 @@ export async function runClaudeOverSsh(
     // is fully buffered and nothing streams back until the process exits).
     // SIGHUP from PTY disconnect is neutralized by `trap '' HUP` in the
     // command prefix, so claude survives transient network blips.
-    // For the stdin path we still disable PTY because PTY's line discipline
-    // mangles binary data written to stdin.
-    const execOpts = useStdin ? {} : { pty: true };
-    conn.exec(command, execOpts, (err, stream) => {
+    // Since the prompt is delivered via a temp file (not stdin), PTY is
+    // always safe — no stdin data to mangle via line discipline.
+    conn.exec(command, { pty: true }, (err, stream) => {
       if (err) { settle(() => { conn.end(); reject(err); }); return; }
-
-      // Pipe the prompt via stdin in chunked writes so we never block the
-      // SSH channel buffer with one massive write. Surface write errors
-      // (e.g. EPIPE if claude exits early) by rejecting the outer promise.
-      if (useStdin) {
-        const CHUNK = 32 * 1024;
-        let offset = 0;
-        const writeNext = () => {
-          while (offset < prompt.length) {
-            const slice = prompt.slice(offset, offset + CHUNK);
-            offset += slice.length;
-            const ok = stream.stdin.write(slice, (writeErr?: Error | null) => {
-              if (writeErr) {
-                settle(() => { try { conn.end(); } catch { /* noop */ } reject(writeErr); });
-              }
-            });
-            if (!ok) {
-              stream.stdin.once('drain', writeNext);
-              return;
-            }
-          }
-          stream.stdin.end();
-        };
-        stream.stdin.on('error', (writeErr: Error) => {
-          settle(() => { try { conn.end(); } catch { /* noop */ } reject(writeErr); });
-        });
-        writeNext();
-      }
 
       let buffer = '';
       let claudeSessionId: string | undefined;

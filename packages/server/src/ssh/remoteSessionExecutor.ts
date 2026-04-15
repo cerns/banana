@@ -4,18 +4,38 @@ import { updateClaudeSessionId } from '../sessions/sessionManager.js';
 import { broadcastToDashboards } from '../ws/dashboardBroadcast.js';
 import { pushManager } from '../push/pushManager.js';
 import { runClaudeOverSsh } from './sshRunner.js';
+import { config } from '../config.js';
 
 /** Active SSH executions — keyed by sessionId for abort support. */
 const activeExecutions = new Map<string, AbortController>();
 
+/** Per-session job queue — jobs waiting to run when the session is busy. */
+interface PendingJob {
+  jobId: string;
+  prompt: string;
+  modelOverride?: string;
+}
+const pendingQueue = new Map<string, PendingJob[]>();
+
 /** Job completion callbacks — keyed by jobId. */
 const completionCallbacks = new Map<string, Array<(sessionId: string, jobId: string) => void>>();
+
+/** Global callbacks — fire after EVERY job completes (regardless of hub routing). */
+const globalCallbacks: Array<(sessionId: string, jobId: string) => void> = [];
 
 /** Register a callback to fire when a specific job completes. */
 export function onJobComplete(jobId: string, callback: (sessionId: string, jobId: string) => void): void {
   const cbs = completionCallbacks.get(jobId) ?? [];
   cbs.push(callback);
   completionCallbacks.set(jobId, cbs);
+}
+
+/**
+ * Register a callback that fires after ANY job completes — ad-hoc or hub-dispatched.
+ * Used to drain hub queues after ad-hoc jobs free up a session.
+ */
+export function onAnyJobComplete(callback: (sessionId: string, jobId: string) => void): void {
+  globalCallbacks.push(callback);
 }
 
 function fireCompletionCallbacks(sessionId: string, jobId: string): void {
@@ -25,6 +45,14 @@ function fireCompletionCallbacks(sessionId: string, jobId: string): void {
   for (const cb of cbs) {
     try { cb(sessionId, jobId); } catch (e) {
       console.error('[remote-executor] completion callback error:', e);
+    }
+  }
+}
+
+function fireGlobalCallbacks(sessionId: string, jobId: string): void {
+  for (const cb of globalCallbacks) {
+    try { cb(sessionId, jobId); } catch (e) {
+      console.error('[remote-executor] global callback error:', e);
     }
   }
 }
@@ -39,6 +67,11 @@ export function getActiveSessionIds(): string[] {
   return Array.from(activeExecutions.keys());
 }
 
+/** Return the number of jobs waiting in the per-session queue. */
+export function getPendingJobCount(sessionId: string): number {
+  return pendingQueue.get(sessionId)?.length ?? 0;
+}
+
 function fmtDuration(ms: number): string {
   const s = Math.round(ms / 1000);
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
@@ -48,8 +81,28 @@ function fmtDuration(ms: number): string {
  * Execute a Claude prompt on a remote machine via SSH.
  * Fire-and-forget — the caller does not await this. Output is streamed
  * to the session store and broadcast to connected dashboards.
+ *
+ * If the session is already busy (running another job), the job is queued
+ * and will execute automatically when the current job finishes. This
+ * ensures correct ordering when multiple prompts target the same session.
  */
 export function executeRemoteJob(sessionId: string, jobId: string, prompt: string, modelOverride?: string): void {
+  if (activeExecutions.has(sessionId)) {
+    // Session is busy — queue for sequential execution instead of aborting
+    const queue = pendingQueue.get(sessionId) ?? [];
+    queue.push({ jobId, prompt, modelOverride });
+    pendingQueue.set(sessionId, queue);
+    console.log(`[remote-executor] Session ${sessionId.slice(0, 8)} busy — queued job ${jobId.slice(0, 8)} (${queue.length} pending)`);
+    broadcastToDashboards({
+      type: 'DASHBOARD_EVENT',
+      event: 'JOB_QUEUED',
+      sessionId,
+      jobId,
+      queueLength: queue.length,
+    });
+    return;
+  }
+
   // Intentionally not awaited — runs in background
   runJob(sessionId, jobId, prompt, modelOverride).catch((err) => {
     console.error(`[remote-executor] Unexpected error for session=${sessionId} job=${jobId}:`, err);
@@ -61,6 +114,10 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
   if (!session || session.type !== 'remote' || !session.machineId) {
     sessionStore.errorJob(sessionId, jobId, 'Invalid remote session configuration');
     broadcastError(sessionId, jobId, 'Invalid remote session configuration');
+    // Still fire callbacks so hub can decrement counters and drain queues
+    fireCompletionCallbacks(sessionId, jobId);
+    drainSessionQueue(sessionId);
+    fireGlobalCallbacks(sessionId, jobId);
     return;
   }
 
@@ -68,20 +125,51 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
   if (!machine) {
     sessionStore.errorJob(sessionId, jobId, `Machine ${session.machineId} not found`);
     broadcastError(sessionId, jobId, `Machine ${session.machineId} not found`);
+    fireCompletionCallbacks(sessionId, jobId);
+    drainSessionQueue(sessionId);
+    fireGlobalCallbacks(sessionId, jobId);
     return;
   }
 
   const workdir = session.remoteWorkdir ?? machine.defaultWorkdir ?? '';
-  const resumeId = session.claudeSessionId;
-
-  // Abort any prior execution for this session (only one active per session)
-  const existing = activeExecutions.get(sessionId);
-  if (existing) existing.abort();
+  let resumeId = session.claudeSessionId;
 
   const controller = new AbortController();
   activeExecutions.set(sessionId, controller);
 
   try {
+    // ── Auto-compact: keep context window lean on long-running sessions ──
+    const turns = session.turnsSinceCompact ?? 0;
+    if (resumeId && config.compactAfterTurns > 0 && turns >= config.compactAfterTurns) {
+      console.log(`[remote-executor] Session ${sessionId.slice(0, 8)} has ${turns} turns — running /compact`);
+      broadcastToDashboards({
+        type: 'DASHBOARD_EVENT',
+        event: 'SESSION_COMPACTING',
+        sessionId,
+        turns,
+      });
+      try {
+        const compactResult = await runClaudeOverSsh(
+          machine,
+          '/compact',
+          workdir,
+          () => {}, // discard compact output
+          resumeId,
+          controller.signal,
+          modelOverride || session.model,
+        );
+        if (compactResult.claudeSessionId) {
+          updateClaudeSessionId(sessionId, compactResult.claudeSessionId);
+          resumeId = compactResult.claudeSessionId;
+        }
+        sessionStore.updateMeta(sessionId, { turnsSinceCompact: 0 });
+        console.log(`[remote-executor] /compact done for ${sessionId.slice(0, 8)} in ${fmtDuration(compactResult.durationMs)}`);
+      } catch (compactErr) {
+        // Don't fail the actual job — just log and continue
+        console.warn(`[remote-executor] /compact failed for ${sessionId.slice(0, 8)}, continuing:`, compactErr);
+      }
+    }
+
     const result = await runClaudeOverSsh(
       machine,
       prompt,
@@ -108,6 +196,12 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
       updateClaudeSessionId(sessionId, result.claudeSessionId);
     }
 
+    // Increment turn counter for auto-compact tracking (only on resumed sessions)
+    if (resumeId) {
+      const currentTurns = sessionStore.get(sessionId)?.turnsSinceCompact ?? 0;
+      sessionStore.updateMeta(sessionId, { turnsSinceCompact: currentTurns + 1 });
+    }
+
     broadcastToDashboards({
       type: 'DASHBOARD_EVENT',
       event: 'OUTPUT_DONE',
@@ -126,8 +220,6 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
       : `⚠️ ${host} failed · exit ${result.exitCode} · ${dur}`;
     pushManager.sendPush(title, `${folder} · "${prompt.slice(0, 80)}"`).catch(() => {});
 
-    fireCompletionCallbacks(sessionId, jobId);
-
   } catch (err) {
     const errorMsg = err instanceof Error ? err.message : String(err);
     sessionStore.errorJob(sessionId, jobId, errorMsg);
@@ -137,14 +229,44 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
     const folder = workdir.split('/').pop() ?? '';
     pushManager.sendPush(`❌ ${host} couldn't start`, `${folder} · ${errorMsg.slice(0, 100)}`).catch(() => {});
 
-    fireCompletionCallbacks(sessionId, jobId);
-
   } finally {
-    // Only remove if this is still the current execution (not replaced by a newer one)
+    // Free the session FIRST so callbacks see it as available for queue drain.
     if (activeExecutions.get(sessionId) === controller) {
       activeExecutions.delete(sessionId);
     }
+
+    // Per-job callbacks (hub dispatch completion handlers — update hub state, don't start new jobs)
+    fireCompletionCallbacks(sessionId, jobId);
+
+    // Drain per-session queue — start the next queued job before hub queue
+    // drain so that already-submitted jobs execute in order. Hub queue items
+    // will wait until the per-session queue is empty.
+    drainSessionQueue(sessionId);
+
+    // Global callbacks (hub queue drain for ALL job types including ad-hoc)
+    fireGlobalCallbacks(sessionId, jobId);
   }
+}
+
+/**
+ * Drain the per-session job queue — start the next queued job if the session
+ * is free. Called in the finally block after each job completes.
+ */
+function drainSessionQueue(sessionId: string): void {
+  if (activeExecutions.has(sessionId)) return; // safety check
+  const queue = pendingQueue.get(sessionId);
+  if (!queue || queue.length === 0) {
+    pendingQueue.delete(sessionId);
+    return;
+  }
+  const next = queue.shift()!;
+  if (queue.length === 0) pendingQueue.delete(sessionId);
+
+  console.log(`[remote-executor] Draining queue for ${sessionId.slice(0, 8)} → job ${next.jobId.slice(0, 8)} (${queue.length} remaining)`);
+
+  runJob(sessionId, next.jobId, next.prompt, next.modelOverride).catch((err) => {
+    console.error(`[remote-executor] Unexpected error for session=${sessionId} job=${next.jobId}:`, err);
+  });
 }
 
 function broadcastError(sessionId: string, jobId: string, error: string): void {
@@ -157,10 +279,17 @@ function broadcastError(sessionId: string, jobId: string, error: string): void {
   });
 }
 
-/** Abort an active SSH execution for a session. */
+/** Abort an active SSH execution for a session and clear any pending queue. */
 export function abortRemoteJob(sessionId: string): boolean {
+  // Clear pending queue — abort means "stop everything for this session"
+  const queuedCount = pendingQueue.get(sessionId)?.length ?? 0;
+  pendingQueue.delete(sessionId);
+  if (queuedCount > 0) {
+    console.log(`[remote-executor] Cleared ${queuedCount} queued job(s) for ${sessionId.slice(0, 8)}`);
+  }
+
   const controller = activeExecutions.get(sessionId);
-  if (!controller) return false;
+  if (!controller) return queuedCount > 0;
   controller.abort();
   return true;
 }

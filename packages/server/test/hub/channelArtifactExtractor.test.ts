@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { extractArtifactActions } from '../../src/hub/channelArtifactExtractor.js';
+import { extractArtifactActions, parseReplyToChannel, stripReplyToChannel, parseReplyRouting, extractChannelReply } from '../../src/hub/channelArtifactExtractor.js';
 
 describe('extractArtifactActions', () => {
   describe('bJIRA_CREATE', () => {
@@ -222,5 +222,156 @@ After`;
       expect(a.cleanedText).toContain('Before');
       expect(a.cleanedText).toContain('After');
     });
+  });
+
+  describe('CHANNEL_REPLY', () => {
+    it('extracts channel reply content and strips marker from cleanedText', () => {
+      const reply = `Let me check the files and make the fix.
+Editing templates...
+
+[CHANNEL_REPLY]
+Shipped GA4 ID fix — commit 16631b0. All 3 templates updated.
+[/CHANNEL_REPLY]
+
+Done, moving on.`;
+      const a = extractArtifactActions(reply);
+      expect(a.channelReply).toBe('Shipped GA4 ID fix — commit 16631b0. All 3 templates updated.');
+      expect(a.cleanedText).not.toContain('CHANNEL_REPLY');
+      expect(a.cleanedText).toContain('Let me check');
+      expect(a.cleanedText).toContain('Done, moving on');
+    });
+
+    it('joins multiple channel reply blocks', () => {
+      const reply = `[CHANNEL_REPLY]Part 1[/CHANNEL_REPLY]
+middle text
+[CHANNEL_REPLY]Part 2[/CHANNEL_REPLY]`;
+      const a = extractArtifactActions(reply);
+      expect(a.channelReply).toBe('Part 1\n\nPart 2');
+    });
+
+    it('returns undefined channelReply when no marker is present', () => {
+      const a = extractArtifactActions('Just a normal reply.');
+      expect(a.channelReply).toBeUndefined();
+    });
+
+    it('is case-insensitive', () => {
+      const reply = '[channel_reply]Summary here[/channel_reply]';
+      const a = extractArtifactActions(reply);
+      expect(a.channelReply).toBe('Summary here');
+    });
+
+    it('works alongside bJIRA/bCONF markers', () => {
+      const reply = `[bJIRA_UPDATE id=bJIRA-1 status=done]
+[CHANNEL_REPLY]Fixed the LCP issue. Tests pass.[/CHANNEL_REPLY]`;
+      const a = extractArtifactActions(reply);
+      expect(a.taskUpdates).toHaveLength(1);
+      expect(a.channelReply).toBe('Fixed the LCP issue. Tests pass.');
+    });
+  });
+});
+
+describe('parseReplyToChannel', () => {
+  it('parses a [REPLY_TO_CHANNEL] block with channel and message IDs', () => {
+    const text = `I did the work.
+[REPLY_TO_CHANNEL][#project][%abc-123-def]
+Shipped the fix — commit 16631b0.
+[/REPLY_TO_CHANNEL]`;
+    const result = parseReplyToChannel(text);
+    expect(result).toEqual({
+      channelId: 'project',
+      messageId: 'abc-123-def',
+      content: 'Shipped the fix — commit 16631b0.',
+    });
+  });
+
+  it('returns null when no marker is present', () => {
+    expect(parseReplyToChannel('Just normal output')).toBeNull();
+  });
+
+  it('handles multiline content', () => {
+    const text = `[REPLY_TO_CHANNEL][#perf][%msg-42]
+Done:
+- Fixed LCP
+- Updated templates
+
+Blocked: nothing
+[/REPLY_TO_CHANNEL]`;
+    const result = parseReplyToChannel(text);
+    expect(result).not.toBeNull();
+    expect(result!.channelId).toBe('perf');
+    expect(result!.messageId).toBe('msg-42');
+    expect(result!.content).toContain('Fixed LCP');
+    expect(result!.content).toContain('Blocked: nothing');
+  });
+});
+
+describe('stripReplyToChannel', () => {
+  it('strips the marker block from text', () => {
+    const text = `Before
+[REPLY_TO_CHANNEL][#ch][%msg]content[/REPLY_TO_CHANNEL]
+After`;
+    const stripped = stripReplyToChannel(text);
+    expect(stripped).not.toContain('REPLY_TO_CHANNEL');
+    expect(stripped).toContain('Before');
+    expect(stripped).toContain('After');
+  });
+});
+
+describe('parseReplyRouting', () => {
+  it('extracts channelId and messageId from routing header', () => {
+    const prompt = `[ROLE: QA]\n\n[REPLY_TO_CHANNEL][#perf][%msg-42]\n---\nDo the work.`;
+    const result = parseReplyRouting(prompt);
+    expect(result).toEqual({ channelId: 'perf', messageId: 'msg-42' });
+  });
+
+  it('returns null when no routing header is present', () => {
+    expect(parseReplyRouting('Just a normal prompt')).toBeNull();
+  });
+
+  it('extracts only the routing — does not require closing tag', () => {
+    const prompt = `[REPLY_TO_CHANNEL][#project][%abc-123]`;
+    const result = parseReplyRouting(prompt);
+    expect(result).toEqual({ channelId: 'project', messageId: 'abc-123' });
+  });
+});
+
+describe('extractChannelReply', () => {
+  it('extracts [CHANNEL_REPLY] content from output', () => {
+    const text = `Tool output...done.
+[CHANNEL_REPLY]
+bJIRA-9 PASS — all checks green.
+**Done:** launch ready
+[/CHANNEL_REPLY]`;
+    const result = extractChannelReply(text);
+    expect(result).toContain('bJIRA-9 PASS');
+    expect(result).toContain('launch ready');
+  });
+
+  it('returns null when no [CHANNEL_REPLY] marker is present', () => {
+    expect(extractChannelReply('Just normal text output')).toBeNull();
+  });
+
+  it('joins multiple [CHANNEL_REPLY] blocks', () => {
+    const text = `[CHANNEL_REPLY]Part 1[/CHANNEL_REPLY]
+Middle text
+[CHANNEL_REPLY]Part 2[/CHANNEL_REPLY]`;
+    const result = extractChannelReply(text);
+    expect(result).toBe('Part 1\n\nPart 2');
+  });
+
+  it('returns null for empty [CHANNEL_REPLY] blocks', () => {
+    expect(extractChannelReply('[CHANNEL_REPLY][/CHANNEL_REPLY]')).toBeNull();
+  });
+
+  it('handles nested bJIRA markers inside [CHANNEL_REPLY]', () => {
+    const text = `[CHANNEL_REPLY]
+QA done.
+[bJIRA_UPDATE id=bJIRA-9 status=done]
+Verified.
+[/bJIRA_UPDATE]
+[/CHANNEL_REPLY]`;
+    const result = extractChannelReply(text);
+    expect(result).toContain('QA done.');
+    expect(result).toContain('bJIRA_UPDATE'); // raw extraction, no artifact processing
   });
 });

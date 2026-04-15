@@ -526,6 +526,8 @@ describe('hubRouter', () => {
       expect(prompt).toContain('You are a backend developer.');
       expect(prompt).toContain('Build something');
       expect(prompt).toContain('SKIP');
+      // Regular dispatches also include REPLY_TO_CHANNEL metadata
+      expect(prompt).toContain('[REPLY_TO_CHANNEL][#ch1]');
     });
   });
 
@@ -556,6 +558,35 @@ describe('hubRouter', () => {
       expect(prompt).toContain('EXPLICITLY TRIGGERED');
       // Triggered prompt MUST NOT contain the regular "respond with exactly SKIP" fallback
       expect(prompt).not.toContain('respond with exactly');
+    });
+
+    it('should include REPLY_TO_CHANNEL metadata in the dispatch prompt', () => {
+      createSession({ sessionId: 'reply-to-sess', channels: ['ch1'] });
+      const msg = hubRouter.postHubMessage({
+        from: 'user', fromName: 'User', content: 'Do stuff', channelIds: ['ch1'],
+      });
+
+      mockExecuteRemoteJob.mockClear();
+      hubRouter.triggerSessionOnMessage('reply-to-sess', msg.id);
+
+      const calls = mockExecuteRemoteJob.mock.calls.filter((c: any) => c[0] === 'reply-to-sess');
+      expect(calls).toHaveLength(1);
+      const prompt = calls[0][2];
+      expect(prompt).toContain('[REPLY_TO_CHANNEL][#ch1]');
+      expect(prompt).toContain(`[%${msg.id}]`);
+    });
+
+    it('should include CHANNEL_REPLY guidance in triggered prompt', () => {
+      createSession({ sessionId: 'cr-hint-sess', channels: ['ch1'] });
+      const msg = hubRouter.postHubMessage({
+        from: 'user', fromName: 'User', content: 'Work on it', channelIds: ['ch1'],
+      });
+
+      mockExecuteRemoteJob.mockClear();
+      hubRouter.triggerSessionOnMessage('cr-hint-sess', msg.id);
+
+      const prompt = mockExecuteRemoteJob.mock.calls.find((c: any) => c[0] === 'cr-hint-sess')![2];
+      expect(prompt).toContain('[CHANNEL_REPLY]');
     });
 
     it('should queue the trigger when the session is busy', () => {
@@ -1300,6 +1331,29 @@ describe('hubRouter', () => {
       expect(updated.body).toContain('## Update');
       expect(updated.history).toHaveLength(1);
     });
+
+    it('[CHANNEL_REPLY] marker controls what gets posted to channel', () => {
+      createReplyingSession(
+        `Editing templates...\nRunning tests...\n\n[CHANNEL_REPLY]\nShipped GA4 fix — commit 16631b0. All tests pass.\n[/CHANNEL_REPLY]\n\nDone.`,
+      );
+
+      const channelMsgs = hubStore.hubStore.getByChannel('mark-ch');
+      const reply = channelMsgs.find(m => m.from === 'mark-sess');
+      expect(reply).toBeDefined();
+      // Only the CHANNEL_REPLY content should appear, not the narration
+      expect(reply!.content).toBe('Shipped GA4 fix — commit 16631b0. All tests pass.');
+      expect(reply!.content).not.toContain('Editing templates');
+      expect(reply!.content).not.toContain('Done.');
+    });
+
+    it('[CHANNEL_REPLY] absent → full text posted (existing behavior)', () => {
+      createReplyingSession('All narration text goes to channel.');
+
+      const channelMsgs = hubStore.hubStore.getByChannel('mark-ch');
+      const reply = channelMsgs.find(m => m.from === 'mark-sess');
+      expect(reply).toBeDefined();
+      expect(reply!.content).toBe('All narration text goes to channel.');
+    });
   });
 
   describe('extractTextFromChunks', () => {
@@ -1347,6 +1401,39 @@ describe('hubRouter', () => {
       ];
       const text = hubRouter.extractTextFromChunks(chunks);
       expect(text).toBe('Create Jira ticket');
+    });
+
+    it('should NOT duplicate with cumulative assistant snapshots (no stream deltas)', () => {
+      // When stream deltas are absent (e.g. some CLI versions), assistant
+      // snapshots are used. Each snapshot is cumulative — contains the FULL
+      // text up to that point. Only the LAST one should be used.
+      const chunks = [
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'Hello' }] } },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'Hello world' }] } },
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'Hello world. Done.' }] } },
+      ];
+      const text = hubRouter.extractTextFromChunks(chunks);
+      expect(text).toBe('Hello world. Done.');
+    });
+
+    it('should handle assistant snapshot with multiple text blocks (tool use interleaved)', () => {
+      // After tool use, the assistant snapshot has multiple text blocks:
+      // [text, tool_use, text]. We need all text blocks from the LAST snapshot.
+      const chunks = [
+        { type: 'assistant', message: { content: [{ type: 'text', text: 'Checking...' }] } },
+        { type: 'assistant', message: { content: [
+          { type: 'text', text: 'Checking...' },
+          { type: 'tool_use', id: 'tool1', name: 'bash', input: {} },
+        ] } },
+        { type: 'assistant', message: { content: [
+          { type: 'text', text: 'Checking...' },
+          { type: 'tool_use', id: 'tool1', name: 'bash', input: {} },
+          { type: 'text', text: 'All good. [CHANNEL_REPLY]Done.[/CHANNEL_REPLY]' },
+        ] } },
+      ];
+      const text = hubRouter.extractTextFromChunks(chunks);
+      expect(text).toBe('Checking...All good. [CHANNEL_REPLY]Done.[/CHANNEL_REPLY]');
+      expect(text).not.toContain('Checking...Checking...');
     });
   });
 });

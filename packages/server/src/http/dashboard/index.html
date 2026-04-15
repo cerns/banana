@@ -20,6 +20,7 @@
       <option value="haiku">haiku</option>
       <option value="opusplan">opusplan</option>
     </select>
+    <button id="settings-btn" class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)" title="Server settings">&#9881;</button>
     <span id="ws-status" class="disconnected">○ disconnected</span>
   </header>
   <div id="push-banner" style="display:none"></div>
@@ -311,7 +312,7 @@
         <div class="form-row"><label>Channels (comma-sep)</label><input id="se-channels" placeholder="general, backend" autocomplete="off" data-1p-ignore /></div>
         <div class="form-row"><label>Role Prompt</label><textarea id="se-role-prompt" placeholder="System prompt for this role" rows="4" autocomplete="off" data-1p-ignore></textarea></div>
         <div class="form-row"><label>Model</label><select id="se-model"><option value="">default</option><option value="opus">opus</option><option value="sonnet">sonnet</option><option value="haiku">haiku</option><option value="opusplan">opusplan (plan=Opus, exec=Sonnet)</option></select></div>
-        <div class="form-row"><label>Working Dir</label><input id="se-workdir" placeholder="/path/to/project" disabled style="opacity:0.6" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Working Dir</label><div style="display:flex;gap:4px;flex:1"><input id="se-workdir" placeholder="/path/to/project" disabled style="opacity:0.6;flex:1" autocomplete="off" data-1p-ignore /><button id="se-workdir-lock" type="button" title="Unlock to edit" style="background:var(--surface);border:1px solid var(--border);border-radius:4px;cursor:pointer;font-size:14px;padding:2px 6px">&#128274;</button></div></div>
         <div class="form-row"><label>Machine</label><select id="se-machine" disabled style="opacity:0.6"></select></div>
         <div id="se-claude-info" style="display:none;font-size:10px;color:var(--muted);margin-top:8px;word-break:break-all"></div>
         <div style="display:flex;gap:8px;margin-top:12px">
@@ -327,11 +328,26 @@
   <div id="jobs-modal" class="modal" style="display:none">
     <div class="modal-content modal-lg">
       <div class="modal-header">
-        <span>Running Jobs</span>
+        <span>Jobs</span>
         <button class="modal-close" data-close="jobs-modal">&times;</button>
       </div>
       <div class="modal-body">
-        <div id="jobs-list" style="min-height:60px"></div>
+        <div id="jobs-tabs" class="jobs-tabs">
+          <button class="jobs-tab active" data-source="all">All</button>
+          <button class="jobs-tab" data-source="adhoc">Ad-hoc</button>
+          <button class="jobs-tab" data-source="hub">Hub</button>
+          <button class="jobs-tab" data-source="trigger">Trigger</button>
+          <button class="jobs-tab" data-source="self-trigger">Self-trigger</button>
+          <button class="jobs-tab" data-source="talking">Talking</button>
+        </div>
+        <div id="jobs-active-section">
+          <h4 style="margin:0 0 8px;color:var(--accent);font-size:12px;text-transform:uppercase;letter-spacing:1px">Running</h4>
+          <div id="jobs-list" style="min-height:30px"></div>
+        </div>
+        <div id="jobs-recent-section" style="margin-top:16px">
+          <h4 style="margin:0 0 8px;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:1px">Recent</h4>
+          <div id="jobs-recent-list" style="min-height:30px"></div>
+        </div>
       </div>
     </div>
   </div>
@@ -350,6 +366,29 @@
           <button id="job-detail-abort" class="btn" style="background:var(--red);color:#000">Abort</button>
           <button class="btn modal-close" data-close="job-detail-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Close</button>
         </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Settings modal -->
+  <div id="settings-modal" class="modal" style="display:none">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span>&#9881; Settings</span>
+        <button class="modal-close" data-close="settings-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <div class="form-row"><label>Auto-compact after N turns (0 = disabled)</label><input id="set-compact-turns" type="number" min="0" step="1" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Hub max concurrent jobs</label><input id="set-hub-concurrent" type="number" min="1" step="1" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Hub cooldown (ms)</label><input id="set-hub-cooldown" type="number" min="0" step="1000" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Hub max talk rounds</label><input id="set-hub-talk-rounds" type="number" min="1" step="1" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Hub max chain depth</label><input id="set-hub-chain-depth" type="number" min="1" step="1" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>SSH idle timeout (ms, 0 = disabled)</label><input id="set-ssh-idle" type="number" min="0" step="60000" autocomplete="off" data-1p-ignore /></div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button id="set-save" class="btn">Save</button>
+          <button class="btn modal-close" data-close="settings-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+        <div id="set-status" style="margin-top:8px;font-size:11px;color:var(--muted)"></div>
       </div>
     </div>
   </div>

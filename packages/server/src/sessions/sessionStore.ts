@@ -32,7 +32,12 @@ export interface SessionRecord {
    * Examples: "opus", "sonnet", "haiku", "claude-sonnet-4-6". Empty/undefined
    * lets the remote CLI pick its default. */
   model?: string;
+  /** Number of resumed turns since the last /compact. Auto-compact triggers
+   * when this reaches config.compactAfterTurns. */
+  turnsSinceCompact?: number;
 }
+
+export type JobSource = 'adhoc' | 'hub' | 'trigger' | 'self-trigger' | 'talking';
 
 export interface JobRecord {
   jobId: string;
@@ -43,6 +48,7 @@ export interface JobRecord {
   durationMs?: number;
   chunks: unknown[];
   error?: string;
+  source?: JobSource;
 }
 
 // Debounce window: coalesce many writes (e.g. streaming chunks) into one
@@ -108,7 +114,7 @@ class SessionStore {
     this.persist();
   }
 
-  updateMeta(sessionId: string, fields: Partial<Pick<SessionRecord, 'name' | 'claudeSessionId' | 'remoteWorkdir' | 'role' | 'screenName' | 'interests' | 'rolePrompt' | 'channels' | 'hubQueue' | 'model'>>): void {
+  updateMeta(sessionId: string, fields: Partial<Pick<SessionRecord, 'name' | 'claudeSessionId' | 'remoteWorkdir' | 'role' | 'screenName' | 'interests' | 'rolePrompt' | 'channels' | 'hubQueue' | 'model' | 'turnsSinceCompact'>>): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     Object.assign(session, fields);

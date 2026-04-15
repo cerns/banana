@@ -213,7 +213,7 @@ function tryConnect() {
     if (msg.type === 'DASHBOARD_ACK') { showMain(); setStatus('connected'); loadSessions(); return; }
     if (msg.type === 'DASHBOARD_REJECT') { alert('Invalid token'); localStorage.removeItem('banana_token'); showAuth(); return; }
     if (msg.type === 'DASHBOARD_EVENT') handleEvent(msg);
-    if (msg.type === 'DASHBOARD_EVENT' && msg.event === 'HUB_MESSAGE') handleHubEvent(msg);
+    if (msg.type === 'DASHBOARD_EVENT') handleHubEvent(msg);
   });
   ws.addEventListener('close', () => { setStatus('disconnected'); setTimeout(tryConnect, 3000); });
   ws.addEventListener('error', () => setStatus('disconnected'));
@@ -268,12 +268,23 @@ function handleEvent(msg) {
     return;
   }
 
+  if (event === 'JOB_QUEUED') {
+    // A job was queued for this session — ensure we track it as running
+    ensureOutput(sessionId, msg.jobId);
+    updateSessionSpinner(sessionId);
+    refreshJobsBadge();
+    return;
+  }
+
   if (event === 'OUTPUT_CHUNK') {
     ensureOutput(sessionId, msg.jobId);
     outputs[sessionId][msg.jobId].chunks.push(msg.chunk);
     saveOutputs(sessionId);
     markUnread(sessionId);
     if (sessionId === activeSessionId) renderOutput();
+    // Real-time badge: at least 1 job running
+    refreshJobsBadge();
+    updateSessionSpinner(sessionId);
     return;
   }
 
@@ -293,6 +304,14 @@ function handleEvent(msg) {
       ? `✅ ${host} finished in ${dur}`
       : `⚠️ ${host} failed · exit ${msg.exitCode} · ${dur}`;
     notify(title, `${folder} · "${prompt}"`);
+    // Real-time badge: a job just finished
+    refreshJobsBadge();
+    updateSessionSpinner(sessionId);
+    // Refresh jobs modal if open
+    if (document.getElementById('jobs-modal').style.display !== 'none') {
+      loadActiveJobs();
+      loadRecentJobs();
+    }
     return;
   }
 
@@ -306,6 +325,13 @@ function handleEvent(msg) {
     const host = s?.hostname ?? sessionId.slice(0, 8);
     const folder = s?.workdir?.split('/').pop() ?? '';
     notify(`❌ ${host} couldn't start`, `${folder} · ${String(msg.error).slice(0, 100)}`);
+    // Real-time badge
+    refreshJobsBadge();
+    updateSessionSpinner(sessionId);
+    if (document.getElementById('jobs-modal').style.display !== 'none') {
+      loadActiveJobs();
+      loadRecentJobs();
+    }
     return;
   }
 }
@@ -341,8 +367,40 @@ async function loadSessions() {
 }
 
 // ── Sidebar ───────────────────────────────────────────────────────────────────
+// Check if a session has any running (not done, not errored) job
+function isSessionRunning(sessionId) {
+  const jobs = outputs[sessionId];
+  if (!jobs) return false;
+  return Object.values(jobs).some(j => !j.done && !j.error);
+}
+
+// Incrementally update spinner for a single session (no full sidebar re-render)
+function updateSessionSpinner(sessionId) {
+  const item = sessionList.querySelector(`.session-item[data-id="${sessionId}"]`);
+  if (!item) return;
+  const running = isSessionRunning(sessionId);
+  const nameRow = item.querySelector('.session-name-row');
+  if (!nameRow) return;
+  let spinner = nameRow.querySelector('.session-spinner');
+  if (running && !spinner) {
+    spinner = document.createElement('span');
+    spinner.className = 'session-spinner';
+    const dot = nameRow.querySelector('.unread-dot');
+    if (dot) nameRow.insertBefore(spinner, dot);
+    else nameRow.appendChild(spinner);
+  } else if (!running && spinner) {
+    spinner.remove();
+  }
+}
+
 function renderSidebar() {
-  const items = Object.values(sessions).sort((a, b) => (b.connectedAt || '').localeCompare(a.connectedAt || ''));
+  const items = Object.values(sessions).sort((a, b) => {
+    const nameA = (a.name || '').toLowerCase();
+    const nameB = (b.name || '').toLowerCase();
+    if (nameA && !nameB) return -1;
+    if (!nameA && nameB) return 1;
+    return nameA.localeCompare(nameB);
+  });
   document.getElementById('session-count').textContent = items.length ? `(${items.length})` : '';
   if (items.length === 0) {
     sessionList.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:11px;">No sessions yet</div>';
@@ -351,11 +409,13 @@ function renderSidebar() {
   sessionList.innerHTML = items.map(s => {
     const displayName = s.name || s.hostname || '?';
     const hasUnread = unread[s.sessionId];
+    const running = isSessionRunning(s.sessionId);
     return `
     <div class="session-item ${s.sessionId === activeSessionId ? 'active' : ''}" data-id="${s.sessionId}">
       <div class="session-top-row">
         <div class="session-name-row">
           ${s.name ? `<span class="session-name">${esc(s.name)}</span>` : `<span class="session-host-name">${esc(displayName)}</span>`}
+          ${running ? '<span class="session-spinner"></span>' : ''}
           ${hasUnread ? '<span class="unread-dot"></span>' : ''}
         </div>
         <button class="session-edit-btn" data-edit-session="${s.sessionId}" title="Edit session">&#9998;</button>
@@ -597,6 +657,7 @@ async function sendPrompt() {
     saveOutputs(activeSessionId);
     updateInputState();
     renderOutput();
+    updateSessionSpinner(activeSessionId);
   }
 }
 
@@ -634,7 +695,7 @@ function fmtDuration(ms) {
 }
 
 function esc(str) {
-  return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+  return String(str ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
 // ── Modal helpers ─────────────────────────────────────────────────────────────
@@ -678,9 +739,28 @@ async function openSessionEditModal(sessionId) {
     claudeInfo.style.display = 'none';
   }
 
+  // Reset workdir lock
+  const wdInput = document.getElementById('se-workdir');
+  const wdLock = document.getElementById('se-workdir-lock');
+  wdInput.disabled = true;
+  wdInput.style.opacity = '0.6';
+  wdLock.innerHTML = '&#128274;';
+  wdLock.title = 'Unlock to edit';
+
   document.getElementById('se-status').textContent = '';
   openModal('session-edit-modal');
 }
+
+document.getElementById('se-workdir-lock').addEventListener('click', () => {
+  const wdInput = document.getElementById('se-workdir');
+  const wdLock = document.getElementById('se-workdir-lock');
+  const locked = wdInput.disabled;
+  wdInput.disabled = !locked;
+  wdInput.style.opacity = locked ? '1' : '0.6';
+  wdLock.innerHTML = locked ? '&#128275;' : '&#128274;';
+  wdLock.title = locked ? 'Lock to prevent edits' : 'Unlock to edit';
+  if (locked) wdInput.focus();
+});
 
 document.getElementById('se-save').addEventListener('click', async () => {
   const sessionId = document.getElementById('se-id').value;
@@ -692,14 +772,15 @@ document.getElementById('se-save').addEventListener('click', async () => {
   const rolePrompt = document.getElementById('se-role-prompt').value.trim();
   const model = document.getElementById('se-model').value;
 
-  const patchBody = { name, role, screenName, interests, channels, rolePrompt, model };
+  const remoteWorkdir = document.getElementById('se-workdir').value.trim();
+  const patchBody = { name, role, screenName, interests, channels, rolePrompt, model, remoteWorkdir };
   await apiFetch(`/api/sessions/${sessionId}`, {
     method: 'PATCH',
     body: JSON.stringify(patchBody),
   });
 
   if (sessions[sessionId]) {
-    Object.assign(sessions[sessionId], { name, role, screenName, interests, channels, rolePrompt, model });
+    Object.assign(sessions[sessionId], { name, role, screenName, interests, channels, rolePrompt, model, remoteWorkdir });
   }
 
   renderSidebar();
@@ -971,17 +1052,30 @@ document.getElementById('ns-create').addEventListener('click', async () => {
 
 // ── Running Jobs Modal ────────────────────────────────────────────────────────
 let jobsRefreshTimer = null;
+let jobsSourceFilter = 'all'; // 'all' | 'adhoc' | 'hub' | 'trigger' | 'self-trigger' | 'talking'
 
 document.getElementById('jobs-btn').addEventListener('click', () => {
   loadActiveJobs();
+  loadRecentJobs();
   openModal('jobs-modal');
   // Auto-refresh every 3s while modal is open
-  jobsRefreshTimer = setInterval(loadActiveJobs, 3000);
+  jobsRefreshTimer = setInterval(() => { loadActiveJobs(); loadRecentJobs(); }, 3000);
 });
 
 // Stop auto-refresh when modal closes
 document.querySelector('[data-close="jobs-modal"]').addEventListener('click', () => {
   if (jobsRefreshTimer) { clearInterval(jobsRefreshTimer); jobsRefreshTimer = null; }
+});
+
+// Tab click handler
+document.getElementById('jobs-tabs').addEventListener('click', (e) => {
+  const tab = e.target.closest('.jobs-tab');
+  if (!tab) return;
+  document.querySelectorAll('.jobs-tab').forEach(t => t.classList.remove('active'));
+  tab.classList.add('active');
+  jobsSourceFilter = tab.dataset.source;
+  loadActiveJobs();
+  loadRecentJobs();
 });
 
 function fmtElapsed(ms) {
@@ -991,18 +1085,26 @@ function fmtElapsed(ms) {
   return m + 'm ' + (s % 60) + 's';
 }
 
+function sourceBadge(source) {
+  const s = source || 'adhoc';
+  const labels = { adhoc: 'Ad-hoc', hub: 'Hub', trigger: 'Trigger', 'self-trigger': 'Self-trigger', talking: 'Talking' };
+  return `<span class="job-source-badge job-source-${s}">${labels[s] || s}</span>`;
+}
+
 async function loadActiveJobs() {
-  const jobs = await apiFetch('/api/jobs/active');
+  const allJobs = await apiFetch('/api/jobs/active');
   const el = document.getElementById('jobs-list');
-  if (!Array.isArray(jobs) || jobs.length === 0) {
+  if (!Array.isArray(allJobs)) { el.innerHTML = ''; return; }
+  updateJobsBadge(allJobs.length);
+  const jobs = jobsSourceFilter === 'all' ? allJobs : allJobs.filter(j => (j.source || 'adhoc') === jobsSourceFilter);
+  if (jobs.length === 0) {
     el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:20px">No running jobs</div>';
-    updateJobsBadge(0);
     return;
   }
-  updateJobsBadge(jobs.length);
   el.innerHTML = jobs.map(j => `
     <div class="job-card" data-session-id="${esc(j.sessionId)}" data-job-id="${esc(j.jobId)}">
       <div class="job-card-header">
+        ${sourceBadge(j.source)}
         <span class="job-session-name">${esc(j.sessionName)}</span>
         <span class="job-model">${j.model ? esc(j.model) : 'default'}</span>
         <span class="job-elapsed">${fmtElapsed(j.elapsedMs)}</span>
@@ -1039,6 +1141,62 @@ function updateJobsBadge(count) {
   } else {
     badge.style.display = 'none';
   }
+}
+
+/** Debounced badge refresh via API — called on every WS job event. */
+let _badgeRefreshTimer = null;
+function refreshJobsBadge() {
+  if (_badgeRefreshTimer) return; // already scheduled
+  _badgeRefreshTimer = setTimeout(async () => {
+    _badgeRefreshTimer = null;
+    try {
+      const jobs = await apiFetch('/api/jobs/active');
+      if (Array.isArray(jobs)) updateJobsBadge(jobs.length);
+    } catch {}
+  }, 300);
+}
+
+async function loadRecentJobs() {
+  const el = document.getElementById('jobs-recent-list');
+  if (!el) return;
+  try {
+    const allJobs = await apiFetch('/api/jobs/recent?limit=20');
+    if (!Array.isArray(allJobs) || allJobs.length === 0) {
+      el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:10px;font-size:12px">No recent jobs</div>';
+      return;
+    }
+    const jobs = jobsSourceFilter === 'all' ? allJobs : allJobs.filter(j => (j.source || 'adhoc') === jobsSourceFilter);
+    if (jobs.length === 0) {
+      el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:10px;font-size:12px">No recent jobs</div>';
+      return;
+    }
+    const statusColors = { done: 'var(--green)', failed: 'var(--yellow)', error: 'var(--red)' };
+    el.innerHTML = jobs.map(j => {
+      const color = statusColors[j.status] || 'var(--muted)';
+      const dur = j.durationMs != null ? fmtElapsed(j.durationMs) : '-';
+      const ago = fmtElapsed(Date.now() - new Date(j.finishedAt).getTime()) + ' ago';
+      const icon = j.status === 'done' ? '✓' : j.status === 'error' ? '✗' : '⚠';
+      return `
+      <div class="job-card job-card-recent" data-session-id="${esc(j.sessionId)}" data-job-id="${esc(j.jobId)}">
+        <div class="job-card-header">
+          <span style="color:${color};font-weight:bold;margin-right:4px">${icon}</span>
+          ${sourceBadge(j.source)}
+          <span class="job-session-name">${esc(j.sessionName)}</span>
+          <span class="job-model">${j.model ? esc(j.model) : ''}</span>
+          <span class="job-elapsed">${dur}</span>
+          <span class="job-chunks" title="${esc(j.finishedAt)}">${ago}</span>
+        </div>
+        <div class="job-prompt">${esc(j.prompt || '(no prompt)')}</div>
+        ${j.error ? `<div class="job-error">${esc(j.error)}</div>` : ''}
+        ${j.lastText ? `<div class="job-last-text">${esc(j.lastText)}</div>` : ''}
+      </div>`;
+    }).join('');
+    // Wire click to open detail
+    el.querySelectorAll('.job-card-recent').forEach(card => {
+      card.style.cursor = 'pointer';
+      card.addEventListener('click', () => openJobDetail(card.dataset.sessionId, card.dataset.jobId));
+    });
+  } catch { el.innerHTML = ''; }
 }
 
 async function openJobDetail(sessionId, jobId) {
@@ -1082,13 +1240,51 @@ async function openJobDetail(sessionId, jobId) {
   openModal('job-detail-modal');
 }
 
-// Periodically update the jobs badge (every 30s) even when modal is closed
+// Fallback badge poll (60s) in case WS events are missed; primary updates
+// are real-time via refreshJobsBadge() called from OUTPUT_DONE/ERROR/CHUNK.
 setInterval(async () => {
   try {
     const jobs = await apiFetch('/api/jobs/active');
     if (Array.isArray(jobs)) updateJobsBadge(jobs.length);
   } catch {}
-}, 30000);
+}, 60000);
+
+// ── Settings Modal ───────────────────────────────────────────────────────────
+document.getElementById('settings-btn').addEventListener('click', async () => {
+  try {
+    const settings = await apiFetch('/api/settings');
+    document.getElementById('set-compact-turns').value = settings.compactAfterTurns ?? 10;
+    document.getElementById('set-hub-concurrent').value = settings.hubMaxConcurrentJobs ?? 10;
+    document.getElementById('set-hub-cooldown').value = settings.hubCooldownMs ?? 10000;
+    document.getElementById('set-hub-talk-rounds').value = settings.hubMaxTalkRounds ?? 10;
+    document.getElementById('set-hub-chain-depth').value = settings.hubMaxChainDepth ?? 5;
+    document.getElementById('set-ssh-idle').value = settings.sshIdleTimeoutMs ?? 1800000;
+    document.getElementById('set-status').textContent = '';
+  } catch (e) {
+    document.getElementById('set-status').textContent = 'Failed to load settings';
+  }
+  openModal('settings-modal');
+});
+
+document.getElementById('set-save').addEventListener('click', async () => {
+  const body = {
+    compactAfterTurns: Number(document.getElementById('set-compact-turns').value),
+    hubMaxConcurrentJobs: Number(document.getElementById('set-hub-concurrent').value),
+    hubCooldownMs: Number(document.getElementById('set-hub-cooldown').value),
+    hubMaxTalkRounds: Number(document.getElementById('set-hub-talk-rounds').value),
+    hubMaxChainDepth: Number(document.getElementById('set-hub-chain-depth').value),
+    sshIdleTimeoutMs: Number(document.getElementById('set-ssh-idle').value),
+  };
+  try {
+    await apiFetch('/api/settings', { method: 'PATCH', body: JSON.stringify(body) });
+    document.getElementById('set-status').textContent = 'Saved';
+    document.getElementById('set-status').style.color = 'var(--green)';
+    setTimeout(() => closeModal('settings-modal'), 600);
+  } catch (e) {
+    document.getElementById('set-status').textContent = 'Save failed: ' + e;
+    document.getElementById('set-status').style.color = 'var(--red)';
+  }
+});
 
 // ── Hub ───────────────────────────────────────────────────────────────────────
 document.getElementById('hub-btn').addEventListener('click', () => {
@@ -1504,6 +1700,7 @@ async function openCompactionHistory(channelId) {
         <div class="compaction-row-header">
           <span class="compaction-id">${esc(c.id)}</span>
           <span class="compaction-meta">${new Date(c.createdAt).toLocaleString()} · by ${esc(c.createdBy)} · ${c.messageIds.length} msgs</span>
+          <button class="btn btn-sm compaction-redo-btn" data-compact-id="${esc(c.id)}" data-channel-id="${esc(c.channelId)}" title="Re-run the LLM summarizer for this compaction (e.g. after an API auth error)">Redo</button>
         </div>
         <details>
           <summary>Summary</summary>
@@ -1526,6 +1723,45 @@ async function openCompactionHistory(channelId) {
         </details>
       </div>
     `).join('');
+    // Attach redo button handlers
+    listEl.querySelectorAll('.compaction-redo-btn').forEach(btn => {
+      btn.addEventListener('click', async (e) => {
+        e.stopPropagation();
+        const compactId = btn.dataset.compactId;
+        const chId = btn.dataset.channelId;
+        const ok = confirm(
+          `Redo compaction ${compactId}?\n\n` +
+          `This will re-run the LLM summarizer on the ${btn.closest('.compaction-row').querySelector('.compaction-meta').textContent.match(/\d+ msgs/)?.[0] ?? 'archived'} messages ` +
+          `and replace the current summary.\n\nContinue?`
+        );
+        if (!ok) return;
+        btn.disabled = true;
+        btn.textContent = 'Redoing...';
+        try {
+          const result = await apiFetch(`/api/hub/channels/${chId}/compactions/${compactId}/redo`, {
+            method: 'POST',
+            body: JSON.stringify({}),
+          });
+          if (result && result.error) throw new Error(result.error);
+          btn.textContent = 'Done';
+          btn.style.background = 'var(--green)';
+          btn.style.color = '#000';
+          // Reload the history modal and channel messages
+          setTimeout(async () => {
+            await openCompactionHistory(chId);
+            if (chId === activeChannelId) {
+              delete hubMessages[activeChannelId];
+              await selectHubChannel(activeChannelId);
+            }
+          }, 500);
+        } catch (err) {
+          btn.textContent = 'Failed';
+          btn.style.background = 'var(--red)';
+          alert('Redo failed: ' + err.message);
+          setTimeout(() => { btn.textContent = 'Redo'; btn.style.background = ''; btn.disabled = false; }, 2000);
+        }
+      });
+    });
   }
   modal.style.display = 'flex';
 }

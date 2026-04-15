@@ -7,7 +7,10 @@ import { docStore } from './hub/docStore.js';
 import { createHttpServer } from './http/httpServer.js';
 import { createWsServer } from './ws/wsServer.js';
 import { pushManager } from './push/pushManager.js';
-import { drainGlobalQueue } from './hub/hubRouter.js';
+import { onAnyJobComplete } from './ssh/remoteSessionExecutor.js';
+import { processQueue, drainGlobalQueue, extractTextFromChunks, postHubMessage } from './hub/hubRouter.js';
+import { parseReplyToChannel, stripReplyToChannel, extractArtifactActions, parseReplyRouting, extractChannelReply } from './hub/channelArtifactExtractor.js';
+import { broadcastToDashboards } from './ws/dashboardBroadcast.js';
 
 sessionStore.load();
 machineStore.load();
@@ -15,6 +18,132 @@ hubStore.load();
 taskStore.load();
 docStore.load();
 pushManager.init();
+
+// After ANY job completes (ad-hoc or hub-dispatched), drain hub queues
+// AND check for channel reply markers in job output.
+// This fires AFTER activeExecutions.delete so the session is free and
+// processQueue/drainGlobalQueue can dispatch the next queued item.
+onAnyJobComplete((sessionId, jobId) => {
+  processQueue(sessionId);
+  drainGlobalQueue();
+
+  const session = sessionStore.get(sessionId);
+  if (!session) return;
+  const job = session.jobs.find(j => j.jobId === jobId);
+  if (!job) return;
+
+  // Hub/trigger/self-trigger/talking jobs are handled by onSessionJobComplete
+  // in hubRouter.ts. However, if that flow somehow fails to post a channel
+  // reply, we act as a safety net here. Ad-hoc jobs always go through this path.
+  const isHubJob = job.source && job.source !== 'adhoc';
+
+  const rawOutput = extractTextFromChunks(job.chunks ?? []);
+
+  // ── Strategy 1: Full [REPLY_TO_CHANNEL][#ch][%msg]...[/REPLY_TO_CHANNEL] in output
+  // (agent explicitly provided both routing and content in the output)
+  if (!isHubJob) {
+    const replyTarget = parseReplyToChannel(rawOutput);
+    if (replyTarget) {
+      const channel = hubStore.getChannel(replyTarget.channelId);
+      const parentMsg = hubStore.getMessage(replyTarget.messageId);
+      if (!channel) {
+        console.warn(`[banana] REPLY_TO_CHANNEL: channel "${replyTarget.channelId}" not found — skipped`);
+      } else {
+        const screenName = session.screenName ?? session.name ?? sessionId.slice(0, 8);
+        console.log(`[banana] REPLY_TO_CHANNEL from ad-hoc job → #${replyTarget.channelId} msg ${replyTarget.messageId.slice(0, 8)}`);
+        postHubMessage({
+          from: sessionId,
+          fromName: screenName,
+          content: replyTarget.content,
+          channelIds: [replyTarget.channelId],
+          tags: parentMsg?.tags ?? [],
+          mentions: [],
+          parentId: parentMsg ? replyTarget.messageId : undefined,
+          depth: parentMsg ? parentMsg.depth + 1 : 0,
+        });
+        return; // Done — don't also try strategy 2
+      }
+    }
+  }
+
+  // ── Strategy 2: [CHANNEL_REPLY] in output + routing from job prompt
+  // The agent used [CHANNEL_REPLY]...[/CHANNEL_REPLY] (content-only) and the
+  // routing metadata [REPLY_TO_CHANNEL][#ch][%msg] was in the job prompt.
+  // For hub-dispatched jobs, onSessionJobComplete handles this already, but
+  // this acts as a safety net. For ad-hoc jobs with prompt routing, this is
+  // the primary path.
+  const channelReply = extractChannelReply(rawOutput);
+  if (!channelReply) return;
+
+  // Extract routing from the job's prompt (where the system injected it)
+  let routing = parseReplyRouting(job.prompt ?? '');
+
+  // No routing in prompt — fall back to the session's channel subscriptions.
+  // This handles adhoc jobs where the agent learned [CHANNEL_REPLY] from a
+  // previous hub dispatch (via --resume conversation history) but the manual
+  // prompt has no routing header.
+  if (!routing && !isHubJob && session.channels?.length) {
+    const fallbackChannel = session.channels[0];
+    // Post as a new top-level message (no parent) — the adhoc job's output
+    // isn't necessarily related to any specific thread in the channel.
+    routing = {
+      channelId: fallbackChannel,
+      messageId: '',
+    };
+    console.log(`[banana] CHANNEL_REPLY: no routing in prompt — falling back to session channel #${fallbackChannel}`);
+  }
+
+  if (!routing) {
+    if (!isHubJob) {
+      console.warn(`[banana] [CHANNEL_REPLY] found in output but no routing and no session channels — cannot post`);
+    }
+    // For hub jobs, onSessionJobComplete should have already handled this
+    return;
+  }
+
+  // For hub jobs, check if a reply was already posted (onSessionJobComplete ran first)
+  // by looking for the job's dispatch status in the hub store. If already 'acted',
+  // onSessionJobComplete already posted the reply — skip to avoid duplicates.
+  if (isHubJob) {
+    // Find the hub message this job was dispatched from
+    const allMessages = hubStore.getByChannel(routing.channelId);
+    const alreadyPosted = allMessages.some(m =>
+      m.dispatches?.some(d => d.jobId === jobId && d.status === 'acted')
+    );
+    if (alreadyPosted) return; // onSessionJobComplete already handled it
+  }
+
+  const channel = hubStore.getChannel(routing.channelId);
+  const parentMsg = hubStore.getMessage(routing.messageId);
+  if (!channel) {
+    console.warn(`[banana] CHANNEL_REPLY: channel "${routing.channelId}" not found — skipped`);
+    return;
+  }
+
+  const screenName = session.screenName ?? session.name ?? sessionId.slice(0, 8);
+  console.log(`[banana] CHANNEL_REPLY (${isHubJob ? 'fallback' : 'adhoc'}) → #${routing.channelId} msg ${routing.messageId.slice(0, 8)}`);
+
+  // Run artifact extraction on the reply content (bJIRA/bCONF markers)
+  const actions = extractArtifactActions(channelReply);
+  // Apply any task/doc actions embedded in the reply
+  for (const f of actions.taskCreates) taskStore.createTask(routing.channelId, f, screenName);
+  for (const u of actions.taskUpdates) taskStore.updateTask(u.id, u, screenName);
+  for (const c of actions.taskComments) taskStore.addComment(c.id, c.text, screenName);
+  for (const w of actions.docWrites) docStore.createDoc(routing.channelId, w.title, w.body, screenName, w.tags ?? []);
+  for (const u of actions.docUpdates) docStore.updateDoc(u.id, { title: u.title, body: u.body, tags: u.tags }, screenName);
+  for (const a of actions.docAppends) docStore.appendDoc(a.id, a.text, screenName);
+
+  postHubMessage({
+    from: sessionId,
+    fromName: screenName,
+    content: actions.cleanedText || channelReply,
+    channelIds: [routing.channelId],
+    tags: parentMsg?.tags ?? [],
+    mentions: [],
+    parentId: parentMsg ? routing.messageId : undefined,
+    depth: parentMsg ? parentMsg.depth + 1 : 0,
+  });
+});
 
 const httpServer = createHttpServer();
 createWsServer(httpServer);

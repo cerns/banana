@@ -487,6 +487,19 @@ header h1 { font-size: 16px; color: var(--accent); }
   overflow: hidden;
   text-overflow: ellipsis;
 }
+.session-spinner {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  border: 1.5px solid var(--green);
+  border-top-color: transparent;
+  border-radius: 50%;
+  animation: session-spin 0.8s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes session-spin {
+  to { transform: rotate(360deg); }
+}
 .unread-dot {
   width: 8px;
   height: 8px;
@@ -640,6 +653,16 @@ header h1 { font-size: 16px; color: var(--accent); }
   align-items: center;
   gap: 10px;
   margin-bottom: 6px;
+}
+.compaction-redo-btn {
+  margin-left: auto;
+  background: var(--surface) !important;
+  color: var(--blue) !important;
+  border: 1px solid var(--border) !important;
+}
+.compaction-redo-btn:hover {
+  background: var(--blue) !important;
+  color: #000 !important;
 }
 .compaction-id {
   font-family: var(--font-mono);
@@ -1054,6 +1077,37 @@ header h1 { font-size: 16px; color: var(--accent); }
 }
 
 /* ── Running Jobs ──────────────────────────────────────────────────────────── */
+.jobs-tabs {
+  display: flex;
+  gap: 4px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+.jobs-tab {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  color: var(--muted);
+  padding: 3px 10px;
+  border-radius: 4px;
+  cursor: pointer;
+  font-size: 11px;
+  font-family: var(--font-mono);
+}
+.jobs-tab:hover { color: var(--text); border-color: var(--muted); }
+.jobs-tab.active { background: var(--accent); color: #000; border-color: var(--accent); }
+.job-source-badge {
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+.job-source-adhoc   { background: rgba(88,166,255,0.15); color: var(--blue); }
+.job-source-hub     { background: rgba(63,185,80,0.15); color: var(--green); }
+.job-source-trigger { background: rgba(247,201,72,0.15); color: var(--accent); }
+.job-source-self-trigger { background: rgba(248,81,73,0.15); color: var(--red); }
+.job-source-talking { background: rgba(188,143,243,0.15); color: #bc8ff3; }
 .job-card {
   background: var(--surface);
   border: 1px solid var(--border);
@@ -1113,6 +1167,19 @@ header h1 { font-size: 16px; color: var(--accent); }
 .job-card-actions {
   display: flex;
   gap: 6px;
+}
+.job-card-recent {
+  opacity: 0.8;
+  border-left-color: var(--muted);
+}
+.job-card-recent:hover { opacity: 1; }
+.job-error {
+  font-size: 11px;
+  color: var(--red);
+  margin-top: 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 
 /* ── Doc History ───────────────────────────────────────────────────────────── */

@@ -4,13 +4,15 @@ import type { IncomingMessage, ServerResponse } from 'http';
 
 // ── Mocks ────────────────────────────────────────────────────────────────────
 
+const mockConfig = {
+  token: 'test-token', persistPath: '', historyMax: 1000, machinesPersistPath: '',
+  hubPersistPath: '', hubMaxChainDepth: 5, hubMaxConcurrentJobs: 3, hubCooldownMs: 0,
+  tasksPersistPath: '', docsPersistPath: '',
+  taskContextMax: 8, docContextMax: 5, docRevisionMax: 20,
+  compactAfterTurns: 10, hubMaxTalkRounds: 10, sshIdleTimeoutMs: 1800000,
+};
 vi.mock('../../src/config.js', () => ({
-  config: {
-    token: 'test-token', persistPath: '', historyMax: 1000, machinesPersistPath: '',
-    hubPersistPath: '', hubMaxChainDepth: 5, hubMaxConcurrentJobs: 3, hubCooldownMs: 0,
-    tasksPersistPath: '', docsPersistPath: '',
-    taskContextMax: 8, docContextMax: 5, docRevisionMax: 20,
-  },
+  config: mockConfig,
 }));
 
 vi.mock('fs', async (importOriginal) => {
@@ -39,9 +41,11 @@ vi.mock('../../src/push/pushManager.js', () => ({
 
 const mockExecuteRemoteJob = vi.fn();
 const mockAbortRemoteJob = vi.fn().mockReturnValue(true);
+const mockGetActiveSessionIds = vi.fn().mockReturnValue([]);
 vi.mock('../../src/ssh/remoteSessionExecutor.js', () => ({
   executeRemoteJob: mockExecuteRemoteJob,
   abortRemoteJob: mockAbortRemoteJob,
+  getActiveSessionIds: mockGetActiveSessionIds,
 }));
 
 const mockTestSshConnection = vi.fn();
@@ -116,6 +120,7 @@ describe('apiRouter', () => {
     vi.doMock('../../src/ssh/remoteSessionExecutor.js', () => ({
       executeRemoteJob: mockExecuteRemoteJob,
       abortRemoteJob: mockAbortRemoteJob,
+      getActiveSessionIds: mockGetActiveSessionIds,
     }));
     vi.doMock('../../src/ssh/sshRunner.js', () => ({
       testSshConnection: mockTestSshConnection,
@@ -724,6 +729,177 @@ describe('apiRouter', () => {
     });
   });
 
+  // ── Jobs endpoints ─────────────────────────────────────────────────────
+
+  describe('Jobs endpoints', () => {
+    it('GET /api/jobs/active should return empty when no active sessions', async () => {
+      mockGetActiveSessionIds.mockReturnValue([]);
+      const req = createReq('GET', '/api/jobs/active');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(res._body).toEqual([]);
+    });
+
+    it('GET /api/jobs/active should return running jobs with session info', async () => {
+      // Setup a session with a running job
+      const session = sessionStore.sessionStore.get(
+        sessionStore.sessionStore.getAll().find(s => s.type === 'remote')?.sessionId ?? '',
+      );
+      if (!session) {
+        // Create a remote session for this test
+        const { machineStore: ms } = await import('../../src/machines/machineStore.js');
+        ms.upsert({
+          id: 'jm-1', name: 'job-machine', alias: 'jm', ip: '10.0.0.1',
+          port: 22, username: 'user', createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+        });
+        const s: import('../../src/sessions/sessionStore.js').SessionRecord = {
+          sessionId: 'job-sess-1', clientId: '', hostname: 'test', workdir: '',
+          connectedAt: new Date().toISOString(), status: 'connected',
+          jobs: [{
+            jobId: 'running-job-1', prompt: 'analyze codebase',
+            startedAt: new Date().toISOString(), chunks: [
+              { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'analyzing...' } } },
+            ],
+          }],
+          type: 'remote', name: 'dev-agent', machineId: 'jm-1', model: 'opus',
+        };
+        sessionStore.sessionStore.upsert(s);
+        mockGetActiveSessionIds.mockReturnValue(['job-sess-1']);
+      }
+
+      const req = createReq('GET', '/api/jobs/active');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(res._body).toHaveLength(1);
+      expect(res._body[0]).toMatchObject({
+        sessionId: 'job-sess-1',
+        sessionName: 'dev-agent',
+        model: 'opus',
+        jobId: 'running-job-1',
+        status: 'running',
+        source: 'adhoc',
+        chunkCount: 1,
+      });
+      expect(res._body[0].prompt).toContain('analyze');
+    });
+
+    it('GET /api/jobs/recent should return empty when no finished jobs', async () => {
+      const req = createReq('GET', '/api/jobs/recent');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(res._body).toEqual([]);
+    });
+
+    it('GET /api/jobs/recent should return completed jobs sorted by finishedAt desc', async () => {
+      // Create session with 3 finished jobs
+      const s: import('../../src/sessions/sessionStore.js').SessionRecord = {
+        sessionId: 'recent-sess', clientId: '', hostname: 'test', workdir: '',
+        connectedAt: new Date().toISOString(), status: 'connected',
+        jobs: [
+          {
+            jobId: 'old-job', prompt: 'first task', startedAt: '2026-04-13T10:00:00Z',
+            finishedAt: '2026-04-13T10:01:00Z', exitCode: 0, durationMs: 60000, chunks: [],
+          },
+          {
+            jobId: 'mid-job', prompt: 'second task', startedAt: '2026-04-13T10:05:00Z',
+            finishedAt: '2026-04-13T10:06:00Z', exitCode: 1, durationMs: 60000, chunks: [],
+          },
+          {
+            jobId: 'new-job', prompt: 'third task', startedAt: '2026-04-13T10:10:00Z',
+            finishedAt: '2026-04-13T10:11:00Z', exitCode: 0, durationMs: 60000, chunks: [],
+          },
+          {
+            jobId: 'still-running', prompt: 'current', startedAt: '2026-04-13T10:15:00Z',
+            chunks: [],
+          },
+        ],
+        type: 'remote', name: 'qa-bob', machineId: 'jm-1',
+      };
+      sessionStore.sessionStore.upsert(s);
+
+      const req = createReq('GET', '/api/jobs/recent');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      // Only 3 finished jobs (not the still-running one)
+      expect(res._body).toHaveLength(3);
+      // Sorted newest first
+      expect(res._body[0].jobId).toBe('new-job');
+      expect(res._body[1].jobId).toBe('mid-job');
+      expect(res._body[2].jobId).toBe('old-job');
+      // Status derived correctly
+      expect(res._body[0].status).toBe('done');
+      expect(res._body[1].status).toBe('failed');
+    });
+
+    it('GET /api/jobs/recent should respect limit param', async () => {
+      const req = createReq('GET', '/api/jobs/recent?limit=1');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(res._body.length).toBeLessThanOrEqual(1);
+    });
+
+    it('GET /api/jobs/recent should show error status for errored jobs', async () => {
+      const s: import('../../src/sessions/sessionStore.js').SessionRecord = {
+        sessionId: 'err-sess', clientId: '', hostname: 'test', workdir: '',
+        connectedAt: new Date().toISOString(), status: 'connected',
+        jobs: [{
+          jobId: 'err-job', prompt: 'will fail', startedAt: '2026-04-13T10:00:00Z',
+          finishedAt: '2026-04-13T10:00:05Z', error: 'SSH connection refused', chunks: [],
+        }],
+        type: 'remote', name: 'broken-agent', machineId: 'jm-1',
+      };
+      sessionStore.sessionStore.upsert(s);
+
+      const req = createReq('GET', '/api/jobs/recent');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      const errJob = res._body.find((j: any) => j.jobId === 'err-job');
+      expect(errJob).toBeDefined();
+      expect(errJob.status).toBe('error');
+      expect(errJob.error).toBe('SSH connection refused');
+    });
+
+    it('GET /api/jobs/recent should include source field', async () => {
+      const s: import('../../src/sessions/sessionStore.js').SessionRecord = {
+        sessionId: 'source-sess', clientId: '', hostname: 'test', workdir: '',
+        connectedAt: new Date().toISOString(), status: 'connected',
+        jobs: [
+          {
+            jobId: 'hub-job', prompt: '[HUB #proj]', startedAt: '2026-04-13T11:00:00Z',
+            finishedAt: '2026-04-13T11:01:00Z', exitCode: 0, durationMs: 60000, chunks: [],
+            source: 'hub' as const,
+          },
+          {
+            jobId: 'trigger-job', prompt: 'triggered', startedAt: '2026-04-13T11:02:00Z',
+            finishedAt: '2026-04-13T11:03:00Z', exitCode: 0, durationMs: 60000, chunks: [],
+            source: 'trigger' as const,
+          },
+          {
+            jobId: 'adhoc-job', prompt: 'hello', startedAt: '2026-04-13T11:04:00Z',
+            finishedAt: '2026-04-13T11:05:00Z', exitCode: 0, durationMs: 60000, chunks: [],
+          },
+        ],
+        type: 'remote', name: 'source-test', machineId: 'jm-1',
+      };
+      sessionStore.sessionStore.upsert(s);
+
+      const req = createReq('GET', '/api/jobs/recent');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      const hubJob = res._body.find((j: any) => j.jobId === 'hub-job');
+      const triggerJob = res._body.find((j: any) => j.jobId === 'trigger-job');
+      const adhocJob = res._body.find((j: any) => j.jobId === 'adhoc-job');
+      expect(hubJob.source).toBe('hub');
+      expect(triggerJob.source).toBe('trigger');
+      expect(adhocJob.source).toBe('adhoc'); // defaults to adhoc when undefined
+    });
+  });
+
   // ── Hub endpoints ──────────────────────────────────────────────────────
 
   describe('Hub endpoints', () => {
@@ -1199,6 +1375,48 @@ describe('apiRouter', () => {
       const res = createRes();
       await handleApiRequest(req, res);
       expect(res._status).toBe(400);
+    });
+  });
+
+  describe('settings', () => {
+    it('GET /api/settings should return current settings', async () => {
+      const req = createReq('GET', '/api/settings');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(res._body.compactAfterTurns).toBe(10);
+      expect(res._body.hubMaxConcurrentJobs).toBe(3);
+      expect(res._body.hubCooldownMs).toBe(0);
+      expect(res._body.hubMaxTalkRounds).toBe(10);
+      expect(res._body.hubMaxChainDepth).toBe(5);
+      expect(res._body.sshIdleTimeoutMs).toBe(1800000);
+    });
+
+    it('PATCH /api/settings should update settings', async () => {
+      const req = createReq('PATCH', '/api/settings', { compactAfterTurns: 20 });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(res._body.compactAfterTurns).toBe(20);
+      expect(mockConfig.compactAfterTurns).toBe(20);
+      // restore
+      mockConfig.compactAfterTurns = 10;
+    });
+
+    it('PATCH /api/settings should ignore invalid values', async () => {
+      const original = mockConfig.compactAfterTurns;
+      const req = createReq('PATCH', '/api/settings', { compactAfterTurns: -5 });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(mockConfig.compactAfterTurns).toBe(original);
+    });
+
+    it('PATCH /api/settings should ignore unknown keys', async () => {
+      const req = createReq('PATCH', '/api/settings', { unknownKey: 999 });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
     });
   });
 });

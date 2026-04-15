@@ -8,7 +8,7 @@ import { taskStore } from '../hub/taskStore.js';
 import type { TaskStatus, TaskPriority, UpdateTaskFields } from '../hub/taskStore.js';
 import { docStore } from '../hub/docStore.js';
 import type { UpdateDocFields } from '../hub/docStore.js';
-import { postHubMessage, resolveScreenName, triggerSessionOnMessage, compactChannel } from '../hub/hubRouter.js';
+import { postHubMessage, resolveScreenName, triggerSessionOnMessage, compactChannel, redoCompaction } from '../hub/hubRouter.js';
 import { broadcastToDashboards } from '../ws/dashboardBroadcast.js';
 import { pushManager } from '../push/pushManager.js';
 import type webpush from 'web-push';
@@ -108,9 +108,52 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
         elapsedMs,
         chunkCount,
         lastText: lastText.slice(-200),
+        status: 'running' as const,
+        source: runningJob.source || 'adhoc',
       };
     }).filter(Boolean);
     json(res, 200, jobs);
+    return true;
+  }
+
+  // GET /api/jobs/recent — recently completed jobs (last N across all sessions)
+  if (method === 'GET' && pathname === '/api/jobs/recent') {
+    const limitParam = url.searchParams.get('limit');
+    const limit = Math.min(Math.max(parseInt(limitParam ?? '20', 10) || 20, 1), 100);
+    const allSessions = sessionStore.getAll();
+    const recentJobs: Array<Record<string, unknown>> = [];
+
+    for (const session of allSessions) {
+      for (const job of session.jobs) {
+        if (!job.finishedAt) continue;
+        const lastChunks = (job.chunks || []).slice(-3);
+        const lastText = lastChunks
+          .filter((c: any) => c?.type === 'stream_event' && c?.event?.type === 'content_block_delta')
+          .map((c: any) => c?.event?.delta?.text ?? '')
+          .join('');
+        recentJobs.push({
+          sessionId: session.sessionId,
+          sessionName: session.name || session.hostname,
+          machineId: session.machineId,
+          model: session.model,
+          jobId: job.jobId,
+          prompt: job.prompt?.slice(0, 200),
+          startedAt: job.startedAt,
+          finishedAt: job.finishedAt,
+          durationMs: job.durationMs,
+          exitCode: job.exitCode,
+          error: job.error,
+          chunkCount: job.chunks?.length ?? 0,
+          lastText: lastText.slice(-200),
+          status: job.error ? 'error' : (job.exitCode === 0 ? 'done' : 'failed'),
+          source: job.source || 'adhoc',
+        });
+      }
+    }
+
+    // Sort by finishedAt desc, take top N
+    recentJobs.sort((a, b) => String(b.finishedAt).localeCompare(String(a.finishedAt)));
+    json(res, 200, recentJobs.slice(0, limit));
     return true;
   }
 
@@ -401,7 +444,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       return true;
     }
 
-    const job = createJob(sessionId, body.prompt);
+    const job = createJob(sessionId, body.prompt, 'adhoc');
 
     const { executeRemoteJob } = await import('../ssh/remoteSessionExecutor.js');
     executeRemoteJob(sessionId, job.jobId, body.prompt, body.model);
@@ -462,6 +505,21 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
   if (hubCompactionsMatch && method === 'GET') {
     const channelId = hubCompactionsMatch[1];
     json(res, 200, hubStore.getCompactions(channelId));
+    return true;
+  }
+
+  // POST /api/hub/channels/:id/compactions/:cid/redo — re-run summarizer on an existing compaction
+  const hubRedoMatch = pathname.match(/^\/api\/hub\/channels\/([^/]+)\/compactions\/([^/]+)\/redo$/);
+  if (hubRedoMatch && method === 'POST') {
+    const channelId = hubRedoMatch[1];
+    const compactionId = hubRedoMatch[2];
+    const body = await readBody(req) as { machineId?: string };
+    try {
+      const result = await redoCompaction(channelId, compactionId, body.machineId);
+      json(res, 200, result);
+    } catch (e) {
+      json(res, 400, { error: (e as Error).message });
+    }
     return true;
   }
 
@@ -695,6 +753,43 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       json(res, 200, { ok: true, archived: true });
       return true;
     }
+  }
+
+  // ── Settings endpoints ──────────────────────────────────────────────────
+
+  // GET /api/settings — read mutable runtime settings
+  if (method === 'GET' && pathname === '/api/settings') {
+    json(res, 200, {
+      compactAfterTurns: config.compactAfterTurns,
+      hubMaxConcurrentJobs: config.hubMaxConcurrentJobs,
+      hubCooldownMs: config.hubCooldownMs,
+      hubMaxTalkRounds: config.hubMaxTalkRounds,
+      hubMaxChainDepth: config.hubMaxChainDepth,
+      sshIdleTimeoutMs: config.sshIdleTimeoutMs,
+    });
+    return true;
+  }
+
+  // PATCH /api/settings — update mutable runtime settings
+  if (method === 'PATCH' && pathname === '/api/settings') {
+    const body = await readBody(req) as Record<string, unknown>;
+    const allowed = ['compactAfterTurns', 'hubMaxConcurrentJobs', 'hubCooldownMs', 'hubMaxTalkRounds', 'hubMaxChainDepth', 'sshIdleTimeoutMs'] as const;
+    for (const key of allowed) {
+      if (body[key] !== undefined) {
+        const val = Number(body[key]);
+        if (!Number.isFinite(val) || val < 0) continue;
+        (config as any)[key] = Math.round(val);
+      }
+    }
+    json(res, 200, {
+      compactAfterTurns: config.compactAfterTurns,
+      hubMaxConcurrentJobs: config.hubMaxConcurrentJobs,
+      hubCooldownMs: config.hubCooldownMs,
+      hubMaxTalkRounds: config.hubMaxTalkRounds,
+      hubMaxChainDepth: config.hubMaxChainDepth,
+      sshIdleTimeoutMs: config.sshIdleTimeoutMs,
+    });
+    return true;
   }
 
   // ── Push endpoints ────────────────────────────────────────────────────────

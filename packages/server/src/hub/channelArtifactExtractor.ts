@@ -1,5 +1,11 @@
 import type { TaskStatus, TaskPriority } from './taskStore.js';
 
+export interface ChannelReplyTarget {
+  channelId: string;
+  messageId: string;
+  content: string;
+}
+
 export interface ArtifactActions {
   taskCreates: Array<{
     title: string;
@@ -22,6 +28,8 @@ export interface ArtifactActions {
   docUpdates: Array<{ id: string; title?: string; body?: string; tags?: string[] }>;
   docAppends: Array<{ id: string; text: string }>;
   docDeletes: Array<{ id: string }>;
+  /** Explicit channel reply extracted from [CHANNEL_REPLY] marker (if present). */
+  channelReply?: string;
   /** Reply with all recognized markers stripped — used as the chat post body. */
   cleanedText: string;
 }
@@ -231,6 +239,71 @@ export function extractArtifactActions(reply: string): ArtifactActions {
     return '';
   });
 
+  // ── [CHANNEL_REPLY] marker ─────────────────────────────────────────
+  // Agents wrap their intended channel reply in [CHANNEL_REPLY]...[/CHANNEL_REPLY].
+  // Only the content inside is posted to the channel. Everything outside stays
+  // in the session only (narration, tool output, debugging). If the marker is
+  // absent, all text is used (existing behavior).
+  const channelReplyRe = /\[CHANNEL_REPLY\]([\s\S]*?)\[\/CHANNEL_REPLY\]/gi;
+  const channelReplyParts: string[] = [];
+  actions.cleanedText = actions.cleanedText.replace(channelReplyRe, (_full, body: string) => {
+    channelReplyParts.push(body.trim());
+    return '';
+  });
+  if (channelReplyParts.length > 0) {
+    actions.channelReply = channelReplyParts.join('\n\n');
+  }
+
   actions.cleanedText = actions.cleanedText.replace(/\n{3,}/g, '\n\n').trim();
   return actions;
+}
+
+/**
+ * Parse [REPLY_TO_CHANNEL][#channelId][%messageId] markers from raw output.
+ * Enables ad-hoc sessions to explicitly post replies to a channel.
+ * Returns the first match found (agents should only use one per reply).
+ */
+export function parseReplyToChannel(text: string): ChannelReplyTarget | null {
+  // [REPLY_TO_CHANNEL][#channelId][%messageId]
+  // content
+  // [/REPLY_TO_CHANNEL]
+  const blockRe = /\[REPLY_TO_CHANNEL\]\[#([^\]]+)\]\[%([^\]]+)\]\s*([\s\S]*?)\[\/REPLY_TO_CHANNEL\]/i;
+  const m = text.match(blockRe);
+  if (m) {
+    return { channelId: m[1].trim(), messageId: m[2].trim(), content: m[3].trim() };
+  }
+  return null;
+}
+
+/** Strip [REPLY_TO_CHANNEL]...[/REPLY_TO_CHANNEL] blocks from text. */
+export function stripReplyToChannel(text: string): string {
+  return text.replace(/\[REPLY_TO_CHANNEL\]\[#[^\]]+\]\[%[^\]]+\]\s*[\s\S]*?\[\/REPLY_TO_CHANNEL\]/gi, '')
+    .replace(/\n{3,}/g, '\n\n').trim();
+}
+
+/**
+ * Extract routing metadata [REPLY_TO_CHANNEL][#channelId][%messageId] from text.
+ * Unlike parseReplyToChannel, this only extracts the routing header — it does NOT
+ * require a closing tag or content block.  Used to recover channel/message routing
+ * from a job's PROMPT when the agent's OUTPUT uses [CHANNEL_REPLY] (content-only).
+ */
+export function parseReplyRouting(text: string): { channelId: string; messageId: string } | null {
+  const m = text.match(/\[REPLY_TO_CHANNEL\]\[#([^\]]+)\]\[%([^\]]+)\]/i);
+  if (!m) return null;
+  return { channelId: m[1].trim(), messageId: m[2].trim() };
+}
+
+/**
+ * Extract [CHANNEL_REPLY]...[/CHANNEL_REPLY] content from text.
+ * Returns the joined content of all [CHANNEL_REPLY] blocks, or null if none found.
+ */
+export function extractChannelReply(text: string): string | null {
+  const re = /\[CHANNEL_REPLY\]([\s\S]*?)\[\/CHANNEL_REPLY\]/gi;
+  const parts: string[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    const body = m[1].trim();
+    if (body) parts.push(body);
+  }
+  return parts.length > 0 ? parts.join('\n\n') : null;
 }

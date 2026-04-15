@@ -101,6 +101,20 @@ describe('config', () => {
     expect(config.promptCompressEnabled).toBe(true);
   });
 
+  it('should default compactAfterTurns=10', async () => {
+    process.env.BANANA_TOKEN = 'test';
+    delete process.env.BANANA_COMPACT_AFTER_TURNS;
+    const { config } = await import('../src/config.js');
+    expect(config.compactAfterTurns).toBe(10);
+  });
+
+  it('should load compactAfterTurns from env', async () => {
+    process.env.BANANA_TOKEN = 'test';
+    process.env.BANANA_COMPACT_AFTER_TURNS = '20';
+    const { config } = await import('../src/config.js');
+    expect(config.compactAfterTurns).toBe(20);
+  });
+
   it('should disable promptCompressEnabled when BANANA_PROMPT_COMPRESS=0', async () => {
     process.env.BANANA_TOKEN = 'test';
     process.env.BANANA_PROMPT_COMPRESS = '0';

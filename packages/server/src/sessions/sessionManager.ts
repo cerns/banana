@@ -1,7 +1,7 @@
 import { randomUUID } from 'crypto';
-import { sessionStore, type SessionRecord, type JobRecord } from './sessionStore.js';
+import { sessionStore, type SessionRecord, type JobRecord, type JobSource } from './sessionStore.js';
 
-export function createJob(sessionId: string, prompt: string): JobRecord {
+export function createJob(sessionId: string, prompt: string, source?: JobSource): JobRecord {
   const session = sessionStore.get(sessionId);
   if (!session) throw new Error(`Session ${sessionId} not found`);
 
@@ -10,6 +10,7 @@ export function createJob(sessionId: string, prompt: string): JobRecord {
     prompt,
     startedAt: new Date().toISOString(),
     chunks: [],
+    source,
   };
   session.jobs.push(job);
   sessionStore.upsert(session);

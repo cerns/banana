@@ -242,6 +242,26 @@ class HubStore {
     return this.channels.get(channelId)?.compactions ?? [];
   }
 
+  getCompaction(channelId: string, compactionId: string): ChannelCompaction | undefined {
+    return this.channels.get(channelId)?.compactions?.find(c => c.id === compactionId);
+  }
+
+  updateCompactionSummary(channelId: string, compactionId: string, summary: string): boolean {
+    const compaction = this.getCompaction(channelId, compactionId);
+    if (!compaction) return false;
+    compaction.summary = summary;
+    this.persist();
+    return true;
+  }
+
+  updateMessageContent(messageId: string, content: string): boolean {
+    const msg = this.messages.get(messageId);
+    if (!msg) return false;
+    msg.content = content;
+    this.persist();
+    return true;
+  }
+
   // ── Persistence ───────────────────────────────────────────────────────────
 
   load(): void {

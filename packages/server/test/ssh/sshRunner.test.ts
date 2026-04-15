@@ -52,11 +52,24 @@ function createMockStream() {
   return stream;
 }
 
+function createMockSftp() {
+  const sftp = {
+    end: vi.fn(),
+    createWriteStream: vi.fn((_path: string, _opts?: any) => {
+      const ws = new EventEmitter() as any;
+      ws.end = vi.fn((_data?: any, cb?: Function) => { if (cb) cb(); });
+      return ws;
+    }),
+  };
+  return sftp;
+}
+
 function createMockClient() {
   const client = new EventEmitter() as any;
   client.exec = vi.fn();
   client.end = vi.fn();
   client.connect = vi.fn();
+  client.sftp = vi.fn((cb: Function) => { cb(null, createMockSftp()); });
   return client;
 }
 
@@ -448,10 +461,9 @@ describe('sshRunner', () => {
       consoleSpy.mockRestore();
     });
 
-    it('should pipe large prompts via stdin instead of argv', async () => {
+    it('should write prompt via SFTP temp file instead of embedding in command', async () => {
       const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const machine = makeMachine();
-      // 32KB prompt — well over the 16KB stdin threshold
       const bigPrompt = 'x'.repeat(32 * 1024);
       const promise = sshRunner.runClaudeOverSsh(machine, bigPrompt, '/work', () => {});
 
@@ -467,34 +479,42 @@ describe('sshRunner', () => {
 
       const result = await promise;
       expect(result.exitCode).toBe(0);
-      // The huge prompt is NOT embedded in the command
+      // The raw prompt is NOT embedded in the command
       expect(cmd).not.toContain('xxxxxxxxxxxxxxxx');
-      // The full prompt was written to stdin and the stream was ended
-      const total = stream.stdin.writes.join('');
-      expect(total.length).toBe(bigPrompt.length);
-      expect(stream.stdin.ended).toBe(true);
+      // Command uses stdin redirect from SFTP temp file
+      expect(cmd).toContain('/tmp/banana-prompt-');
+      expect(cmd).toMatch(/< '\/tmp\/banana-prompt-/);
+      // Cleanup rm -f at the end
+      expect(cmd).toContain('rm -f');
+      // SFTP was used to write the prompt
+      expect(mockClientInstance.sftp).toHaveBeenCalled();
+      // Always uses PTY (no stdin piping)
+      expect(stream.stdin.writes.length).toBe(0);
       consoleSpy.mockRestore();
     });
 
-    it('should reject when stdin write errors (EPIPE)', async () => {
+    it('should deliver prompt via SFTP — no shell injection possible', async () => {
       const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const machine = makeMachine();
-      const bigPrompt = 'y'.repeat(32 * 1024);
-      const promise = sshRunner.runClaudeOverSsh(machine, bigPrompt, '/work', () => {});
+      const prompt = "it's a test; rm -rf /";
+      const promise = sshRunner.runClaudeOverSsh(machine, prompt, '/work', () => {});
 
+      let cmd = '';
       const stream = createMockStream();
-      // First write callback reports EPIPE
-      stream.stdin.write = vi.fn((_data: string, cb?: (err?: Error | null) => void) => {
-        if (cb) cb(new Error('write EPIPE'));
-        return true;
-      });
-      mockClientInstance.exec.mockImplementation((_c: string, _opts: any, cb: Function) => {
+      mockClientInstance.exec.mockImplementation((c: string, _opts: any, cb: Function) => {
+        cmd = c;
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
       await flush();
+      stream.emit('close', 0);
 
-      await expect(promise).rejects.toThrow('write EPIPE');
+      await promise;
+      // The dangerous raw characters must NOT appear in the command
+      expect(cmd).not.toContain("it's a test; rm -rf /");
+      // Prompt was written via SFTP, not embedded in the command
+      expect(mockClientInstance.sftp).toHaveBeenCalled();
+      expect(cmd).toMatch(/< '\/tmp\/banana-prompt-/);
       consoleSpy.mockRestore();
     });
 
@@ -586,10 +606,10 @@ describe('sshRunner', () => {
       consoleSpy.mockRestore();
     });
 
-    it('should shell-escape prompt with special characters', async () => {
+    it('should handle prompts with quotes, backticks, and dollar signs via SFTP', async () => {
       const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
       const machine = makeMachine();
-      const prompt = "it's a test; rm -rf /";
+      const prompt = `He said "hello" and it's $HOME \`cmd\` done`;
       const promise = sshRunner.runClaudeOverSsh(machine, prompt, '/work', () => {});
 
       let cmd = '';
@@ -603,11 +623,14 @@ describe('sshRunner', () => {
       stream.emit('close', 0);
 
       await promise;
-      // The single quote in "it's" should be escaped using the '"'"' pattern
-      expect(cmd).toContain("'\"'\"'");
-      // The dangerous characters should be inside single quotes (safe)
-      // Verify the full escaped prompt pattern: 'it'"'"'s a test; rm -rf /'
-      expect(cmd).toMatch(/'it'"'"'s a test; rm -rf \/'/);
+      // Raw dangerous characters from the PROMPT must not appear in the command
+      expect(cmd).not.toContain('`cmd`');
+      expect(cmd).not.toContain(`He said "hello"`);
+      expect(cmd).not.toContain("it's");
+      // Prompt was delivered via SFTP, command just redirects from temp file
+      expect(mockClientInstance.sftp).toHaveBeenCalled();
+      expect(cmd).toMatch(/< '\/tmp\/banana-prompt-/);
+      expect(cmd).toContain('rm -f');
       consoleSpy.mockRestore();
     });
 

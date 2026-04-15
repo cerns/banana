@@ -463,6 +463,15 @@ BEFORE the [BEGIN_WORK] marker:
 If you cannot produce a real Plan with concrete steps and acceptance criteria,
 DO NOT include [BEGIN_WORK]. Just discuss in chat instead. The marker is a
 commitment to do real, verifiable work — not vibes.
+
+────────────────────────────────────────
+CHANNEL REPLY FORMAT: [CHANNEL_REPLY]
+────────────────────────────────────────
+When posting results back to the channel (especially after action mode work),
+wrap the message you want posted in [CHANNEL_REPLY]...[/CHANNEL_REPLY].
+Only text inside this marker will appear in the channel; everything outside
+(tool use narration, debugging output, internal reasoning) stays in your session only.
+If you omit the marker, your ENTIRE text output is posted (which may be very noisy).
 `;
 
 function buildGuidance(engagement: EngagementLevel): string {
@@ -492,6 +501,13 @@ function buildGuidance(engagement: EngagementLevel): string {
         '  - What files you changed (paths)',
         '  - What commands you ran and their results',
         '  - What\'s done, what remains, and any blockers',
+        '',
+        '## CHANNEL REPLY',
+        'Your final text output will be posted back to the channel as a reply.',
+        'Wrap the message you want posted in [CHANNEL_REPLY]...[/CHANNEL_REPLY].',
+        'Only text inside this marker will appear in the channel; everything outside',
+        '(tool use narration, debugging output) stays in your session only.',
+        'If you omit the marker, your ENTIRE text output is posted (which may be noisy).',
         '',
         'If the task is genuinely outside your role or impossible, briefly explain why instead of pretending to act.',
         'Do NOT respond with [SKIP]. Do NOT ask the user clarifying questions — make reasonable assumptions and proceed.',
@@ -624,6 +640,9 @@ function dispatchToSession(
       ? `[YOU WERE TRIGGERED TO ACT ON THIS MESSAGE in ${channelName} from ${hubMessage.fromName}]`
       : `[HUB ${channelName} from ${hubMessage.fromName}]`;
 
+  // Tell the agent where its reply will be posted (explicit routing metadata)
+  const replyToLine = `[REPLY_TO_CHANNEL][#${hubMessage.channelId}][%${hubMessage.id}]`;
+
   const rawPrompt = [
     roleLine,
     rolePromptLine,
@@ -631,14 +650,18 @@ function dispatchToSession(
     sourceHeader,
     hubMessage.content,
     '',
+    replyToLine,
     '---',
     guidance,
   ].filter(Boolean).join('\n');
 
   const prompt = compressForDispatch(rawPrompt, `dispatch ${session.sessionId.slice(0, 8)}`);
 
-  // Create job
-  const job = createJob(session.sessionId, prompt);
+  // Create job with source tag for the jobs modal
+  const jobSource = isSelfTrigger ? 'self-trigger' as const
+    : engagement === 'triggered' ? 'trigger' as const
+    : 'hub' as const;
+  const job = createJob(session.sessionId, prompt, jobSource);
 
   // Update dispatch
   hubStore.addDispatch(hubMessage.id, {
@@ -667,14 +690,16 @@ function onSessionJobComplete(
   engagement: EngagementLevel,
 ): void {
   runningHubJobs = Math.max(0, runningHubJobs - 1);
+  console.log(`[hub] onSessionJobComplete fired: session=${sessionId.slice(0, 8)} job=${jobId.slice(0, 8)} engagement=${engagement} hubMsg=${hubMessage.id.slice(0, 8)} depth=${hubMessage.depth}`);
 
   const session = sessionStore.get(sessionId);
-  if (!session) return;
+  if (!session) { console.warn(`[hub] onSessionJobComplete: session ${sessionId.slice(0, 8)} not found — aborting`); return; }
 
   // Extract text from job chunks
   const storedSession = sessionStore.get(sessionId);
   const job = storedSession?.jobs.find(j => j.jobId === jobId);
   const rawOutput = extractTextFromChunks(job?.chunks ?? []);
+  console.log(`[hub] onSessionJobComplete: rawOutput ${rawOutput.length} chars, chunks=${job?.chunks?.length ?? 0}`);
 
   // SKIP detection — structured `[SKIP][#REASON]` or legacy bare "SKIP".
   // Skipped responses ARE posted to the channel (so humans see who skipped
@@ -707,39 +732,43 @@ function onSessionJobComplete(
       });
     }
   } else {
-    hubStore.updateDispatch(hubMessage.id, sessionId, {
-      status: 'acted',
-      finishedAt: new Date().toISOString(),
-    });
-    broadcastDispatchUpdate(hubMessage.id);
+    // Detect markers BEFORE stripping them
+    const wantsSelfTrigger = detectSelfTrigger(rawOutput) && engagement !== 'triggered';
+    // Talking continuation is only valid in chat mode (not while triggered)
+    // and never together with [BEGIN_WORK] — self-trigger takes precedence.
+    const wantsTalking = !wantsSelfTrigger
+      && engagement !== 'triggered'
+      && detectTalkingMarker(rawOutput);
 
-    // Chain depth check before posting result back
-    if (hubMessage.depth < config.hubMaxChainDepth) {
-      // Detect markers BEFORE stripping them
-      const wantsSelfTrigger = detectSelfTrigger(rawOutput) && engagement !== 'triggered';
-      // Talking continuation is only valid in chat mode (not while triggered)
-      // and never together with [BEGIN_WORK] — self-trigger takes precedence.
-      const wantsTalking = !wantsSelfTrigger
-        && engagement !== 'triggered'
-        && detectTalkingMarker(rawOutput);
+    // Strip self-trigger AND talking markers from displayed content
+    const stripped = stripTalkingMarkers(stripSelfTriggerMarkers(rawOutput));
 
-      // Strip self-trigger AND talking markers from displayed content
-      const stripped = stripTalkingMarkers(stripSelfTriggerMarkers(rawOutput));
+    // Extract task/doc artifact actions from the reply (and strip those markers too)
+    const screenName = session.screenName ?? session.name ?? sessionId.slice(0, 8);
+    const actions = extractArtifactActions(stripped);
+    applyArtifactActions(actions, hubMessage.channelId, screenName);
 
-      // Extract task/doc artifact actions from the reply (and strip those markers too)
-      const screenName = session.screenName ?? session.name ?? sessionId.slice(0, 8);
-      const actions = extractArtifactActions(stripped);
-      applyArtifactActions(actions, hubMessage.channelId, screenName);
+    // If the agent wrapped its reply in [CHANNEL_REPLY]...[/CHANNEL_REPLY],
+    // use ONLY that content for the channel post (cleaner than all narration).
+    // Otherwise fall back to cleanedText (all extracted text, markers stripped).
+    const compactedContent = actions.channelReply ?? actions.cleanedText;
 
-      const compactedContent = actions.cleanedText;
+    const atDepthLimit = hubMessage.depth >= config.hubMaxChainDepth;
+    console.log(`[hub] onSessionJobComplete: session=${sessionId.slice(0, 8)} job=${jobId.slice(0, 8)} channel=${hubMessage.channelId} depth=${hubMessage.depth} hasChannelReply=${!!actions.channelReply} contentLen=${compactedContent.length} atDepthLimit=${atDepthLimit}`);
 
-      // Inherit parent tags only — don't auto-inject the session's interests
-      // (that floods the conversation with internal routing metadata).
-      const newTags = hubMessage.tags;
+    // Inherit parent tags only — don't auto-inject the session's interests
+    // (that floods the conversation with internal routing metadata).
+    const newTags = hubMessage.tags;
 
-      // Extract @mentions from the agent's reply so humans can be pulled in.
-      const replyMentions = extractMentions(compactedContent);
+    // Extract @mentions from the agent's reply so humans can be pulled in.
+    const replyMentions = extractMentions(compactedContent);
 
+    // Always post the message if there's content — even at the chain depth
+    // limit. The depth limit prevents CHAIN PROPAGATION (self-triggers,
+    // talking, recursive dispatches) but should never silently drop an
+    // agent's work results. Previously, the depth check prevented posting
+    // entirely, so the agent did work but the result vanished.
+    if (compactedContent.trim()) {
       const postedReply = postHubMessage({
         from: sessionId,
         fromName: screenName,
@@ -751,27 +780,39 @@ function onSessionJobComplete(
         depth: hubMessage.depth + 1,
       });
 
-      // Self-trigger: agent included [BEGIN_WORK] in their reply, so re-invoke
-      // them in 'triggered' (action) mode against their own reply. The work
-      // result becomes a child of the chat reply, preserving the source chain.
-      // Loop guard: only chat-mode (not already triggered) can self-trigger.
-      if (wantsSelfTrigger) {
-        console.log(`[hub]   ${sessionId.slice(0, 8)} SELF-TRIGGER detected in reply`);
-        // Defer one tick so the reply gets persisted/broadcast first
-        setImmediate(() => {
-          triggerSessionOnMessage(sessionId, postedReply.id);
-        });
-      } else if (wantsTalking) {
-        // Talking continuation: re-invoke the same agent. Their next reply will
-        // be posted as a SIBLING of postedReply (same parent = hubMessage.id,
-        // same depth = hubMessage.depth + 1) so the conversation reads as a
-        // sequence of monologue beats rather than a deeply nested thread.
-        console.log(`[hub]   ${sessionId.slice(0, 8)} TALKING marker detected → round 1`);
-        setImmediate(() => {
-          continueTalking(sessionId, hubMessage, postedReply, 1);
-        });
+      // At depth limit, immediately mark the posted reply as complete to
+      // prevent it from dispatching to other sessions (chain explosion).
+      if (atDepthLimit) {
+        hubStore.updateStatus(postedReply.id, 'complete');
+      }
+
+      // Self-trigger and talking only allowed under the depth limit.
+      if (!atDepthLimit) {
+        if (wantsSelfTrigger) {
+          console.log(`[hub]   ${sessionId.slice(0, 8)} SELF-TRIGGER detected in reply`);
+          setImmediate(() => {
+            triggerSessionOnMessage(sessionId, postedReply.id);
+          });
+        } else if (wantsTalking) {
+          console.log(`[hub]   ${sessionId.slice(0, 8)} TALKING marker detected → round 1`);
+          setImmediate(() => {
+            continueTalking(sessionId, hubMessage, postedReply, 1);
+          });
+        }
+      } else {
+        console.log(`[hub]   ${sessionId.slice(0, 8)} at depth limit (${hubMessage.depth}) — posted reply but suppressed chain propagation`);
       }
     }
+
+    // Mark dispatch as 'acted' AFTER posting — previously this was done
+    // before the depth check, so if posting was skipped the safety net in
+    // index.ts also skipped (it saw 'acted' and assumed the message was
+    // already posted).
+    hubStore.updateDispatch(hubMessage.id, sessionId, {
+      status: 'acted',
+      finishedAt: new Date().toISOString(),
+    });
+    broadcastDispatchUpdate(hubMessage.id);
   }
 
   // Check if all dispatches are done
@@ -783,10 +824,10 @@ function onSessionJobComplete(
     }
   }
 
-  // Process this session's queue first, then drain any other sessions that
-  // were blocked by the concurrency limit or cooldown.
-  processQueue(sessionId);
-  drainGlobalQueue();
+  // Queue drain is handled by the global onAnyJobComplete callback registered
+  // in index.ts. That callback fires AFTER activeExecutions.delete (session is
+  // free), so processQueue/drainGlobalQueue can actually dispatch work. The old
+  // calls here were no-ops because the session was still marked busy.
 }
 
 /**
@@ -846,19 +887,22 @@ function continueTalking(
     'beat without the marker. Reply with [SKIP][#NO_ACTION_NEEDED] to drop out entirely.',
   ].join('\n');
 
+  const replyToLine = `[REPLY_TO_CHANNEL][#${originalMessage.channelId}][%${originalMessage.id}]`;
+
   const rawPrompt = [
     roleLine,
     rolePromptLine,
     contextBlock,
     sourceHeader,
     '',
+    replyToLine,
     '---',
     guidance,
   ].filter(Boolean).join('\n');
 
   const prompt = compressForDispatch(rawPrompt, `talking ${sessionId.slice(0, 8)}`);
 
-  const job = createJob(sessionId, prompt);
+  const job = createJob(sessionId, prompt, 'talking');
 
   // Record the dispatch on the ORIGINAL message so the dashboard sees the
   // talking thread as part of that conversation.
@@ -923,8 +967,7 @@ function onTalkingJobComplete(
       });
     }
 
-    processQueue(sessionId);
-    drainGlobalQueue();
+    // Queue drain handled by global onAnyJobComplete callback
     return;
   }
 
@@ -972,8 +1015,7 @@ function onTalkingJobComplete(
     }
   }
 
-  processQueue(sessionId);
-  drainGlobalQueue();
+  // Queue drain handled by global onAnyJobComplete callback
 }
 
 export function processQueue(sessionId: string): void {
@@ -1165,6 +1207,10 @@ export function extractTextFromChunks(chunks: unknown[]): string {
     if (c.type === 'assistant') {
       const content = (c.message as Record<string, unknown>)?.content;
       if (Array.isArray(content)) {
+        // Each assistant snapshot is CUMULATIVE (contains full text up to that
+        // point) when --include-partial-messages is used. Only keep the text
+        // from the LATEST snapshot — otherwise we duplicate the entire output.
+        assistantParts.length = 0;
         for (const block of content) {
           if (block && typeof block === 'object' && (block as Record<string, unknown>).type === 'text') {
             assistantParts.push((block as Record<string, unknown>).text as string);
@@ -1509,6 +1555,102 @@ export async function compactChannel(
   });
 
   return { seedMessage, compaction };
+}
+
+/**
+ * Re-run the summarizer for an existing compaction whose summary is empty or
+ * contains an error (e.g. Claude API 401). Uses the archived messages stored
+ * on the compaction record — no live messages are touched.
+ *
+ * Updates the compaction summary and the seed message that followed it.
+ */
+export async function redoCompaction(
+  channelId: string,
+  compactionId: string,
+  machineId?: string,
+): Promise<{ summary: string }> {
+  const channel = hubStore.getChannel(channelId);
+  if (!channel) throw new Error('channel not found');
+
+  const compaction = hubStore.getCompaction(channelId, compactionId);
+  if (!compaction) throw new Error('compaction not found');
+
+  const messages = compaction.messages;
+  if (!messages || messages.length === 0) throw new Error('compaction has no archived messages');
+
+  console.log(`[hub] redoCompaction ${channelId}/${compactionId} — re-summarizing ${messages.length} archived messages`);
+
+  const machine = pickMachineForCompaction(channelId, machineId);
+  if (!machine) throw new Error('no machine available to run summarizer');
+
+  // Build prior summaries from compactions BEFORE this one
+  const allCompactions = channel.compactions ?? [];
+  const thisIdx = allCompactions.findIndex(c => c.id === compactionId);
+  const priorSummaries = allCompactions
+    .slice(0, thisIdx)
+    .map((c, i) => `### Prior compaction ${i + 1} (${c.createdAt})\n${c.summary}`)
+    .join('\n\n');
+
+  const fullTranscript = buildTranscript(messages);
+  const fullTokens = estimateTokens(fullTranscript);
+  const maxTokens = config.compactChunkTokens;
+  const chunks = fullTokens <= maxTokens
+    ? [messages]
+    : splitMessagesIntoChunks(messages, maxTokens);
+
+  broadcastCompactProgress(channelId, 0, chunks.length, 'redo starting');
+
+  const chunkSummaries: string[] = [];
+  for (let i = 0; i < chunks.length; i++) {
+    const partIdx = i + 1;
+    const chunkMessages = chunks[i];
+    broadcastCompactProgress(channelId, partIdx, chunks.length, `redo part ${partIdx}/${chunks.length}`);
+
+    const partSummary = await summarizeChunk({
+      channelName: channel.name,
+      machine,
+      messages: chunkMessages,
+      partIdx,
+      totalParts: chunks.length,
+      priorSummaries: i === 0 ? priorSummaries : '',
+    });
+
+    if (!partSummary.trim()) {
+      throw new Error(`summarizer produced empty output on part ${partIdx}/${chunks.length}`);
+    }
+
+    chunkSummaries.push(
+      chunks.length > 1
+        ? `## Part ${partIdx}/${chunks.length} (${chunkMessages.length} messages)\n\n${partSummary}`
+        : partSummary,
+    );
+  }
+
+  const summary = chunkSummaries.join('\n\n---\n\n');
+
+  // Update the compaction record
+  hubStore.updateCompactionSummary(channelId, compactionId, summary);
+
+  // Find and update the seed message that references this compaction
+  const allMessages = hubStore.getByChannel(channelId);
+  const seedMsg = allMessages.find(m => m.content.includes(compactionId) && m.tags.includes('compaction'));
+  if (seedMsg) {
+    const newContent = `📜 **Channel compacted** — ${compaction.messageIds.length} messages folded into ${compactionId}\n\n${summary}`;
+    hubStore.updateMessageContent(seedMsg.id, newContent);
+  }
+
+  await hubStore.persistNow();
+
+  console.log(`[hub] redoCompaction ${channelId}/${compactionId} ✓ new summary ${summary.length} chars`);
+
+  broadcastToDashboards({
+    type: 'DASHBOARD_EVENT',
+    event: 'CHANNEL_COMPACTED',
+    channelId,
+    compactionId,
+  });
+
+  return { summary };
 }
 
 /** Compact output using a utility Claude CLI on the same machine. */
