@@ -9,6 +9,7 @@ const mockConfig = {
   sshReadyTimeoutMs: 30_000,
   sshConnectRetries: 0,
   sshIdleTimeoutMs: 0, // disabled by default in tests
+  jumpHostPersistPath: '',
 };
 vi.mock('../../src/config.js', () => ({
   config: mockConfig,
@@ -211,6 +212,94 @@ describe('sshRunner', () => {
 
       const result = await promise;
       expect(result).toBe('warning');
+    });
+  });
+
+  describe('getRemoteContextTokens', () => {
+    it('should sum input_tokens + cache_creation + cache_read from last usage line', async () => {
+      const machine = makeMachine();
+      const promise = sshRunner.getRemoteContextTokens(machine, '/home/user/project', 'sess-abc');
+
+      const stream = createMockStream();
+      // getRemoteContextTokens calls exec(cmd, cb) — 2-arg, no options
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
+        cb(null, stream);
+      });
+      mockClientInstance.emit('ready');
+      await flush();
+
+      // The grep+awk pipeline outputs the sum of all three token fields
+      stream.emit('data', Buffer.from('59068\n'));
+      stream.emit('close');
+
+      const result = await promise;
+      expect(result).toBe(59068);
+    });
+
+    it('should build correct command: find by session ID, grep + sum tokens', async () => {
+      const machine = makeMachine();
+      const promise = sshRunner.getRemoteContextTokens(machine, '/home/user/project', 'sess-abc');
+
+      const stream = createMockStream();
+      let executedCmd = '';
+      mockClientInstance.exec.mockImplementation((cmd: string, cb: Function) => {
+        executedCmd = cmd;
+        cb(null, stream);
+      });
+      mockClientInstance.emit('ready');
+      await flush();
+
+      stream.emit('data', Buffer.from('100\n'));
+      stream.emit('close');
+
+      await promise;
+      // Must find session file by ID under ~/.claude/projects
+      expect(executedCmd).toContain('find ~/.claude/projects');
+      expect(executedCmd).toContain('sess-abc.jsonl');
+      // Must grep for cache_read_input_tokens lines (present on usage entries)
+      expect(executedCmd).toContain('cache_read_input_tokens');
+      // Must extract all three token fields
+      expect(executedCmd).toContain('input_tokens|cache_creation_input_tokens|cache_read_input_tokens');
+      // Must sum with awk
+      expect(executedCmd).toContain('awk');
+    });
+
+    it('should return undefined when no output', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const machine = makeMachine();
+      const promise = sshRunner.getRemoteContextTokens(machine, '/home/user/project', 'sess-abc');
+
+      const stream = createMockStream();
+      mockClientInstance.exec.mockImplementation((_cmd: string, cb: Function) => {
+        cb(null, stream);
+      });
+      mockClientInstance.emit('ready');
+      await flush();
+
+      stream.emit('data', Buffer.from('\n'));
+      stream.emit('close');
+
+      const result = await promise;
+      expect(result).toBeUndefined();
+      warnSpy.mockRestore();
+    });
+
+    it('should return undefined for empty claudeSessionId', async () => {
+      const machine = makeMachine();
+      const result = await sshRunner.getRemoteContextTokens(machine, '/work', '');
+      expect(result).toBeUndefined();
+    });
+
+    it('should return undefined on connection error', async () => {
+      const warnSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
+      const machine = makeMachine();
+      const promise = sshRunner.getRemoteContextTokens(machine, '/work', 'sess-1');
+
+      mockClientInstance.emit('error', new Error('Connection refused'));
+
+      const result = await promise;
+      expect(result).toBeUndefined();
+      warnSpy.mockRestore();
     });
   });
 

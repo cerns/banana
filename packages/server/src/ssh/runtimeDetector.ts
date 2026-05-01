@@ -1,6 +1,5 @@
-import { Client } from 'ssh2';
 import type { MachineRecord, RuntimeInfo, SystemInfo, NetworkInterface } from '../machines/machineStore.js';
-import { buildConnectConfig } from './sshRunner.js';
+import { connectWithRetry } from './sshRunner.js';
 
 export interface DetectionResult {
   runtimes: RuntimeInfo[];
@@ -130,33 +129,24 @@ export function parseDetectionOutput(raw: string): DetectionResult {
   return { runtimes, claudePath, systemInfo };
 }
 
-export function detectRuntimes(machine: MachineRecord): Promise<DetectionResult> {
+export async function detectRuntimes(machine: MachineRecord): Promise<DetectionResult> {
+  const { client: conn, cleanup } = await connectWithRetry(machine);
   return new Promise((resolve, reject) => {
-    const conn = new Client();
     const timeout = setTimeout(() => {
-      conn.end();
+      cleanup();
       reject(new Error('Runtime detection timed out after 15s'));
     }, 15_000);
 
-    conn.on('ready', () => {
-      conn.exec(DETECT_COMMAND, (err, stream) => {
-        if (err) { clearTimeout(timeout); conn.end(); reject(err); return; }
-        let output = '';
-        stream.on('data', (data: Buffer) => { output += data.toString(); });
-        stream.stderr.on('data', () => { /* ignore stderr */ });
-        stream.on('close', () => {
-          clearTimeout(timeout);
-          conn.end();
-          resolve(parseDetectionOutput(output));
-        });
+    conn.exec(DETECT_COMMAND, (err, stream) => {
+      if (err) { clearTimeout(timeout); cleanup(); reject(err); return; }
+      let output = '';
+      stream.on('data', (data: Buffer) => { output += data.toString(); });
+      stream.stderr.on('data', () => { /* ignore stderr */ });
+      stream.on('close', () => {
+        clearTimeout(timeout);
+        cleanup();
+        resolve(parseDetectionOutput(output));
       });
     });
-
-    conn.on('error', (err) => {
-      clearTimeout(timeout);
-      reject(err);
-    });
-
-    conn.connect(buildConnectConfig(machine));
   });
 }

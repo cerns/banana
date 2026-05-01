@@ -755,12 +755,100 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     }
   }
 
+  // ── Jump host endpoints ──────────────────────────────────────────────────
+
+  // GET /api/jumphosts
+  if (method === 'GET' && pathname === '/api/jumphosts') {
+    const { jumpHostStore } = await import('../ssh/jumpHostStore.js');
+    json(res, 200, jumpHostStore.getRedactedConfig());
+    return true;
+  }
+
+  // PUT /api/jumphosts — replace entire config
+  if (method === 'PUT' && pathname === '/api/jumphosts') {
+    const { jumpHostStore } = await import('../ssh/jumpHostStore.js');
+    const body = await readBody(req) as any;
+    jumpHostStore.setConfig({ enabled: !!body.enabled, hosts: Array.isArray(body.hosts) ? body.hosts : [] });
+    json(res, 200, jumpHostStore.getRedactedConfig());
+    return true;
+  }
+
+  // PATCH /api/jumphosts/enabled — quick toggle
+  if (method === 'PATCH' && pathname === '/api/jumphosts/enabled') {
+    const { jumpHostStore } = await import('../ssh/jumpHostStore.js');
+    const body = await readBody(req) as { enabled?: boolean };
+    if (body.enabled !== undefined) jumpHostStore.setEnabled(!!body.enabled);
+    json(res, 200, { enabled: jumpHostStore.getConfig().enabled });
+    return true;
+  }
+
+  // POST /api/jumphosts/hosts — add a host
+  if (method === 'POST' && pathname === '/api/jumphosts/hosts') {
+    const { jumpHostStore } = await import('../ssh/jumpHostStore.js');
+    const body = await readBody(req) as any;
+    if (!body.host || !body.username) { json(res, 400, { error: 'host and username required' }); return true; }
+    const id = randomUUID();
+    const host = {
+      id, host: body.host, port: body.port ?? 22, username: body.username,
+      sshKeyPath: body.sshKeyPath, password: body.password, passphrase: body.passphrase,
+      label: body.label,
+    };
+    jumpHostStore.addHost(host);
+    json(res, 201, jumpHostStore.getRedactedConfig());
+    return true;
+  }
+
+  // PUT /api/jumphosts/hosts/:id — update a host
+  const jhHostMatch = pathname.match(/^\/api\/jumphosts\/hosts\/([^/]+)$/);
+  if (jhHostMatch && method === 'PUT') {
+    const { jumpHostStore } = await import('../ssh/jumpHostStore.js');
+    const hostId = jhHostMatch[1];
+    const body = await readBody(req) as any;
+    if (!jumpHostStore.updateHost(hostId, body)) { json(res, 404, { error: 'Jump host not found' }); return true; }
+    json(res, 200, jumpHostStore.getRedactedConfig());
+    return true;
+  }
+
+  // DELETE /api/jumphosts/hosts/:id
+  if (jhHostMatch && method === 'DELETE') {
+    const { jumpHostStore } = await import('../ssh/jumpHostStore.js');
+    const hostId = jhHostMatch[1];
+    if (!jumpHostStore.removeHost(hostId)) { json(res, 404, { error: 'Jump host not found' }); return true; }
+    json(res, 200, jumpHostStore.getRedactedConfig());
+    return true;
+  }
+
+  // PUT /api/jumphosts/reorder
+  if (method === 'PUT' && pathname === '/api/jumphosts/reorder') {
+    const { jumpHostStore } = await import('../ssh/jumpHostStore.js');
+    const body = await readBody(req) as { ids?: string[] };
+    if (!Array.isArray(body.ids)) { json(res, 400, { error: 'ids array required' }); return true; }
+    jumpHostStore.reorderHosts(body.ids);
+    json(res, 200, jumpHostStore.getRedactedConfig());
+    return true;
+  }
+
+  // POST /api/jumphosts/test — test the chain
+  if (method === 'POST' && pathname === '/api/jumphosts/test') {
+    const { jumpHostStore } = await import('../ssh/jumpHostStore.js');
+    const { testJumpHostChain } = await import('../ssh/sshRunner.js');
+    const cfg = jumpHostStore.getConfig();
+    if (cfg.hosts.length === 0) { json(res, 400, { error: 'No jump hosts configured' }); return true; }
+    try {
+      const output = await testJumpHostChain(cfg.hosts);
+      json(res, 200, { ok: true, output });
+    } catch (err) {
+      json(res, 422, { ok: false, error: err instanceof Error ? err.message : String(err) });
+    }
+    return true;
+  }
+
   // ── Settings endpoints ──────────────────────────────────────────────────
 
   // GET /api/settings — read mutable runtime settings
   if (method === 'GET' && pathname === '/api/settings') {
     json(res, 200, {
-      compactAfterTurns: config.compactAfterTurns,
+      compactTokenThreshold: config.compactTokenThreshold,
       hubMaxConcurrentJobs: config.hubMaxConcurrentJobs,
       hubCooldownMs: config.hubCooldownMs,
       hubMaxTalkRounds: config.hubMaxTalkRounds,
@@ -773,7 +861,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
   // PATCH /api/settings — update mutable runtime settings
   if (method === 'PATCH' && pathname === '/api/settings') {
     const body = await readBody(req) as Record<string, unknown>;
-    const allowed = ['compactAfterTurns', 'hubMaxConcurrentJobs', 'hubCooldownMs', 'hubMaxTalkRounds', 'hubMaxChainDepth', 'sshIdleTimeoutMs'] as const;
+    const allowed = ['compactTokenThreshold', 'hubMaxConcurrentJobs', 'hubCooldownMs', 'hubMaxTalkRounds', 'hubMaxChainDepth', 'sshIdleTimeoutMs'] as const;
     for (const key of allowed) {
       if (body[key] !== undefined) {
         const val = Number(body[key]);
@@ -782,7 +870,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       }
     }
     json(res, 200, {
-      compactAfterTurns: config.compactAfterTurns,
+      compactTokenThreshold: config.compactTokenThreshold,
       hubMaxConcurrentJobs: config.hubMaxConcurrentJobs,
       hubCooldownMs: config.hubCooldownMs,
       hubMaxTalkRounds: config.hubMaxTalkRounds,

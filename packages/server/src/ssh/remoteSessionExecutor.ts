@@ -3,7 +3,7 @@ import { machineStore } from '../machines/machineStore.js';
 import { updateClaudeSessionId } from '../sessions/sessionManager.js';
 import { broadcastToDashboards } from '../ws/dashboardBroadcast.js';
 import { pushManager } from '../push/pushManager.js';
-import { runClaudeOverSsh } from './sshRunner.js';
+import { runClaudeOverSsh, getRemoteContextTokens } from './sshRunner.js';
 import { config } from '../config.js';
 
 /** Active SSH executions — keyed by sessionId for abort support. */
@@ -77,6 +77,16 @@ function fmtDuration(ms: number): string {
   return s < 60 ? `${s}s` : `${Math.floor(s / 60)}m ${s % 60}s`;
 }
 
+function fmtTokens(n: number): string {
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k tokens` : `${n} tokens`;
+}
+
+function fmtBytes(n: number): string {
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}MB`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}kB`;
+  return `${n}B`;
+}
+
 /**
  * Execute a Claude prompt on a remote machine via SSH.
  * Fire-and-forget — the caller does not await this. Output is streamed
@@ -138,15 +148,30 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
   activeExecutions.set(sessionId, controller);
 
   try {
+    const sid8 = sessionId.slice(0, 8);
+    const jid8 = jobId.slice(0, 8);
+
+    // ── Pre-job context check ──────────────────────────────────────────
+    let preContextTokens: number | undefined;
+    if (resumeId) {
+      try {
+        preContextTokens = await getRemoteContextTokens(machine, workdir, resumeId, controller.signal);
+      } catch { /* non-critical */ }
+      if (preContextTokens !== undefined) {
+        sessionStore.updateMeta(sessionId, { lastInputTokens: preContextTokens });
+      }
+    }
+
+    console.log(`[remote-executor] Session ${sid8} job ${jid8} start — prompt ${prompt.length} chars${preContextTokens ? `, context ${fmtTokens(preContextTokens)}` : resumeId ? ', context unknown' : ', new session'}`);
+
     // ── Auto-compact: keep context window lean on long-running sessions ──
-    const turns = session.turnsSinceCompact ?? 0;
-    if (resumeId && config.compactAfterTurns > 0 && turns >= config.compactAfterTurns) {
-      console.log(`[remote-executor] Session ${sessionId.slice(0, 8)} has ${turns} turns — running /compact`);
+    if (resumeId && config.compactTokenThreshold > 0 && preContextTokens !== undefined && preContextTokens >= config.compactTokenThreshold) {
+      console.log(`[remote-executor] Session ${sid8} context ${fmtTokens(preContextTokens)} >= ${fmtTokens(config.compactTokenThreshold)} — running /compact`);
       broadcastToDashboards({
         type: 'DASHBOARD_EVENT',
         event: 'SESSION_COMPACTING',
         sessionId,
-        turns,
+        inputTokens: preContextTokens,
       });
       try {
         const compactResult = await runClaudeOverSsh(
@@ -162,19 +187,20 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
           updateClaudeSessionId(sessionId, compactResult.claudeSessionId);
           resumeId = compactResult.claudeSessionId;
         }
-        sessionStore.updateMeta(sessionId, { turnsSinceCompact: 0 });
-        console.log(`[remote-executor] /compact done for ${sessionId.slice(0, 8)} in ${fmtDuration(compactResult.durationMs)}`);
+        console.log(`[remote-executor] /compact done for ${sid8} in ${fmtDuration(compactResult.durationMs)}`);
       } catch (compactErr) {
         // Don't fail the actual job — just log and continue
-        console.warn(`[remote-executor] /compact failed for ${sessionId.slice(0, 8)}, continuing:`, compactErr);
+        console.warn(`[remote-executor] /compact failed for ${sid8}, continuing:`, compactErr);
       }
     }
 
+    let outputBytes = 0;
     const result = await runClaudeOverSsh(
       machine,
       prompt,
       workdir,
       (chunk) => {
+        outputBytes += JSON.stringify(chunk).length;
         sessionStore.addChunk(sessionId, jobId, chunk);
         broadcastToDashboards({
           type: 'DASHBOARD_EVENT',
@@ -196,11 +222,19 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
       updateClaudeSessionId(sessionId, result.claudeSessionId);
     }
 
-    // Increment turn counter for auto-compact tracking (only on resumed sessions)
-    if (resumeId) {
-      const currentTurns = sessionStore.get(sessionId)?.turnsSinceCompact ?? 0;
-      sessionStore.updateMeta(sessionId, { turnsSinceCompact: currentTurns + 1 });
+    // Read actual context size from remote JSONL (sums input + cache tokens)
+    const finalSessionId = result.claudeSessionId ?? resumeId;
+    let postContextTokens: number | undefined;
+    if (finalSessionId) {
+      try {
+        postContextTokens = await getRemoteContextTokens(machine, workdir, finalSessionId);
+      } catch { /* non-critical */ }
+      if (postContextTokens !== undefined) {
+        sessionStore.updateMeta(sessionId, { lastInputTokens: postContextTokens });
+      }
     }
+
+    console.log(`[remote-executor] Session ${sid8} job ${jid8} done — exit ${result.exitCode}, ${fmtDuration(result.durationMs)}, output ${fmtBytes(outputBytes)}${postContextTokens ? `, context ${fmtTokens(postContextTokens)}` : ''}`);
 
     broadcastToDashboards({
       type: 'DASHBOARD_EVENT',

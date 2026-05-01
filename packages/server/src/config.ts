@@ -51,9 +51,11 @@ export const config = {
   // 80000 leaves headroom under common 100k context limits for the prompt
   // scaffolding + the response.
   compactChunkTokens: parseInt(process.env.BANANA_COMPACT_CHUNK_TOKENS ?? '80000', 10),
-  // Auto-compact: after this many resumed turns on a session, run /compact
-  // before the next prompt to keep context window lean. Set to 0 to disable.
-  compactAfterTurns: parseInt(process.env.BANANA_COMPACT_AFTER_TURNS ?? '10', 10),
+  // Auto-compact: when the last run's input token count exceeds this threshold,
+  // run /compact before the next prompt to keep context lean. Set to 0 to disable.
+  // Default 10000 — triggers compact early to keep context lean.
+  compactTokenThreshold: parseInt(process.env.BANANA_COMPACT_TOKEN_THRESHOLD ?? '10000', 10),
+  jumpHostPersistPath: process.env.BANANA_JUMPHOSTS_PATH ?? path.join(os.homedir(), '.banana', 'jumphosts.json'),
 };
 
 if (!config.token) {

@@ -330,7 +330,8 @@ header h1 { font-size: 16px; color: var(--accent); }
   max-height: 80vh;
   overflow-y: auto;
 }
-.modal-lg { width: 560px; }
+.modal-lg { width: 560px; height: 80vh; display: flex; flex-direction: column; }
+.modal-lg > .modal-body { flex: 1; overflow-y: auto; }
 .modal-header {
   display: flex;
   align-items: center;

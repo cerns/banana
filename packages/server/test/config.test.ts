@@ -101,18 +101,18 @@ describe('config', () => {
     expect(config.promptCompressEnabled).toBe(true);
   });
 
-  it('should default compactAfterTurns=10', async () => {
+  it('should default compactTokenThreshold=10000', async () => {
     process.env.BANANA_TOKEN = 'test';
-    delete process.env.BANANA_COMPACT_AFTER_TURNS;
+    delete process.env.BANANA_COMPACT_TOKEN_THRESHOLD;
     const { config } = await import('../src/config.js');
-    expect(config.compactAfterTurns).toBe(10);
+    expect(config.compactTokenThreshold).toBe(10000);
   });
 
-  it('should load compactAfterTurns from env', async () => {
+  it('should load compactTokenThreshold from env', async () => {
     process.env.BANANA_TOKEN = 'test';
-    process.env.BANANA_COMPACT_AFTER_TURNS = '20';
+    process.env.BANANA_COMPACT_TOKEN_THRESHOLD = '50000';
     const { config } = await import('../src/config.js');
-    expect(config.compactAfterTurns).toBe(20);
+    expect(config.compactTokenThreshold).toBe(50000);
   });
 
   it('should disable promptCompressEnabled when BANANA_PROMPT_COMPRESS=0', async () => {
@@ -120,6 +120,12 @@ describe('config', () => {
     process.env.BANANA_PROMPT_COMPRESS = '0';
     const { config } = await import('../src/config.js');
     expect(config.promptCompressEnabled).toBe(false);
+  });
+
+  it('should have jumpHostPersistPath', async () => {
+    process.env.BANANA_TOKEN = 'test';
+    const { config } = await import('../src/config.js');
+    expect(config.jumpHostPersistPath).toContain('jumphosts.json');
   });
 
   it('should exit if BANANA_TOKEN is missing', async () => {

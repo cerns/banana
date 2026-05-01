@@ -5,7 +5,13 @@ import type { SetupStep } from '../../src/ssh/machineSetup.js';
 
 // Mock config
 vi.mock('../../src/config.js', () => ({
-  config: { machinesPersistPath: '' },
+  config: {
+    machinesPersistPath: '',
+    sshReadyTimeoutMs: 30_000,
+    sshKeepaliveCountMax: 60,
+    sshConnectRetries: 0,
+    jumpHostPersistPath: '',
+  },
 }));
 
 // Mock fs for key file reading
@@ -46,6 +52,11 @@ vi.mock('ssh2', () => ({
     return mockClientInstance;
   }),
 }));
+
+// Drain microtask queue so connectWithRetry settles
+async function flush() {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+}
 
 function makeMachine(overrides: Partial<MachineRecord> = {}): MachineRecord {
   return {
@@ -111,6 +122,7 @@ describe('machineSetup', () => {
       { match: /---node---/, stdout: '---node---\nnot-found\n---bun---\n/home/user/.bun/bin/bun\n1.1.0\n---claude---\n/home/user/.bun/bin/claude\n', code: 0 },
     ]);
     mockClientInstance.emit('ready');
+    await flush();
 
     const result = await promise;
     expect(result.runtimes).toHaveLength(1);
@@ -136,6 +148,7 @@ describe('machineSetup', () => {
       { match: /---node---/, stdout: '---node---\nnot-found\n---bun---\n/usr/bin/bun\n1.0.25\n---claude---\n/usr/bin/claude\n', code: 0 },
     ]);
     mockClientInstance.emit('ready');
+    await flush();
 
     const result = await promise;
     expect(steps.some(s => s.phase === 'bun' && s.status === 'skipped')).toBe(true);
@@ -167,6 +180,7 @@ describe('machineSetup', () => {
       { match: /---node---/, stdout: detectOutput, code: 0 },
     ]);
     mockClientInstance.emit('ready');
+    await flush();
 
     const result = await promise;
     expect(steps.some(s => s.phase === 'bun' && s.status === 'skipped')).toBe(true);
@@ -199,6 +213,7 @@ describe('machineSetup', () => {
       { match: /bun\.sh\/install/, stdout: '', stderr: 'curl failed', code: 1 },
     ]);
     mockClientInstance.emit('ready');
+    await flush();
 
     await expect(promise).rejects.toThrow('bun install failed');
     expect(steps.some(s => s.phase === 'bun' && s.status === 'error')).toBe(true);
@@ -216,6 +231,7 @@ describe('machineSetup', () => {
       { match: /claude-code@latest/, stdout: '', stderr: 'install error', code: 1 },
     ]);
     mockClientInstance.emit('ready');
+    await flush();
 
     await expect(promise).rejects.toThrow('claude install failed');
     expect(steps.some(s => s.phase === 'claude' && s.status === 'error')).toBe(true);
@@ -231,6 +247,7 @@ describe('machineSetup', () => {
       cb(new Error('exec failed'));
     });
     mockClientInstance.emit('ready');
+    await flush();
 
     await expect(promise).rejects.toThrow('exec failed');
   });

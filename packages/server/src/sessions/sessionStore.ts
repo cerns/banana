@@ -32,9 +32,10 @@ export interface SessionRecord {
    * Examples: "opus", "sonnet", "haiku", "claude-sonnet-4-6". Empty/undefined
    * lets the remote CLI pick its default. */
   model?: string;
-  /** Number of resumed turns since the last /compact. Auto-compact triggers
-   * when this reaches config.compactAfterTurns. */
-  turnsSinceCompact?: number;
+  /** Last known input token count from the Claude API. Auto-compact triggers
+   *  when this exceeds config.compactTokenThreshold. Updated after every SSH
+   *  run that returns token usage info. */
+  lastInputTokens?: number;
 }
 
 export type JobSource = 'adhoc' | 'hub' | 'trigger' | 'self-trigger' | 'talking';
@@ -114,7 +115,7 @@ class SessionStore {
     this.persist();
   }
 
-  updateMeta(sessionId: string, fields: Partial<Pick<SessionRecord, 'name' | 'claudeSessionId' | 'remoteWorkdir' | 'role' | 'screenName' | 'interests' | 'rolePrompt' | 'channels' | 'hubQueue' | 'model' | 'turnsSinceCompact'>>): void {
+  updateMeta(sessionId: string, fields: Partial<Pick<SessionRecord, 'name' | 'claudeSessionId' | 'remoteWorkdir' | 'role' | 'screenName' | 'interests' | 'rolePrompt' | 'channels' | 'hubQueue' | 'model' | 'lastInputTokens'>>): void {
     const session = this.sessions.get(sessionId);
     if (!session) return;
     Object.assign(session, fields);

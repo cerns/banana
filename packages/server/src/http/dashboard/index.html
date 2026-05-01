@@ -335,10 +335,7 @@
         <div id="jobs-tabs" class="jobs-tabs">
           <button class="jobs-tab active" data-source="all">All</button>
           <button class="jobs-tab" data-source="adhoc">Ad-hoc</button>
-          <button class="jobs-tab" data-source="hub">Hub</button>
-          <button class="jobs-tab" data-source="trigger">Trigger</button>
-          <button class="jobs-tab" data-source="self-trigger">Self-trigger</button>
-          <button class="jobs-tab" data-source="talking">Talking</button>
+          <button class="jobs-tab" data-source="hub-all">Hub</button>
         </div>
         <div id="jobs-active-section">
           <h4 style="margin:0 0 8px;color:var(--accent);font-size:12px;text-transform:uppercase;letter-spacing:1px">Running</h4>
@@ -378,7 +375,7 @@
         <button class="modal-close" data-close="settings-modal">&times;</button>
       </div>
       <div class="modal-body">
-        <div class="form-row"><label>Auto-compact after N turns (0 = disabled)</label><input id="set-compact-turns" type="number" min="0" step="1" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Auto-compact token threshold (0 = disabled)</label><input id="set-compact-tokens" type="number" min="0" step="10000" autocomplete="off" data-1p-ignore /></div>
         <div class="form-row"><label>Hub max concurrent jobs</label><input id="set-hub-concurrent" type="number" min="1" step="1" autocomplete="off" data-1p-ignore /></div>
         <div class="form-row"><label>Hub cooldown (ms)</label><input id="set-hub-cooldown" type="number" min="0" step="1000" autocomplete="off" data-1p-ignore /></div>
         <div class="form-row"><label>Hub max talk rounds</label><input id="set-hub-talk-rounds" type="number" min="1" step="1" autocomplete="off" data-1p-ignore /></div>
@@ -389,6 +386,40 @@
           <button class="btn modal-close" data-close="settings-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
         </div>
         <div id="set-status" style="margin-top:8px;font-size:11px;color:var(--muted)"></div>
+
+        <!-- Jump Hosts -->
+        <div style="margin-top:20px;border-top:1px solid var(--border);padding-top:16px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">
+            <label style="font-weight:600;font-size:13px">SSH Jump Hosts (ProxyJump)</label>
+            <label style="font-size:12px;display:flex;align-items:center;gap:4px;cursor:pointer">
+              <input id="jh-enabled" type="checkbox" />
+              Enabled
+            </label>
+          </div>
+          <div id="jh-chain-preview" style="font-size:11px;color:var(--muted);margin-bottom:8px;display:none"></div>
+          <div id="jh-host-list" style="margin-bottom:8px"></div>
+          <div style="display:flex;gap:6px">
+            <button id="jh-add-btn" class="btn btn-sm">+ Add Jump Host</button>
+            <button id="jh-test-btn" class="btn btn-sm" style="background:var(--blue);color:#000">Test Chain</button>
+          </div>
+          <div id="jh-test-status" style="margin-top:6px;font-size:11px;color:var(--muted)"></div>
+        </div>
+
+        <!-- Jump Host add/edit form (inline, hidden by default) -->
+        <div id="jh-form" style="display:none;margin-top:12px;padding:12px;background:var(--surface);border:1px solid var(--border);border-radius:6px">
+          <input type="hidden" id="jh-edit-id" />
+          <div class="form-row"><label>Label</label><input id="jh-label" placeholder="bastion-1" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>Host</label><input id="jh-host" placeholder="128.199.221.231" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>Port</label><input id="jh-port" type="number" value="22" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>Username</label><input id="jh-username" placeholder="root" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>SSH Key Path</label><input id="jh-sshkey" placeholder="/root/.ssh/id_rsa" autocomplete="off" data-1p-ignore /></div>
+          <div class="form-row"><label>Password</label><input id="jh-password" type="text" placeholder="(optional)" autocomplete="off" data-1p-ignore data-lpignore="true" style="-webkit-text-security:disc;text-security:disc;" /></div>
+          <div class="form-row"><label>Passphrase</label><input id="jh-passphrase" type="text" placeholder="(optional)" autocomplete="off" data-1p-ignore data-lpignore="true" style="-webkit-text-security:disc;text-security:disc;" /></div>
+          <div style="display:flex;gap:6px;margin-top:8px">
+            <button id="jh-form-save" class="btn btn-sm">Save</button>
+            <button id="jh-form-cancel" class="btn btn-sm" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
+          </div>
+        </div>
       </div>
     </div>
   </div>

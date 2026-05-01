@@ -149,10 +149,13 @@ class HubStore {
     this.persist();
   }
 
-  updateDispatch(messageId: string, sessionId: string, fields: Partial<HubDispatch>): void {
+  updateDispatch(messageId: string, sessionId: string, fields: Partial<HubDispatch>, jobId?: string): void {
     const msg = this.messages.get(messageId);
     if (!msg) return;
-    const dispatch = msg.dispatches.find(d => d.sessionId === sessionId);
+    // Match by jobId first (exact), fall back to sessionId (legacy/compat)
+    const dispatch = jobId
+      ? msg.dispatches.find(d => d.jobId === jobId) ?? msg.dispatches.find(d => d.sessionId === sessionId)
+      : msg.dispatches.find(d => d.sessionId === sessionId);
     if (!dispatch) return;
     Object.assign(dispatch, fields);
     this.persist();

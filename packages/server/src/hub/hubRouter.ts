@@ -710,7 +710,7 @@ function onSessionJobComplete(
     hubStore.updateDispatch(hubMessage.id, sessionId, {
       status: 'skipped',
       finishedAt: new Date().toISOString(),
-    });
+    }, jobId);
     broadcastDispatchUpdate(hubMessage.id);
 
     // Post a visible skip message to the channel
@@ -811,7 +811,7 @@ function onSessionJobComplete(
     hubStore.updateDispatch(hubMessage.id, sessionId, {
       status: 'acted',
       finishedAt: new Date().toISOString(),
-    });
+    }, jobId);
     broadcastDispatchUpdate(hubMessage.id);
   }
 
@@ -946,7 +946,7 @@ function onTalkingJobComplete(
     hubStore.updateDispatch(originalMessage.id, sessionId, {
       status: 'skipped',
       finishedAt: new Date().toISOString(),
-    });
+    }, jobId);
     broadcastDispatchUpdate(originalMessage.id);
 
     // Post visible skip in channel
@@ -974,7 +974,7 @@ function onTalkingJobComplete(
   hubStore.updateDispatch(originalMessage.id, sessionId, {
     status: 'acted',
     finishedAt: new Date().toISOString(),
-  });
+  }, jobId);
   broadcastDispatchUpdate(originalMessage.id);
 
   const wantsContinue = detectTalkingMarker(rawOutput);

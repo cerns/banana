@@ -2,14 +2,26 @@ import { Client } from 'ssh2';
 import fs from 'fs';
 import type { MachineRecord } from '../machines/machineStore.js';
 import { config } from '../config.js';
+import { jumpHostStore, type JumpHost } from './jumpHostStore.js';
 
 export interface SshRunResult {
   exitCode: number;
   durationMs: number;
   claudeSessionId?: string;
+  /** Total input tokens reported by the Claude API for this run. Extracted
+   *  from stream-json events (message_start or result). Used for auto-compact
+   *  threshold checking — when this exceeds `compactTokenThreshold`, the next
+   *  prompt will run /compact first. */
+  inputTokens?: number;
 }
 
 export type SshChunkCallback = (chunk: unknown) => void;
+
+/** A connection that may tunnel through jump hosts. Call cleanup() instead of client.end(). */
+export interface TunneledConnection {
+  client: Client;
+  cleanup: () => void;
+}
 
 function parseLine(line: string): unknown | null {
   const trimmed = line.trim();
@@ -42,6 +54,188 @@ export function buildConnectConfig(machine: MachineRecord): Record<string, unkno
     cfg.password = machine.password;
   }
   return cfg;
+}
+
+/** Build ssh2 connect config for a JumpHost. */
+function buildJumpHostConfig(hop: JumpHost): Record<string, unknown> {
+  const cfg: Record<string, unknown> = {
+    host: hop.host,
+    port: hop.port,
+    username: hop.username,
+    readyTimeout: config.sshReadyTimeoutMs,
+    keepaliveInterval: 10_000,
+    keepaliveCountMax: config.sshKeepaliveCountMax,
+  };
+  if (hop.sshKeyPath) {
+    cfg.privateKey = fs.readFileSync(hop.sshKeyPath);
+    if (hop.passphrase) cfg.passphrase = hop.passphrase;
+  } else if (hop.password) {
+    cfg.password = hop.password;
+  }
+  return cfg;
+}
+
+/** Promise wrapper: connect a Client with given config, resolve on 'ready'. */
+function connectClientAsync(clientCfg: Record<string, unknown>): Promise<Client> {
+  return new Promise((resolve, reject) => {
+    const conn = new Client();
+    let settled = false;
+    const onReady = () => { if (settled) return; settled = true; conn.removeListener('error', onError); resolve(conn); };
+    const onError = (err: Error) => { if (settled) return; settled = true; conn.removeListener('ready', onReady); try { conn.end(); } catch { /* noop */ } reject(err); };
+    conn.once('ready', onReady);
+    conn.once('error', onError);
+    conn.connect(clientCfg);
+  });
+}
+
+/** Promise wrapper for ssh2 forwardOut. Returns a duplex stream. */
+function forwardOutAsync(client: Client, dstHost: string, dstPort: number): Promise<any> {
+  return new Promise((resolve, reject) => {
+    client.forwardOut('127.0.0.1', 0, dstHost, dstPort, (err, stream) => {
+      if (err) reject(err);
+      else resolve(stream);
+    });
+  });
+}
+
+/** Persistent jump-host tunnel cache.
+ *  Maintains a single connection chain to the jump hosts. Target connections
+ *  are multiplexed via forwardOut channels — only 1 SSH handshake with the
+ *  jump host regardless of how many targets connect in parallel.
+ *  If the tunnel dies, close/error events invalidate the cache and the next
+ *  getLastHop() call rebuilds it automatically. */
+class JumpTunnelCache {
+  private chain: Client[] = [];
+  private configHash = '';
+  private connecting: Promise<Client> | null = null;
+
+  async getLastHop(jumpHosts: JumpHost[]): Promise<Client> {
+    const hash = jumpHosts.map(h => `${h.username}@${h.host}:${h.port}`).join(',');
+
+    if (hash === this.configHash && this.chain.length > 0) {
+      return this.chain[this.chain.length - 1];
+    }
+
+    if (!this.connecting) {
+      this.connecting = this.buildChain(jumpHosts, hash).finally(() => {
+        this.connecting = null;
+      });
+    }
+
+    return this.connecting;
+  }
+
+  private async buildChain(jumpHosts: JumpHost[], hash: string): Promise<Client> {
+    this.close();
+
+    const firstCfg = buildJumpHostConfig(jumpHosts[0]);
+    const firstClient = await connectClientAsync(firstCfg);
+    this.chain.push(firstClient);
+    firstClient.on('close', () => this.invalidate());
+    firstClient.on('error', () => this.invalidate());
+
+    let current = firstClient;
+    for (let i = 1; i < jumpHosts.length; i++) {
+      const hop = jumpHosts[i];
+      const sock = await forwardOutAsync(current, hop.host, hop.port);
+      const next = await connectClientAsync({ ...buildJumpHostConfig(hop), sock });
+      this.chain.push(next);
+      next.on('close', () => this.invalidate());
+      next.on('error', () => this.invalidate());
+      current = next;
+    }
+
+    this.configHash = hash;
+    console.log(`[ssh-runner] Jump host tunnel established: ${jumpHosts.map(h => `${h.username}@${h.host}:${h.port}`).join(' → ')}`);
+    return current;
+  }
+
+  private invalidate() { this.configHash = ''; }
+
+  close() {
+    for (const c of [...this.chain].reverse()) { try { c.end(); } catch { /* noop */ } }
+    this.chain = [];
+    this.configHash = '';
+  }
+}
+
+const jumpTunnelCache = new JumpTunnelCache();
+
+/** Connect to the target machine through a persistent jump host tunnel.
+ *  The tunnel is shared — target-side failures do NOT destroy it. */
+export async function connectThroughJumpHosts(
+  machine: MachineRecord,
+  jumpHosts: JumpHost[],
+  signal?: AbortSignal,
+): Promise<TunneledConnection> {
+  if (signal?.aborted) throw new Error('Aborted');
+
+  let lastHop: Client;
+  try {
+    lastHop = await jumpTunnelCache.getLastHop(jumpHosts);
+  } catch (err) {
+    throw new Error(`Jump host connect failed: ${(err as Error).message}`);
+  }
+  if (signal?.aborted) throw new Error('Aborted');
+
+  let targetSock: any;
+  try {
+    targetSock = await forwardOutAsync(lastHop, machine.ip, machine.port);
+  } catch (err) {
+    throw new Error(`Jump host forwardOut to ${machine.ip}:${machine.port} failed: ${(err as Error).message}`);
+  }
+
+  try {
+    const targetCfg = { ...buildConnectConfig(machine), sock: targetSock };
+    const targetClient = await connectClientAsync(targetCfg);
+    return {
+      client: targetClient,
+      cleanup: () => { try { targetClient.end(); } catch { /* noop */ } },
+    };
+  } catch (err) {
+    throw new Error(`Target SSH handshake via tunnel failed: ${(err as Error).message}`);
+  }
+}
+
+/** Test the full jump host chain connectivity (without a target machine).
+ *  Connects through each hop and runs `echo ok && hostname` on the last hop. */
+export async function testJumpHostChain(jumpHosts: JumpHost[]): Promise<string> {
+  if (jumpHosts.length === 0) return 'No jump hosts configured';
+
+  const allClients: Client[] = [];
+  const cleanup = () => { for (const c of allClients) { try { c.end(); } catch { /* noop */ } } };
+
+  try {
+    const firstCfg = buildJumpHostConfig(jumpHosts[0]);
+    const firstClient = await connectClientAsync(firstCfg);
+    allClients.push(firstClient);
+
+    let currentClient = firstClient;
+    for (let i = 1; i < jumpHosts.length; i++) {
+      const nextHop = jumpHosts[i];
+      const sock = await forwardOutAsync(currentClient, nextHop.host, nextHop.port);
+      const nextCfg = { ...buildJumpHostConfig(nextHop), sock };
+      const nextClient = await connectClientAsync(nextCfg);
+      allClients.push(nextClient);
+      currentClient = nextClient;
+    }
+
+    // Run test command on the last hop
+    const output = await new Promise<string>((resolve, reject) => {
+      const timeout = setTimeout(() => { cleanup(); reject(new Error('Test timed out after 30s')); }, 30_000);
+      currentClient.exec('echo ok && hostname', (err, stream) => {
+        if (err) { clearTimeout(timeout); cleanup(); reject(err); return; }
+        let out = '';
+        stream.on('data', (d: Buffer) => { out += d.toString(); });
+        stream.stderr.on('data', (d: Buffer) => { out += d.toString(); });
+        stream.on('close', () => { clearTimeout(timeout); cleanup(); resolve(out.trim()); });
+      });
+    });
+    return output;
+  } catch (err) {
+    cleanup();
+    throw err;
+  }
 }
 
 /** Returns true if an SSH connect-phase error is worth retrying. We retry
@@ -79,11 +273,16 @@ function connectOnce(machine: MachineRecord): Promise<Client> {
   });
 }
 
-/** Connect with exponential backoff + jitter for transient handshake failures. */
+/** Connect with exponential backoff + jitter for transient handshake failures.
+ *  Returns a TunneledConnection — call cleanup() instead of client.end(). */
 export async function connectWithRetry(
   machine: MachineRecord,
   signal?: AbortSignal,
-): Promise<Client> {
+): Promise<TunneledConnection> {
+  // Check if jump hosts are enabled
+  const jhCfg = jumpHostStore.getConfig();
+  const useJumpHosts = jhCfg.enabled && jhCfg.hosts.length > 0;
+
   const maxAttempts = Math.max(1, config.sshConnectRetries + 1);
   let lastErr: Error = new Error('SSH connect failed');
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -95,7 +294,11 @@ export async function connectWithRetry(
       if (signal?.aborted) throw new Error('Aborted');
     }
     try {
-      return await connectOnce(machine);
+      if (useJumpHosts) {
+        return await connectThroughJumpHosts(machine, jhCfg.hosts, signal);
+      }
+      const client = await connectOnce(machine);
+      return { client, cleanup: () => { try { client.end(); } catch { /* noop */ } } };
     } catch (err) {
       lastErr = err as Error;
       if (!isRetryableConnectError(lastErr)) throw lastErr;
@@ -106,27 +309,85 @@ export async function connectWithRetry(
 
 /** Test SSH connectivity — runs `echo ok && hostname` and returns the output. */
 export async function testSshConnection(machine: MachineRecord): Promise<string> {
-  const conn = await connectWithRetry(machine);
+  const { client: conn, cleanup } = await connectWithRetry(machine);
   return new Promise((resolve, reject) => {
     // 120s — sshd may be congested if the machine is busy with parallel jobs
     // (e.g. claude auto-compacting a conversation, which can take 60-90s).
     const timeout = setTimeout(() => {
-      conn.end();
+      cleanup();
       reject(new Error('SSH command timed out after 120s'));
     }, 120_000);
 
     conn.exec('echo ok && hostname', (err, stream) => {
-      if (err) { clearTimeout(timeout); conn.end(); reject(err); return; }
+      if (err) { clearTimeout(timeout); cleanup(); reject(err); return; }
       let output = '';
       stream.on('data', (data: Buffer) => { output += data.toString(); });
       stream.stderr.on('data', (data: Buffer) => { output += data.toString(); });
       stream.on('close', () => {
         clearTimeout(timeout);
-        conn.end();
+        cleanup();
         resolve(output.trim());
       });
     });
   });
+}
+
+/**
+ * Read the context window size (input tokens) from the Claude session JSONL
+ * on the remote machine. Finds the file by session ID under ~/.claude/projects/
+ * using `find`, then sums `input_tokens` + `cache_creation_input_tokens` +
+ * `cache_read_input_tokens` from the last usage line. This gives the true
+ * context window size — `input_tokens` alone is near-zero when caching is active.
+ *
+ * Returns undefined if the file doesn't exist or the value can't be read.
+ */
+export async function getRemoteContextTokens(
+  machine: MachineRecord,
+  workdir: string,
+  claudeSessionId: string,
+  signal?: AbortSignal,
+): Promise<number | undefined> {
+  if (!claudeSessionId) return undefined;
+
+  // Find the session JSONL by ID — avoids guessing Claude's directory encoding.
+  const fileName = `${shellEscape(claudeSessionId + '.jsonl')}`;
+  const cmd = `f=$(find ~/.claude/projects -name ${fileName} 2>/dev/null | head -1) && [ -n "$f" ] && grep '"cache_read_input_tokens"' "$f" | tail -1 | grep -oE '"(input_tokens|cache_creation_input_tokens|cache_read_input_tokens)":[0-9]+' | grep -o '[0-9]*' | awk '{s+=$1} END {print s}'`;
+
+  try {
+    const { client: conn, cleanup } = await connectWithRetry(machine, signal);
+    return new Promise<number | undefined>((resolve) => {
+      const timeout = setTimeout(() => {
+        console.warn(`[ssh-runner] getRemoteContextTokens timed out for ${claudeSessionId.slice(0, 8)}`);
+        cleanup();
+        resolve(undefined);
+      }, 15_000);
+
+      conn.exec(cmd, (err, stream) => {
+        if (err) {
+          console.warn(`[ssh-runner] getRemoteContextTokens exec error: ${err.message}`);
+          clearTimeout(timeout); cleanup(); resolve(undefined); return;
+        }
+        let output = '';
+        let stderr = '';
+        stream.on('data', (data: Buffer) => { output += data.toString(); });
+        stream.stderr.on('data', (data: Buffer) => { stderr += data.toString(); });
+        stream.on('close', (code: number | null) => {
+          clearTimeout(timeout);
+          cleanup();
+          const tokens = parseInt(output.trim(), 10);
+          if (Number.isFinite(tokens) && tokens > 0) {
+            resolve(tokens);
+          } else {
+            console.warn(`[ssh-runner] getRemoteContextTokens: no result (exit=${code}, output=${JSON.stringify(output.trim())}, stderr=${JSON.stringify(stderr.trim())}, session=${claudeSessionId.slice(0, 8)})`);
+            resolve(undefined);
+          }
+        });
+      });
+    });
+  } catch (err) {
+    console.warn(`[ssh-runner] getRemoteContextTokens connect error: ${(err as Error).message}`);
+    return undefined;
+  }
 }
 
 /** Determine the claude CLI invocation for a machine based on detected runtimes. */
@@ -189,9 +450,9 @@ export async function runClaudeOverSsh(
   const command = cmdParts.join(' && ') + `; rm -f ${shellEscape(tmpFile)}`;
 
   console.log(`[ssh-runner] Connecting to ${machine.username}@${machine.ip}:${machine.port}`);
-  console.log(`[ssh-runner] Command: ${claudeBin} ... (prompt ${prompt.length} chars via SFTP temp file)`);
+  console.log(`[ssh-runner] Command: ${claudeBin}${model ? ` --model ${model}` : ''}${resumeId ? ' --resume' : ''} (prompt ${prompt.length} chars via SFTP temp file)`);
 
-  const conn = await connectWithRetry(machine, signal);
+  const { client: conn, cleanup } = await connectWithRetry(machine, signal);
 
   // Write prompt to remote temp file via SFTP (binary-safe, no shell involved)
   await new Promise<void>((resolve, reject) => {
@@ -208,7 +469,7 @@ export async function runClaudeOverSsh(
     const settle = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
 
     conn.on('error', (err) => {
-      settle(() => { try { conn.end(); } catch { /* noop */ } reject(err); });
+      settle(() => { cleanup(); reject(err); });
     });
 
     // PTY is needed for line-buffered streaming output (without PTY, stdout
@@ -218,10 +479,11 @@ export async function runClaudeOverSsh(
     // Since the prompt is delivered via a temp file (not stdin), PTY is
     // always safe — no stdin data to mangle via line discipline.
     conn.exec(command, { pty: true }, (err, stream) => {
-      if (err) { settle(() => { conn.end(); reject(err); }); return; }
+      if (err) { settle(() => { cleanup(); reject(err); }); return; }
 
       let buffer = '';
       let claudeSessionId: string | undefined;
+      let inputTokens: number | undefined;
 
       // ── Idle timeout: reset on every stdout/stderr data event ────────
       // If no output arrives for `sshIdleTimeoutMs`, we consider the
@@ -235,7 +497,7 @@ export async function runClaudeOverSsh(
       stream.on('error', (streamErr: Error) => {
         console.error(`[ssh-runner] stream error: ${streamErr.message}`);
         if (idleTimer) clearTimeout(idleTimer);
-        settle(() => { try { conn.end(); } catch { /* noop */ } reject(streamErr); });
+        settle(() => { cleanup(); reject(streamErr); });
       });
       const resetIdleTimer = () => {
         if (idleMs <= 0) return;
@@ -261,6 +523,21 @@ export async function runClaudeOverSsh(
             if (typeof p.session_id === 'string') {
               claudeSessionId = p.session_id;
             }
+            // Extract input_tokens — top-level on result events
+            if (typeof p.input_tokens === 'number') {
+              inputTokens = p.input_tokens;
+            }
+            // Also check stream_event → message_start → message.usage.input_tokens
+            if (p.type === 'stream_event') {
+              const evt = p.event as Record<string, unknown> | undefined;
+              if (evt?.type === 'message_start') {
+                const msg = evt.message as Record<string, unknown> | undefined;
+                const usage = msg?.usage as Record<string, unknown> | undefined;
+                if (typeof usage?.input_tokens === 'number') {
+                  inputTokens = usage.input_tokens as number;
+                }
+              }
+            }
             onChunk(parsed);
           }
         }
@@ -281,12 +558,13 @@ export async function runClaudeOverSsh(
           if (parsed !== null) {
             const p = parsed as Record<string, unknown>;
             if (typeof p.session_id === 'string') claudeSessionId = p.session_id;
+            if (typeof p.input_tokens === 'number') inputTokens = p.input_tokens;
             onChunk(parsed);
           }
         }
         const durationMs = Date.now() - startedAt;
-        console.log(`[ssh-runner] Exited with code ${code} after ${durationMs}ms${claudeSessionId ? ` session=${claudeSessionId}` : ''}`);
-        settle(() => { conn.end(); resolve({ exitCode: code ?? 0, durationMs, claudeSessionId }); });
+        console.log(`[ssh-runner] Exited with code ${code} after ${durationMs}ms${claudeSessionId ? ` session=${claudeSessionId}` : ''}${inputTokens ? ` tokens=${inputTokens}` : ''}`);
+        settle(() => { cleanup(); resolve({ exitCode: code ?? 0, durationMs, claudeSessionId, inputTokens }); });
       });
 
       // Abort support — send SIGTERM equivalent via signal() on the SSH channel

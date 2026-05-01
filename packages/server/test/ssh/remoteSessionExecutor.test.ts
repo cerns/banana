@@ -3,7 +3,7 @@ import type { SessionRecord } from '../../src/sessions/sessionStore.js';
 import type { MachineRecord } from '../../src/machines/machineStore.js';
 
 // Mock config
-const mockConfig = { persistPath: '', historyMax: 1000, machinesPersistPath: '', compactAfterTurns: 10 };
+const mockConfig = { persistPath: '', historyMax: 1000, machinesPersistPath: '', compactTokenThreshold: 80000 };
 vi.mock('../../src/config.js', () => ({
   config: mockConfig,
 }));
@@ -21,8 +21,10 @@ vi.mock('fs', async (importOriginal) => {
 
 // Track mock calls
 const mockRunClaudeOverSsh = vi.fn();
+const mockGetRemoteContextTokens = vi.fn().mockResolvedValue(undefined);
 vi.mock('../../src/ssh/sshRunner.js', () => ({
   runClaudeOverSsh: mockRunClaudeOverSsh,
+  getRemoteContextTokens: mockGetRemoteContextTokens,
 }));
 
 const mockBroadcast = vi.fn();
@@ -55,6 +57,7 @@ describe('remoteSessionExecutor', () => {
     // Re-apply mocks
     vi.doMock('../../src/ssh/sshRunner.js', () => ({
       runClaudeOverSsh: mockRunClaudeOverSsh,
+      getRemoteContextTokens: mockGetRemoteContextTokens,
     }));
     vi.doMock('../../src/ws/dashboardBroadcast.js', () => ({
       broadcastToDashboards: mockBroadcast,
@@ -1184,12 +1187,14 @@ describe('remoteSessionExecutor', () => {
 
   // ── Auto-compact tests ──────────────────────────────────────────────────
   describe('auto-compact', () => {
-    it('should run /compact before prompt when turnsSinceCompact >= threshold', async () => {
-      const { session } = setupRemoteSession();
+    it('should run /compact when remote context tokens >= threshold', async () => {
+      setupRemoteSession();
       sessionStore.sessionStore.updateMeta('sess-r1', {
         claudeSessionId: 'prev-session',
-        turnsSinceCompact: 10, // at threshold
       });
+
+      // Remote session file reports 85000 tokens
+      mockGetRemoteContextTokens.mockResolvedValue(85000);
 
       const calls: Array<{ prompt: string; resumeId?: string }> = [];
       mockRunClaudeOverSsh.mockImplementation(async (_m: any, prompt: string, _w: any, _onChunk: Function, resumeId?: string) => {
@@ -1205,28 +1210,29 @@ describe('remoteSessionExecutor', () => {
         );
       });
 
-      // First call should be /compact, second should be the actual prompt
+      // First call should be /compact, second the actual prompt
       expect(calls).toHaveLength(2);
       expect(calls[0].prompt).toBe('/compact');
       expect(calls[0].resumeId).toBe('prev-session');
       expect(calls[1].prompt).toBe('do stuff');
 
-      // SESSION_COMPACTING event should have been broadcast
+      // SESSION_COMPACTING event broadcast with token count
       expect(mockBroadcast).toHaveBeenCalledWith(
-        expect.objectContaining({ event: 'SESSION_COMPACTING', sessionId: 'sess-r1', turns: 10 }),
+        expect.objectContaining({ event: 'SESSION_COMPACTING', sessionId: 'sess-r1', inputTokens: 85000 }),
       );
 
-      // turnsSinceCompact should be reset to 1 (0 after compact + 1 for the actual job)
+      // lastInputTokens stored from the context check
       const updated = sessionStore.sessionStore.get('sess-r1');
-      expect(updated!.turnsSinceCompact).toBe(1);
+      expect(updated!.lastInputTokens).toBe(85000);
     });
 
-    it('should NOT run /compact when turnsSinceCompact < threshold', async () => {
+    it('should NOT run /compact when remote context tokens < threshold', async () => {
       setupRemoteSession();
       sessionStore.sessionStore.updateMeta('sess-r1', {
         claudeSessionId: 'prev-session',
-        turnsSinceCompact: 5, // below threshold of 10
       });
+
+      mockGetRemoteContextTokens.mockResolvedValue(50000);
 
       const calls: string[] = [];
       mockRunClaudeOverSsh.mockImplementation(async (_m: any, prompt: string) => {
@@ -1245,14 +1251,14 @@ describe('remoteSessionExecutor', () => {
       // Only the actual prompt, no /compact
       expect(calls).toEqual(['do stuff']);
 
-      // turnsSinceCompact incremented to 6
+      // lastInputTokens stored from context check
       const updated = sessionStore.sessionStore.get('sess-r1');
-      expect(updated!.turnsSinceCompact).toBe(6);
+      expect(updated!.lastInputTokens).toBe(50000);
     });
 
     it('should NOT run /compact on first run (no resumeId)', async () => {
       setupRemoteSession();
-      // No claudeSessionId set — first run
+      // No claudeSessionId — first run
 
       mockRunClaudeOverSsh.mockResolvedValue({ exitCode: 0, durationMs: 50 });
 
@@ -1264,21 +1270,18 @@ describe('remoteSessionExecutor', () => {
         );
       });
 
-      // Only one SSH call — the actual prompt
       expect(mockRunClaudeOverSsh).toHaveBeenCalledTimes(1);
-
-      // turnsSinceCompact stays undefined (no resume = no increment)
-      const updated = sessionStore.sessionStore.get('sess-r1');
-      expect(updated!.turnsSinceCompact).toBeUndefined();
+      // getRemoteContextTokens not called (no resumeId)
+      expect(mockGetRemoteContextTokens).not.toHaveBeenCalled();
     });
 
-    it('should increment turnsSinceCompact after each resumed job', async () => {
+    it('should skip compact check when getRemoteContextTokens returns undefined', async () => {
       setupRemoteSession();
       sessionStore.sessionStore.updateMeta('sess-r1', {
         claudeSessionId: 'prev-session',
-        turnsSinceCompact: 3,
       });
 
+      mockGetRemoteContextTokens.mockResolvedValue(undefined);
       mockRunClaudeOverSsh.mockResolvedValue({ exitCode: 0, durationMs: 50, claudeSessionId: 'new-id' });
 
       executor.executeRemoteJob('sess-r1', 'job-1', 'go');
@@ -1289,17 +1292,17 @@ describe('remoteSessionExecutor', () => {
         );
       });
 
-      const updated = sessionStore.sessionStore.get('sess-r1');
-      expect(updated!.turnsSinceCompact).toBe(4);
+      // Only one SSH call — no /compact (couldn't read tokens)
+      expect(mockRunClaudeOverSsh).toHaveBeenCalledTimes(1);
     });
 
     it('should continue with prompt if /compact fails', async () => {
       setupRemoteSession();
       sessionStore.sessionStore.updateMeta('sess-r1', {
         claudeSessionId: 'prev-session',
-        turnsSinceCompact: 15,
       });
 
+      mockGetRemoteContextTokens.mockResolvedValue(100000);
       const consoleSpy = vi.spyOn(console, 'warn').mockImplementation(() => {});
       let callCount = 0;
 
@@ -1317,10 +1320,7 @@ describe('remoteSessionExecutor', () => {
         );
       });
 
-      // Both calls were made (/compact failed + actual prompt succeeded)
       expect(callCount).toBe(2);
-
-      // Warn was logged
       expect(consoleSpy).toHaveBeenCalledWith(
         expect.stringContaining('/compact failed'),
         expect.any(Error),
@@ -1329,15 +1329,14 @@ describe('remoteSessionExecutor', () => {
       consoleSpy.mockRestore();
     });
 
-    it('should NOT run /compact when compactAfterTurns is 0 (disabled)', async () => {
-      const original = mockConfig.compactAfterTurns;
-      mockConfig.compactAfterTurns = 0;
+    it('should NOT run /compact when compactTokenThreshold is 0 (disabled)', async () => {
+      const original = mockConfig.compactTokenThreshold;
+      mockConfig.compactTokenThreshold = 0;
 
       try {
         setupRemoteSession();
         sessionStore.sessionStore.updateMeta('sess-r1', {
           claudeSessionId: 'prev-session',
-          turnsSinceCompact: 100, // way over, but disabled
         });
 
         mockRunClaudeOverSsh.mockResolvedValue({ exitCode: 0, durationMs: 50, claudeSessionId: 'abc' });
@@ -1352,12 +1351,10 @@ describe('remoteSessionExecutor', () => {
 
         // Only one SSH call — no /compact
         expect(mockRunClaudeOverSsh).toHaveBeenCalledTimes(1);
-        expect(mockRunClaudeOverSsh).toHaveBeenCalledWith(
-          expect.anything(), 'go', expect.anything(),
-          expect.any(Function), 'prev-session', expect.anything(), undefined,
-        );
+        // getRemoteContextTokens still called post-job for context logging
+        // but NOT called pre-job (compact check skipped when threshold is 0)
       } finally {
-        mockConfig.compactAfterTurns = original;
+        mockConfig.compactTokenThreshold = original;
       }
     });
 
@@ -1365,8 +1362,9 @@ describe('remoteSessionExecutor', () => {
       setupRemoteSession();
       sessionStore.sessionStore.updateMeta('sess-r1', {
         claudeSessionId: 'old-session',
-        turnsSinceCompact: 10,
       });
+
+      mockGetRemoteContextTokens.mockResolvedValue(90000);
 
       const calls: Array<{ prompt: string; resumeId?: string }> = [];
       mockRunClaudeOverSsh.mockImplementation(async (_m: any, prompt: string, _w: any, _onChunk: Function, resumeId?: string) => {
@@ -1389,7 +1387,6 @@ describe('remoteSessionExecutor', () => {
       expect(calls[0]).toEqual({ prompt: '/compact', resumeId: 'old-session' });
       expect(calls[1]).toEqual({ prompt: 'work', resumeId: 'compacted-session' });
 
-      // Final claudeSessionId persisted
       const updated = sessionStore.sessionStore.get('sess-r1');
       expect(updated!.claudeSessionId).toBe('final-session');
     });

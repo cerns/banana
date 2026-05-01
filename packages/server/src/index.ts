@@ -11,12 +11,14 @@ import { onAnyJobComplete } from './ssh/remoteSessionExecutor.js';
 import { processQueue, drainGlobalQueue, extractTextFromChunks, postHubMessage } from './hub/hubRouter.js';
 import { parseReplyToChannel, stripReplyToChannel, extractArtifactActions, parseReplyRouting, extractChannelReply } from './hub/channelArtifactExtractor.js';
 import { broadcastToDashboards } from './ws/dashboardBroadcast.js';
+import { jumpHostStore } from './ssh/jumpHostStore.js';
 
 sessionStore.load();
 machineStore.load();
 hubStore.load();
 taskStore.load();
 docStore.load();
+jumpHostStore.load();
 pushManager.init();
 
 // After ANY job completes (ad-hoc or hub-dispatched), drain hub queues

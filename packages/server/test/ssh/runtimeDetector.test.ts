@@ -4,7 +4,13 @@ import type { MachineRecord } from '../../src/machines/machineStore.js';
 
 // Mock config
 vi.mock('../../src/config.js', () => ({
-  config: { machinesPersistPath: '' },
+  config: {
+    machinesPersistPath: '',
+    sshReadyTimeoutMs: 30_000,
+    sshKeepaliveCountMax: 60,
+    sshConnectRetries: 0,
+    jumpHostPersistPath: '',
+  },
 }));
 
 // Mock fs for key file reading
@@ -45,6 +51,11 @@ vi.mock('ssh2', () => ({
     return mockClientInstance;
   }),
 }));
+
+// Drain microtask queue so connectWithRetry → conn.exec() settles
+async function flush() {
+  for (let i = 0; i < 10; i++) await Promise.resolve();
+}
 
 function makeMachine(overrides: Partial<MachineRecord> = {}): MachineRecord {
   return {
@@ -266,6 +277,7 @@ describe('runtimeDetector', () => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
+      await flush();
 
       stream.emit('data', Buffer.from('---node---\n/usr/bin/node\nv20.0.0\n---bun---\nnot-found\n---claude---\n/usr/bin/claude\n'));
       stream.emit('close');
@@ -294,6 +306,7 @@ describe('runtimeDetector', () => {
         cb(new Error('exec failed'));
       });
       mockClientInstance.emit('ready');
+      await flush();
 
       await expect(promise).rejects.toThrow('exec failed');
     });
@@ -307,6 +320,7 @@ describe('runtimeDetector', () => {
         cb(null, stream);
       });
       mockClientInstance.emit('ready');
+      await flush();
 
       stream.stderr.emit('data', Buffer.from('warning: something'));
       stream.emit('data', Buffer.from('---node---\n/usr/bin/node\nv20.0.0\n---bun---\nnot-found\n---claude---\nnot-found\n'));

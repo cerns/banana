@@ -9,7 +9,7 @@ const mockConfig = {
   hubPersistPath: '', hubMaxChainDepth: 5, hubMaxConcurrentJobs: 3, hubCooldownMs: 0,
   tasksPersistPath: '', docsPersistPath: '',
   taskContextMax: 8, docContextMax: 5, docRevisionMax: 20,
-  compactAfterTurns: 10, hubMaxTalkRounds: 10, sshIdleTimeoutMs: 1800000,
+  compactTokenThreshold: 80000, hubMaxTalkRounds: 10, sshIdleTimeoutMs: 1800000,
 };
 vi.mock('../../src/config.js', () => ({
   config: mockConfig,
@@ -49,8 +49,24 @@ vi.mock('../../src/ssh/remoteSessionExecutor.js', () => ({
 }));
 
 const mockTestSshConnection = vi.fn();
+const mockTestJumpHostChain = vi.fn();
 vi.mock('../../src/ssh/sshRunner.js', () => ({
   testSshConnection: mockTestSshConnection,
+  testJumpHostChain: mockTestJumpHostChain,
+}));
+
+const mockJumpHostStore = {
+  getConfig: vi.fn().mockReturnValue({ enabled: false, hosts: [] }),
+  getRedactedConfig: vi.fn().mockReturnValue({ enabled: false, hosts: [] }),
+  setConfig: vi.fn(),
+  setEnabled: vi.fn(),
+  addHost: vi.fn(),
+  updateHost: vi.fn().mockReturnValue(true),
+  removeHost: vi.fn().mockReturnValue(true),
+  reorderHosts: vi.fn(),
+};
+vi.mock('../../src/ssh/jumpHostStore.js', () => ({
+  jumpHostStore: mockJumpHostStore,
 }));
 
 const mockDetectRuntimes = vi.fn();
@@ -124,6 +140,10 @@ describe('apiRouter', () => {
     }));
     vi.doMock('../../src/ssh/sshRunner.js', () => ({
       testSshConnection: mockTestSshConnection,
+      testJumpHostChain: mockTestJumpHostChain,
+    }));
+    vi.doMock('../../src/ssh/jumpHostStore.js', () => ({
+      jumpHostStore: mockJumpHostStore,
     }));
     vi.doMock('../../src/ssh/runtimeDetector.js', () => ({
       detectRuntimes: mockDetectRuntimes,
@@ -1384,7 +1404,7 @@ describe('apiRouter', () => {
       const res = createRes();
       await handleApiRequest(req, res);
       expect(res._status).toBe(200);
-      expect(res._body.compactAfterTurns).toBe(10);
+      expect(res._body.compactTokenThreshold).toBe(80000);
       expect(res._body.hubMaxConcurrentJobs).toBe(3);
       expect(res._body.hubCooldownMs).toBe(0);
       expect(res._body.hubMaxTalkRounds).toBe(10);
@@ -1393,23 +1413,23 @@ describe('apiRouter', () => {
     });
 
     it('PATCH /api/settings should update settings', async () => {
-      const req = createReq('PATCH', '/api/settings', { compactAfterTurns: 20 });
+      const req = createReq('PATCH', '/api/settings', { compactTokenThreshold: 50000 });
       const res = createRes();
       await handleApiRequest(req, res);
       expect(res._status).toBe(200);
-      expect(res._body.compactAfterTurns).toBe(20);
-      expect(mockConfig.compactAfterTurns).toBe(20);
+      expect(res._body.compactTokenThreshold).toBe(50000);
+      expect(mockConfig.compactTokenThreshold).toBe(50000);
       // restore
-      mockConfig.compactAfterTurns = 10;
+      mockConfig.compactTokenThreshold = 80000;
     });
 
     it('PATCH /api/settings should ignore invalid values', async () => {
-      const original = mockConfig.compactAfterTurns;
-      const req = createReq('PATCH', '/api/settings', { compactAfterTurns: -5 });
+      const original = mockConfig.compactTokenThreshold;
+      const req = createReq('PATCH', '/api/settings', { compactTokenThreshold: -5 });
       const res = createRes();
       await handleApiRequest(req, res);
       expect(res._status).toBe(200);
-      expect(mockConfig.compactAfterTurns).toBe(original);
+      expect(mockConfig.compactTokenThreshold).toBe(original);
     });
 
     it('PATCH /api/settings should ignore unknown keys', async () => {
@@ -1417,6 +1437,132 @@ describe('apiRouter', () => {
       const res = createRes();
       await handleApiRequest(req, res);
       expect(res._status).toBe(200);
+    });
+  });
+
+  // ── Jump hosts ────────────────────────────────────────────────────────
+  describe('Jump hosts', () => {
+    it('GET /api/jumphosts should return redacted config', async () => {
+      mockJumpHostStore.getRedactedConfig.mockReturnValue({ enabled: true, hosts: [{ id: 'h1', host: '10.0.0.1', port: 22, username: 'root', hasPassword: true, hasPassphrase: false }] });
+      const req = createReq('GET', '/api/jumphosts');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(res._body.enabled).toBe(true);
+      expect(res._body.hosts).toHaveLength(1);
+    });
+
+    it('PUT /api/jumphosts should replace config', async () => {
+      mockJumpHostStore.getRedactedConfig.mockReturnValue({ enabled: true, hosts: [] });
+      const req = createReq('PUT', '/api/jumphosts', { enabled: true, hosts: [] });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(mockJumpHostStore.setConfig).toHaveBeenCalled();
+    });
+
+    it('PATCH /api/jumphosts/enabled should toggle', async () => {
+      mockJumpHostStore.getConfig.mockReturnValue({ enabled: true, hosts: [] });
+      const req = createReq('PATCH', '/api/jumphosts/enabled', { enabled: true });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(mockJumpHostStore.setEnabled).toHaveBeenCalledWith(true);
+    });
+
+    it('POST /api/jumphosts/hosts should add host', async () => {
+      mockJumpHostStore.getRedactedConfig.mockReturnValue({ enabled: false, hosts: [{ id: 'new', host: '1.2.3.4', port: 22, username: 'root' }] });
+      const req = createReq('POST', '/api/jumphosts/hosts', { host: '1.2.3.4', username: 'root' });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(201);
+      expect(mockJumpHostStore.addHost).toHaveBeenCalled();
+    });
+
+    it('POST /api/jumphosts/hosts should 400 without required fields', async () => {
+      const req = createReq('POST', '/api/jumphosts/hosts', { host: '1.2.3.4' });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(400);
+    });
+
+    it('PUT /api/jumphosts/hosts/:id should update host', async () => {
+      mockJumpHostStore.getRedactedConfig.mockReturnValue({ enabled: false, hosts: [] });
+      const req = createReq('PUT', '/api/jumphosts/hosts/h1', { username: 'admin' });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(mockJumpHostStore.updateHost).toHaveBeenCalledWith('h1', expect.objectContaining({ username: 'admin' }));
+    });
+
+    it('PUT /api/jumphosts/hosts/:id should 404 for unknown host', async () => {
+      mockJumpHostStore.updateHost.mockReturnValueOnce(false);
+      const req = createReq('PUT', '/api/jumphosts/hosts/nope', { username: 'admin' });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(404);
+    });
+
+    it('DELETE /api/jumphosts/hosts/:id should remove host', async () => {
+      mockJumpHostStore.getRedactedConfig.mockReturnValue({ enabled: false, hosts: [] });
+      const req = createReq('DELETE', '/api/jumphosts/hosts/h1');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(mockJumpHostStore.removeHost).toHaveBeenCalledWith('h1');
+    });
+
+    it('DELETE /api/jumphosts/hosts/:id should 404 for unknown', async () => {
+      mockJumpHostStore.removeHost.mockReturnValueOnce(false);
+      const req = createReq('DELETE', '/api/jumphosts/hosts/nope');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(404);
+    });
+
+    it('PUT /api/jumphosts/reorder should reorder hosts', async () => {
+      mockJumpHostStore.getRedactedConfig.mockReturnValue({ enabled: false, hosts: [] });
+      const req = createReq('PUT', '/api/jumphosts/reorder', { ids: ['b', 'a'] });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(mockJumpHostStore.reorderHosts).toHaveBeenCalledWith(['b', 'a']);
+    });
+
+    it('PUT /api/jumphosts/reorder should 400 without ids', async () => {
+      const req = createReq('PUT', '/api/jumphosts/reorder', {});
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(400);
+    });
+
+    it('POST /api/jumphosts/test should test chain', async () => {
+      mockJumpHostStore.getConfig.mockReturnValue({ enabled: true, hosts: [{ id: 'h1', host: '10.0.0.1', port: 22, username: 'root' }] });
+      mockTestJumpHostChain.mockResolvedValue('ok\nbastion-1');
+      const req = createReq('POST', '/api/jumphosts/test');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(res._body.ok).toBe(true);
+      expect(res._body.output).toContain('ok');
+    });
+
+    it('POST /api/jumphosts/test should 400 when no hosts', async () => {
+      mockJumpHostStore.getConfig.mockReturnValue({ enabled: false, hosts: [] });
+      const req = createReq('POST', '/api/jumphosts/test');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(400);
+    });
+
+    it('POST /api/jumphosts/test should 422 on failure', async () => {
+      mockJumpHostStore.getConfig.mockReturnValue({ enabled: true, hosts: [{ id: 'h1', host: '10.0.0.1', port: 22, username: 'root' }] });
+      mockTestJumpHostChain.mockRejectedValue(new Error('Connection refused'));
+      const req = createReq('POST', '/api/jumphosts/test');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(422);
+      expect(res._body.ok).toBe(false);
     });
   });
 });

@@ -285,6 +285,10 @@ function handleEvent(msg) {
     // Real-time badge: at least 1 job running
     refreshJobsBadge();
     updateSessionSpinner(sessionId);
+    // Refresh jobs modal if open so running jobs appear immediately
+    if (document.getElementById('jobs-modal').style.display !== 'none') {
+      debouncedLoadActiveJobs();
+    }
     return;
   }
 
@@ -1052,7 +1056,7 @@ document.getElementById('ns-create').addEventListener('click', async () => {
 
 // ── Running Jobs Modal ────────────────────────────────────────────────────────
 let jobsRefreshTimer = null;
-let jobsSourceFilter = 'all'; // 'all' | 'adhoc' | 'hub' | 'trigger' | 'self-trigger' | 'talking'
+let jobsSourceFilter = 'all'; // 'all' | 'adhoc' | 'hub-all'
 
 document.getElementById('jobs-btn').addEventListener('click', () => {
   loadActiveJobs();
@@ -1085,6 +1089,13 @@ function fmtElapsed(ms) {
   return m + 'm ' + (s % 60) + 's';
 }
 
+const HUB_SOURCES = new Set(['hub', 'trigger', 'self-trigger', 'talking']);
+function filterJobsBySource(allJobs) {
+  if (jobsSourceFilter === 'all') return allJobs;
+  if (jobsSourceFilter === 'hub-all') return allJobs.filter(j => HUB_SOURCES.has(j.source || ''));
+  return allJobs.filter(j => (j.source || 'adhoc') === jobsSourceFilter);
+}
+
 function sourceBadge(source) {
   const s = source || 'adhoc';
   const labels = { adhoc: 'Ad-hoc', hub: 'Hub', trigger: 'Trigger', 'self-trigger': 'Self-trigger', talking: 'Talking' };
@@ -1096,7 +1107,7 @@ async function loadActiveJobs() {
   const el = document.getElementById('jobs-list');
   if (!Array.isArray(allJobs)) { el.innerHTML = ''; return; }
   updateJobsBadge(allJobs.length);
-  const jobs = jobsSourceFilter === 'all' ? allJobs : allJobs.filter(j => (j.source || 'adhoc') === jobsSourceFilter);
+  const jobs = filterJobsBySource(allJobs);
   if (jobs.length === 0) {
     el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:20px">No running jobs</div>';
     return;
@@ -1143,6 +1154,16 @@ function updateJobsBadge(count) {
   }
 }
 
+/** Debounced active-jobs refresh — called on OUTPUT_CHUNK when modal is open. */
+let _activeJobsRefreshTimer = null;
+function debouncedLoadActiveJobs() {
+  if (_activeJobsRefreshTimer) return;
+  _activeJobsRefreshTimer = setTimeout(() => {
+    _activeJobsRefreshTimer = null;
+    loadActiveJobs();
+  }, 500);
+}
+
 /** Debounced badge refresh via API — called on every WS job event. */
 let _badgeRefreshTimer = null;
 function refreshJobsBadge() {
@@ -1165,7 +1186,7 @@ async function loadRecentJobs() {
       el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:10px;font-size:12px">No recent jobs</div>';
       return;
     }
-    const jobs = jobsSourceFilter === 'all' ? allJobs : allJobs.filter(j => (j.source || 'adhoc') === jobsSourceFilter);
+    const jobs = filterJobsBySource(allJobs);
     if (jobs.length === 0) {
       el.innerHTML = '<div style="color:var(--muted);text-align:center;padding:10px;font-size:12px">No recent jobs</div>';
       return;
@@ -1253,7 +1274,7 @@ setInterval(async () => {
 document.getElementById('settings-btn').addEventListener('click', async () => {
   try {
     const settings = await apiFetch('/api/settings');
-    document.getElementById('set-compact-turns').value = settings.compactAfterTurns ?? 10;
+    document.getElementById('set-compact-tokens').value = settings.compactTokenThreshold ?? 80000;
     document.getElementById('set-hub-concurrent').value = settings.hubMaxConcurrentJobs ?? 10;
     document.getElementById('set-hub-cooldown').value = settings.hubCooldownMs ?? 10000;
     document.getElementById('set-hub-talk-rounds').value = settings.hubMaxTalkRounds ?? 10;
@@ -1263,12 +1284,23 @@ document.getElementById('settings-btn').addEventListener('click', async () => {
   } catch (e) {
     document.getElementById('set-status').textContent = 'Failed to load settings';
   }
+  // Load jump host config
+  try {
+    const jhCfg = await apiFetch('/api/jumphosts');
+    document.getElementById('jh-enabled').checked = jhCfg.enabled;
+    renderJumpHosts(jhCfg.hosts);
+    renderJumpChainPreview(jhCfg.hosts, jhCfg.enabled);
+  } catch (e) {
+    renderJumpHosts([]);
+  }
+  document.getElementById('jh-form').style.display = 'none';
+  document.getElementById('jh-test-status').textContent = '';
   openModal('settings-modal');
 });
 
 document.getElementById('set-save').addEventListener('click', async () => {
   const body = {
-    compactAfterTurns: Number(document.getElementById('set-compact-turns').value),
+    compactTokenThreshold: Number(document.getElementById('set-compact-tokens').value),
     hubMaxConcurrentJobs: Number(document.getElementById('set-hub-concurrent').value),
     hubCooldownMs: Number(document.getElementById('set-hub-cooldown').value),
     hubMaxTalkRounds: Number(document.getElementById('set-hub-talk-rounds').value),
@@ -1283,6 +1315,142 @@ document.getElementById('set-save').addEventListener('click', async () => {
   } catch (e) {
     document.getElementById('set-status').textContent = 'Save failed: ' + e;
     document.getElementById('set-status').style.color = 'var(--red)';
+  }
+});
+
+// ── Jump Hosts UI ─────────────────────────────────────────────────────────────
+let _jhHosts = []; // cached list from server
+
+function renderJumpHosts(hosts) {
+  _jhHosts = hosts;
+  const list = document.getElementById('jh-host-list');
+  if (!hosts.length) {
+    list.innerHTML = '<div style="color:var(--muted);font-size:11px;padding:4px 0">No jump hosts configured</div>';
+    return;
+  }
+  list.innerHTML = hosts.map((h, i) => `<div style="display:flex;align-items:center;gap:6px;padding:4px 0;border-bottom:1px solid var(--border);font-size:12px" data-id="${esc(h.id)}">
+    <span style="color:var(--muted);min-width:16px">${i + 1}.</span>
+    <span style="flex:1">${esc(h.label || '')} <span style="color:var(--accent)">${esc(h.username)}@${esc(h.host)}:${h.port}</span></span>
+    ${i > 0 ? `<button class="btn btn-sm jh-up" data-id="${esc(h.id)}" title="Move up" style="padding:0 4px;font-size:10px">&#9650;</button>` : ''}
+    ${i < hosts.length - 1 ? `<button class="btn btn-sm jh-down" data-id="${esc(h.id)}" title="Move down" style="padding:0 4px;font-size:10px">&#9660;</button>` : ''}
+    <button class="btn btn-sm jh-edit" data-id="${esc(h.id)}" style="padding:0 6px;font-size:10px">Edit</button>
+    <button class="btn btn-sm jh-del" data-id="${esc(h.id)}" style="padding:0 6px;font-size:10px;color:var(--red)">&#10005;</button>
+  </div>`).join('');
+
+  // Bind events
+  list.querySelectorAll('.jh-del').forEach(btn => btn.addEventListener('click', async () => {
+    const id = btn.dataset.id;
+    const cfg = await apiFetch(`/api/jumphosts/hosts/${id}`, { method: 'DELETE' });
+    renderJumpHosts(cfg.hosts);
+    renderJumpChainPreview(cfg.hosts, cfg.enabled);
+  }));
+  list.querySelectorAll('.jh-edit').forEach(btn => btn.addEventListener('click', () => {
+    const id = btn.dataset.id;
+    const h = _jhHosts.find(x => x.id === id);
+    if (!h) return;
+    showJhForm(h);
+  }));
+  list.querySelectorAll('.jh-up').forEach(btn => btn.addEventListener('click', async () => {
+    const id = btn.dataset.id;
+    const ids = _jhHosts.map(h => h.id);
+    const idx = ids.indexOf(id);
+    if (idx <= 0) return;
+    [ids[idx - 1], ids[idx]] = [ids[idx], ids[idx - 1]];
+    const cfg = await apiFetch('/api/jumphosts/reorder', { method: 'PUT', body: JSON.stringify({ ids }) });
+    renderJumpHosts(cfg.hosts);
+    renderJumpChainPreview(cfg.hosts, cfg.enabled);
+  }));
+  list.querySelectorAll('.jh-down').forEach(btn => btn.addEventListener('click', async () => {
+    const id = btn.dataset.id;
+    const ids = _jhHosts.map(h => h.id);
+    const idx = ids.indexOf(id);
+    if (idx < 0 || idx >= ids.length - 1) return;
+    [ids[idx], ids[idx + 1]] = [ids[idx + 1], ids[idx]];
+    const cfg = await apiFetch('/api/jumphosts/reorder', { method: 'PUT', body: JSON.stringify({ ids }) });
+    renderJumpHosts(cfg.hosts);
+    renderJumpChainPreview(cfg.hosts, cfg.enabled);
+  }));
+}
+
+function renderJumpChainPreview(hosts, enabled) {
+  const el = document.getElementById('jh-chain-preview');
+  if (!hosts.length) { el.style.display = 'none'; return; }
+  const chain = ['You'].concat(hosts.map(h => `${h.username}@${h.host}`)).concat(['[target]']);
+  el.textContent = (enabled ? '' : '(disabled) ') + chain.join(' \u2192 ');
+  el.style.display = 'block';
+  el.style.color = enabled ? 'var(--green)' : 'var(--muted)';
+}
+
+function showJhForm(existing) {
+  const form = document.getElementById('jh-form');
+  form.style.display = 'block';
+  document.getElementById('jh-edit-id').value = existing ? existing.id : '';
+  document.getElementById('jh-label').value = existing ? (existing.label || '') : '';
+  document.getElementById('jh-host').value = existing ? existing.host : '';
+  document.getElementById('jh-port').value = existing ? existing.port : 22;
+  document.getElementById('jh-username').value = existing ? existing.username : '';
+  document.getElementById('jh-sshkey').value = existing ? (existing.sshKeyPath || '') : '';
+  document.getElementById('jh-password').value = '';
+  document.getElementById('jh-passphrase').value = '';
+}
+
+document.getElementById('jh-add-btn').addEventListener('click', () => showJhForm(null));
+document.getElementById('jh-form-cancel').addEventListener('click', () => {
+  document.getElementById('jh-form').style.display = 'none';
+});
+
+document.getElementById('jh-form-save').addEventListener('click', async () => {
+  const editId = document.getElementById('jh-edit-id').value;
+  const data = {
+    label: document.getElementById('jh-label').value.trim(),
+    host: document.getElementById('jh-host').value.trim(),
+    port: Number(document.getElementById('jh-port').value) || 22,
+    username: document.getElementById('jh-username').value.trim(),
+    sshKeyPath: document.getElementById('jh-sshkey').value.trim() || undefined,
+    password: document.getElementById('jh-password').value || undefined,
+    passphrase: document.getElementById('jh-passphrase').value || undefined,
+  };
+  if (!data.host || !data.username) { alert('Host and username required'); return; }
+  try {
+    let cfg;
+    if (editId) {
+      cfg = await apiFetch(`/api/jumphosts/hosts/${editId}`, { method: 'PUT', body: JSON.stringify(data) });
+    } else {
+      cfg = await apiFetch('/api/jumphosts/hosts', { method: 'POST', body: JSON.stringify(data) });
+    }
+    renderJumpHosts(cfg.hosts);
+    renderJumpChainPreview(cfg.hosts, cfg.enabled);
+    document.getElementById('jh-form').style.display = 'none';
+  } catch (e) {
+    alert('Save failed: ' + e);
+  }
+});
+
+document.getElementById('jh-enabled').addEventListener('change', async (e) => {
+  try {
+    await apiFetch('/api/jumphosts/enabled', { method: 'PATCH', body: JSON.stringify({ enabled: e.target.checked }) });
+    renderJumpChainPreview(_jhHosts, e.target.checked);
+  } catch (err) {
+    e.target.checked = !e.target.checked; // revert
+  }
+});
+
+document.getElementById('jh-test-btn').addEventListener('click', async () => {
+  const status = document.getElementById('jh-test-status');
+  status.textContent = 'Testing chain...';
+  status.style.color = 'var(--muted)';
+  try {
+    const result = await apiFetch('/api/jumphosts/test', { method: 'POST' });
+    if (result.ok) {
+      status.textContent = 'Chain OK: ' + (result.output || '');
+      status.style.color = 'var(--green)';
+    } else {
+      status.textContent = 'Chain failed: ' + (result.error || '');
+      status.style.color = 'var(--red)';
+    }
+  } catch (e) {
+    status.textContent = 'Test failed: ' + e;
+    status.style.color = 'var(--red)';
   }
 });
 
