@@ -243,11 +243,20 @@ describe('apiRouter', () => {
       expect(res._body.id).toBeDefined();
     });
 
-    it('POST /api/machines should reject missing fields', async () => {
-      const req = createReq('POST', '/api/machines', { name: 'test' });
+    it('POST /api/machines should reject missing name', async () => {
+      const req = createReq('POST', '/api/machines', { ip: '1.2.3.4' });
       const res = createRes();
       await handleApiRequest(req, res);
       expect(res._status).toBe(400);
+    });
+
+    it('POST /api/machines should allow empty ip/username (local machine)', async () => {
+      const req = createReq('POST', '/api/machines', { name: 'local' });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(201);
+      expect(res._body.ip).toBe('');
+      expect(res._body.username).toBe('');
     });
 
     it('POST /api/machines should validate port range', async () => {

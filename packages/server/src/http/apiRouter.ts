@@ -271,8 +271,8 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
   // POST /api/machines — create new machine
   if (method === 'POST' && pathname === '/api/machines') {
     const body = await readBody(req) as Partial<import('../machines/machineStore.js').MachineRecord>;
-    if (!body.name || !body.ip || !body.username) {
-      json(res, 400, { error: 'name, ip, and username are required' });
+    if (!body.name) {
+      json(res, 400, { error: 'name is required' });
       return true;
     }
     const port = body.port ?? 22;
@@ -286,9 +286,9 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       id,
       name: body.name,
       alias: body.alias ?? body.name,
-      ip: body.ip,
+      ip: body.ip ?? '',
       port,
-      username: body.username,
+      username: body.username ?? '',
       password: body.password,
       sshKeyPath: body.sshKeyPath,
       passphrase: body.passphrase,

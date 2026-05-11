@@ -980,8 +980,8 @@ document.getElementById('mf-save').addEventListener('click', async () => {
   const pp = document.getElementById('mf-passphrase').value;
   if (pp) body.passphrase = pp;
 
-  if (!body.name || !body.ip || !body.username) {
-    document.getElementById('mf-status').textContent = 'Name, Host, and Username are required';
+  if (!body.name) {
+    document.getElementById('mf-status').textContent = 'Name is required';
     return;
   }
 
