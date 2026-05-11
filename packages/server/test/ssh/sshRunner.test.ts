@@ -15,7 +15,8 @@ vi.mock('../../src/config.js', () => ({
   config: mockConfig,
 }));
 
-// Mock fs for key file reading
+// Mock fs for key file reading + local temp file writes
+const mockWriteFile = vi.fn().mockResolvedValue(undefined);
 vi.mock('fs', async (importOriginal) => {
   const actual = await importOriginal<typeof import('fs')>();
   return {
@@ -25,12 +26,37 @@ vi.mock('fs', async (importOriginal) => {
       readFileSync: vi.fn().mockReturnValue(Buffer.from('fake-key-data')),
       writeFileSync: vi.fn(),
       mkdirSync: vi.fn(),
+      promises: {
+        ...(actual.promises || {}),
+        writeFile: mockWriteFile,
+      },
     },
     readFileSync: vi.fn().mockReturnValue(Buffer.from('fake-key-data')),
     writeFileSync: vi.fn(),
     mkdirSync: vi.fn(),
   };
 });
+
+// ── Mock child_process for local execution tests ──────────────────────
+function createMockChildProcess() {
+  const child = new EventEmitter() as any;
+  child.stdout = new EventEmitter();
+  child.stderr = new EventEmitter();
+  child.kill = vi.fn();
+  child.pid = 12345;
+  return child;
+}
+
+let mockChildProcess: any;
+const mockSpawn = vi.fn().mockImplementation(() => {
+  mockChildProcess = createMockChildProcess();
+  return mockChildProcess;
+});
+const mockExecCb = vi.fn();
+vi.mock('child_process', () => ({
+  spawn: mockSpawn,
+  exec: mockExecCb,
+}));
 
 // Create mock stream and client
 function createMockStream() {
@@ -770,6 +796,331 @@ describe('sshRunner', () => {
       // Command prefix traps SIGHUP so claude survives PTY disconnections
       expect(execArgs[0]).toContain("trap '' HUP");
       consoleSpy.mockRestore();
+    });
+  });
+
+  describe('isLocalMachine', () => {
+    it('should return true for empty ip', () => {
+      expect(sshRunner.isLocalMachine(makeMachine({ ip: '' }))).toBe(true);
+    });
+
+    it('should return true for undefined ip', () => {
+      expect(sshRunner.isLocalMachine(makeMachine({ ip: undefined as any }))).toBe(true);
+    });
+
+    it('should return true for whitespace-only ip', () => {
+      expect(sshRunner.isLocalMachine(makeMachine({ ip: '   ' }))).toBe(true);
+    });
+
+    it('should return true for localhost', () => {
+      expect(sshRunner.isLocalMachine(makeMachine({ ip: 'localhost' }))).toBe(true);
+    });
+
+    it('should return true for LOCALHOST (case-insensitive)', () => {
+      expect(sshRunner.isLocalMachine(makeMachine({ ip: 'LOCALHOST' }))).toBe(true);
+    });
+
+    it('should return true for 127.0.0.1', () => {
+      expect(sshRunner.isLocalMachine(makeMachine({ ip: '127.0.0.1' }))).toBe(true);
+    });
+
+    it('should return true for padded localhost', () => {
+      expect(sshRunner.isLocalMachine(makeMachine({ ip: ' localhost ' }))).toBe(true);
+    });
+
+    it('should return false for a real IP', () => {
+      expect(sshRunner.isLocalMachine(makeMachine({ ip: '192.168.1.1' }))).toBe(false);
+    });
+
+    it('should return false for a hostname', () => {
+      expect(sshRunner.isLocalMachine(makeMachine({ ip: 'myserver.example.com' }))).toBe(false);
+    });
+  });
+
+  describe('runClaudeOverSsh (local execution)', () => {
+    it('should spawn locally when machine IP is empty', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const chunks: unknown[] = [];
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '/work', c => chunks.push(c));
+
+      await flush();
+
+      // spawn should have been called with sh -c
+      expect(mockSpawn).toHaveBeenCalledWith('sh', ['-c', expect.any(String)], expect.objectContaining({
+        cwd: '/work',
+        stdio: ['ignore', 'pipe', 'pipe'],
+      }));
+
+      // Emit JSON output via child stdout
+      mockChildProcess.stdout.emit('data', Buffer.from('{"type":"assistant","message":"hi"}\n'));
+      mockChildProcess.emit('close', 0);
+
+      const result = await promise;
+      expect(result.exitCode).toBe(0);
+      expect(result.durationMs).toBeGreaterThanOrEqual(0);
+      expect(chunks).toHaveLength(1);
+      // SSH mock should NOT have been called (no connect)
+      expect(mockClientInstance.connect).not.toHaveBeenCalled();
+      consoleSpy.mockRestore();
+    });
+
+    it('should spawn locally when machine IP is localhost', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: 'localhost' });
+      const promise = sshRunner.runClaudeOverSsh(machine, 'test', '/work', () => {});
+
+      await flush();
+      expect(mockSpawn).toHaveBeenCalled();
+      mockChildProcess.emit('close', 0);
+      await promise;
+      consoleSpy.mockRestore();
+    });
+
+    it('should spawn locally when machine IP is 127.0.0.1', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '127.0.0.1' });
+      const promise = sshRunner.runClaudeOverSsh(machine, 'test', '/work', () => {});
+
+      await flush();
+      expect(mockSpawn).toHaveBeenCalled();
+      mockChildProcess.emit('close', 0);
+      await promise;
+      consoleSpy.mockRestore();
+    });
+
+    it('should extract claudeSessionId from local output', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '', () => {});
+
+      await flush();
+      mockChildProcess.stdout.emit('data', Buffer.from('{"session_id":"local-sess-1","type":"system"}\n'));
+      mockChildProcess.emit('close', 0);
+
+      const result = await promise;
+      expect(result.claudeSessionId).toBe('local-sess-1');
+      consoleSpy.mockRestore();
+    });
+
+    it('should extract inputTokens from local stream_event', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '', () => {});
+
+      await flush();
+      const evt = JSON.stringify({
+        type: 'stream_event',
+        event: { type: 'message_start', message: { usage: { input_tokens: 42000 } } },
+      });
+      mockChildProcess.stdout.emit('data', Buffer.from(evt + '\n'));
+      mockChildProcess.emit('close', 0);
+
+      const result = await promise;
+      expect(result.inputTokens).toBe(42000);
+      consoleSpy.mockRestore();
+    });
+
+    it('should handle stderr from local process', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const stderrSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const chunks: any[] = [];
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '/work', c => chunks.push(c));
+
+      await flush();
+      mockChildProcess.stderr.emit('data', Buffer.from('some error'));
+      mockChildProcess.emit('close', 1);
+
+      const result = await promise;
+      expect(result.exitCode).toBe(1);
+      expect(chunks.some((c: any) => c.type === 'stderr' && c.text.includes('some error'))).toBe(true);
+      consoleSpy.mockRestore();
+      stderrSpy.mockRestore();
+    });
+
+    it('should abort local process via SIGTERM', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const controller = new AbortController();
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '/work', () => {}, undefined, controller.signal);
+
+      await flush();
+      controller.abort();
+      expect(mockChildProcess.kill).toHaveBeenCalledWith('SIGTERM');
+
+      mockChildProcess.emit('close', 137);
+      const result = await promise;
+      expect(result.exitCode).toBe(137);
+      consoleSpy.mockRestore();
+    });
+
+    it('should reject immediately if signal already aborted (local)', async () => {
+      const machine = makeMachine({ ip: '' });
+      const controller = new AbortController();
+      controller.abort();
+
+      await expect(
+        sshRunner.runClaudeOverSsh(machine, 'hello', '/work', () => {}, undefined, controller.signal),
+      ).rejects.toThrow('Aborted');
+    });
+
+    it('should write prompt to local temp file', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const promise = sshRunner.runClaudeOverSsh(machine, 'my prompt', '/work', () => {});
+
+      await flush();
+      // fs.promises.writeFile should have been called with the prompt
+      expect(mockWriteFile).toHaveBeenCalledWith(
+        expect.stringContaining('/tmp/banana-prompt-'),
+        'my prompt',
+        { mode: 0o600 },
+      );
+
+      mockChildProcess.emit('close', 0);
+      await promise;
+      consoleSpy.mockRestore();
+    });
+
+    it('should include --resume in local command when resumeId provided', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '/work', () => {}, 'resume-abc');
+
+      await flush();
+      const cmd = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1][1][1];
+      expect(cmd).toContain('--resume');
+      expect(cmd).toContain('resume-abc');
+
+      mockChildProcess.emit('close', 0);
+      await promise;
+      consoleSpy.mockRestore();
+    });
+
+    it('should include --model in local command when model provided', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '/work', () => {}, undefined, undefined, 'sonnet');
+
+      await flush();
+      const cmd = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1][1][1];
+      expect(cmd).toContain('--model');
+      expect(cmd).toContain('sonnet');
+
+      mockChildProcess.emit('close', 0);
+      await promise;
+      consoleSpy.mockRestore();
+    });
+
+    it('should flush buffer on close for local process', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const chunks: any[] = [];
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '', c => chunks.push(c));
+
+      await flush();
+      // Send data without trailing newline
+      mockChildProcess.stdout.emit('data', Buffer.from('{"type":"result","session_id":"local-flush"}'));
+      mockChildProcess.emit('close', 0);
+
+      const result = await promise;
+      expect(chunks).toHaveLength(1);
+      expect(result.claudeSessionId).toBe('local-flush');
+      consoleSpy.mockRestore();
+    });
+
+    it('should handle null exit code from local process', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '', () => {});
+
+      await flush();
+      mockChildProcess.emit('close', null);
+
+      const result = await promise;
+      expect(result.exitCode).toBe(0);
+      consoleSpy.mockRestore();
+    });
+
+    it('should reject on spawn error', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '/work', () => {});
+
+      await flush();
+      mockChildProcess.emit('error', new Error('spawn ENOENT'));
+
+      await expect(promise).rejects.toThrow('spawn ENOENT');
+      consoleSpy.mockRestore();
+    });
+
+    it('should skip invalid JSON lines in local output', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const chunks: unknown[] = [];
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '', c => chunks.push(c));
+
+      await flush();
+      mockChildProcess.stdout.emit('data', Buffer.from('not-json\n{"valid":true}\n\n'));
+      mockChildProcess.emit('close', 0);
+
+      await promise;
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toEqual({ valid: true });
+      consoleSpy.mockRestore();
+    });
+
+    it('should omit cd when workdir is empty', async () => {
+      const consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const machine = makeMachine({ ip: '' });
+      const promise = sshRunner.runClaudeOverSsh(machine, 'hello', '', () => {});
+
+      await flush();
+      const cmd = mockSpawn.mock.calls[mockSpawn.mock.calls.length - 1][1][1];
+      expect(cmd).not.toContain('cd ');
+
+      mockChildProcess.emit('close', 0);
+      await promise;
+      consoleSpy.mockRestore();
+    });
+  });
+
+  describe('testSshConnection (local)', () => {
+    it('should run locally when machine IP is empty', async () => {
+      // Mock child_process.exec for the promisified execAsync call
+      mockExecCb.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+        cb(null, 'ok\nlocal-host', '');
+      });
+
+      const machine = makeMachine({ ip: '' });
+      const result = await sshRunner.testSshConnection(machine);
+      expect(result).toBe('ok\nlocal-host');
+      expect(mockExecCb).toHaveBeenCalledWith(
+        'echo ok && hostname',
+        expect.objectContaining({ timeout: 120_000 }),
+        expect.any(Function),
+      );
+    });
+
+    it('should run locally when machine IP is localhost', async () => {
+      mockExecCb.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+        cb(null, 'ok\nmy-laptop', '');
+      });
+
+      const machine = makeMachine({ ip: 'localhost' });
+      const result = await sshRunner.testSshConnection(machine);
+      expect(result).toBe('ok\nmy-laptop');
+    });
+
+    it('should run locally when machine IP is 127.0.0.1', async () => {
+      mockExecCb.mockImplementation((_cmd: string, _opts: any, cb: Function) => {
+        cb(null, 'ok\nmy-machine', '');
+      });
+
+      const machine = makeMachine({ ip: '127.0.0.1' });
+      const result = await sshRunner.testSshConnection(machine);
+      expect(result).toBe('ok\nmy-machine');
     });
   });
 });

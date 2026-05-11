@@ -1,8 +1,26 @@
 import { Client } from 'ssh2';
 import fs from 'fs';
+import { spawn, exec as execCb } from 'child_process';
 import type { MachineRecord } from '../machines/machineStore.js';
 import { config } from '../config.js';
 import { jumpHostStore, type JumpHost } from './jumpHostStore.js';
+
+/** Manual exec wrapper — avoids util.promisify's custom symbol requirement for exec. */
+function execLocal(cmd: string, opts?: { timeout?: number }): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execCb(cmd, opts ?? {}, (err, stdout, stderr) => {
+      if (err) reject(err);
+      else resolve({ stdout: stdout as string, stderr: stderr as string });
+    });
+  });
+}
+
+/** Returns true if the machine should execute locally (empty/localhost/127.0.0.1). */
+export function isLocalMachine(machine: MachineRecord): boolean {
+  if (!machine.ip) return true;
+  const ip = machine.ip.trim().toLowerCase();
+  return ip === '' || ip === 'localhost' || ip === '127.0.0.1';
+}
 
 export interface SshRunResult {
   exitCode: number;
@@ -307,8 +325,14 @@ export async function connectWithRetry(
   throw lastErr;
 }
 
-/** Test SSH connectivity — runs `echo ok && hostname` and returns the output. */
+/** Test SSH connectivity — runs `echo ok && hostname` and returns the output.
+ *  For local machines (empty IP), runs the command locally via child_process. */
 export async function testSshConnection(machine: MachineRecord): Promise<string> {
+  if (isLocalMachine(machine)) {
+    const { stdout } = await execLocal('echo ok && hostname', { timeout: 120_000 });
+    return stdout.trim();
+  }
+
   const { client: conn, cleanup } = await connectWithRetry(machine);
   return new Promise((resolve, reject) => {
     // 120s — sshd may be congested if the machine is busy with parallel jobs
@@ -352,6 +376,19 @@ export async function getRemoteContextTokens(
   // Find the session JSONL by ID — avoids guessing Claude's directory encoding.
   const fileName = `${shellEscape(claudeSessionId + '.jsonl')}`;
   const cmd = `f=$(find ~/.claude/projects -name ${fileName} 2>/dev/null | head -1) && [ -n "$f" ] && grep '"cache_read_input_tokens"' "$f" | tail -1 | grep -oE '"(input_tokens|cache_creation_input_tokens|cache_read_input_tokens)":[0-9]+' | grep -o '[0-9]*' | awk '{s+=$1} END {print s}'`;
+
+  if (isLocalMachine(machine)) {
+    try {
+      const { stdout, stderr } = await execLocal(cmd, { timeout: 15_000 });
+      const tokens = parseInt(stdout.trim(), 10);
+      if (Number.isFinite(tokens) && tokens > 0) return tokens;
+      console.warn(`[ssh-runner] getRemoteContextTokens (local): no result (output=${JSON.stringify(stdout.trim())}, stderr=${JSON.stringify(stderr.trim())}, session=${claudeSessionId.slice(0, 8)})`);
+      return undefined;
+    } catch (err) {
+      console.warn(`[ssh-runner] getRemoteContextTokens (local) error: ${(err as Error).message}`);
+      return undefined;
+    }
+  }
 
   try {
     const { client: conn, cleanup } = await connectWithRetry(machine, signal);
@@ -400,7 +437,133 @@ function getClaudeBin(machine: MachineRecord): string {
   return 'claude';
 }
 
-/** Run Claude CLI over SSH, streaming output chunks. Supports abort via AbortSignal. */
+/** Run Claude CLI locally via child_process.spawn. Same streaming/parsing as SSH. */
+async function runClaudeLocally(
+  machine: MachineRecord,
+  prompt: string,
+  workdir: string,
+  onChunk: SshChunkCallback,
+  resumeId?: string,
+  signal?: AbortSignal,
+  model?: string,
+): Promise<SshRunResult> {
+  const startedAt = Date.now();
+  const claudeBin = getClaudeBin(machine);
+
+  const args = [
+    '--print',
+    '--output-format', 'stream-json',
+    '--verbose',
+    '--include-partial-messages',
+    '--dangerously-skip-permissions',
+  ];
+  if (model) args.push('--model', model);
+  if (resumeId) args.push('--resume', resumeId);
+
+  // Write prompt to a local temp file
+  const tmpFile = `/tmp/banana-prompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  await fs.promises.writeFile(tmpFile, prompt, { mode: 0o600 });
+
+  // Build shell command: cd + claude + stdin redirect + cleanup
+  const cmdParts: string[] = [];
+  if (workdir) cmdParts.push(`cd ${shellEscape(workdir)}`);
+  cmdParts.push(`${claudeBin} ${args.join(' ')} < ${shellEscape(tmpFile)}`);
+  const command = cmdParts.join(' && ') + `; rm -f ${shellEscape(tmpFile)}`;
+
+  console.log(`[ssh-runner] Running locally: ${claudeBin}${model ? ` --model ${model}` : ''}${resumeId ? ' --resume' : ''} (prompt ${prompt.length} chars)`);
+
+  return new Promise((resolve, reject) => {
+    const child = spawn('sh', ['-c', command], {
+      cwd: workdir || undefined,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+
+    let buffer = '';
+    let claudeSessionId: string | undefined;
+    let inputTokens: number | undefined;
+    let settled = false;
+    const settle = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+
+    // Idle timeout
+    let idleTimer: ReturnType<typeof setTimeout> | undefined;
+    const idleMs = config.sshIdleTimeoutMs;
+    const resetIdleTimer = () => {
+      if (idleMs <= 0) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        console.warn(`[ssh-runner] Idle timeout (${idleMs}ms no output) — killing local process`);
+        onChunk({ type: 'stderr', text: `[banana] idle timeout: no output for ${Math.round(idleMs / 1000)}s — terminating\n` });
+        child.kill('SIGTERM');
+      }, idleMs);
+    };
+    resetIdleTimer();
+
+    child.stdout.on('data', (data: Buffer) => {
+      resetIdleTimer();
+      buffer += data.toString();
+      const lines = buffer.split('\n');
+      buffer = lines.pop() ?? '';
+      for (const line of lines) {
+        const parsed = parseLine(line);
+        if (parsed !== null) {
+          const p = parsed as Record<string, unknown>;
+          if (typeof p.session_id === 'string') claudeSessionId = p.session_id;
+          if (typeof p.input_tokens === 'number') inputTokens = p.input_tokens;
+          if (p.type === 'stream_event') {
+            const evt = p.event as Record<string, unknown> | undefined;
+            if (evt?.type === 'message_start') {
+              const msg = evt.message as Record<string, unknown> | undefined;
+              const usage = msg?.usage as Record<string, unknown> | undefined;
+              if (typeof usage?.input_tokens === 'number') inputTokens = usage.input_tokens as number;
+            }
+          }
+          onChunk(parsed);
+        }
+      }
+    });
+
+    child.stderr.on('data', (data: Buffer) => {
+      resetIdleTimer();
+      const text = data.toString();
+      console.error(`[ssh-runner] stderr (local): ${text.trim()}`);
+      onChunk({ type: 'stderr', text });
+    });
+
+    child.on('error', (err) => {
+      if (idleTimer) clearTimeout(idleTimer);
+      settle(() => reject(err));
+    });
+
+    child.on('close', (code) => {
+      if (idleTimer) clearTimeout(idleTimer);
+      // Flush remaining buffer
+      if (buffer.trim()) {
+        const parsed = parseLine(buffer);
+        if (parsed !== null) {
+          const p = parsed as Record<string, unknown>;
+          if (typeof p.session_id === 'string') claudeSessionId = p.session_id;
+          if (typeof p.input_tokens === 'number') inputTokens = p.input_tokens;
+          onChunk(parsed);
+        }
+      }
+      const durationMs = Date.now() - startedAt;
+      console.log(`[ssh-runner] Local process exited with code ${code} after ${durationMs}ms${claudeSessionId ? ` session=${claudeSessionId}` : ''}${inputTokens ? ` tokens=${inputTokens}` : ''}`);
+      settle(() => resolve({ exitCode: code ?? 0, durationMs, claudeSessionId, inputTokens }));
+    });
+
+    // Abort support
+    const onAbort = () => {
+      if (idleTimer) clearTimeout(idleTimer);
+      console.log('[ssh-runner] Aborting local execution');
+      child.kill('SIGTERM');
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    child.on('close', () => signal?.removeEventListener('abort', onAbort));
+  });
+}
+
+/** Run Claude CLI over SSH, streaming output chunks. Supports abort via AbortSignal.
+ *  For local machines (empty IP), spawns claude locally via child_process. */
 export async function runClaudeOverSsh(
   machine: MachineRecord,
   prompt: string,
@@ -411,6 +574,10 @@ export async function runClaudeOverSsh(
   model?: string,
 ): Promise<SshRunResult> {
   if (signal?.aborted) throw new Error('Aborted');
+
+  if (isLocalMachine(machine)) {
+    return runClaudeLocally(machine, prompt, workdir, onChunk, resumeId, signal, model);
+  }
 
   const startedAt = Date.now();
   const claudeBin = getClaudeBin(machine);

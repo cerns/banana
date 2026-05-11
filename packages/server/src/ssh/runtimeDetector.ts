@@ -1,5 +1,15 @@
+import { exec as execCb } from 'child_process';
 import type { MachineRecord, RuntimeInfo, SystemInfo, NetworkInterface } from '../machines/machineStore.js';
-import { connectWithRetry } from './sshRunner.js';
+import { connectWithRetry, isLocalMachine } from './sshRunner.js';
+
+function execLocal(cmd: string, opts?: { timeout?: number }): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execCb(cmd, opts ?? {}, (err, stdout, stderr) => {
+      if (err) reject(err);
+      else resolve({ stdout: stdout as string, stderr: stderr as string });
+    });
+  });
+}
 
 export interface DetectionResult {
   runtimes: RuntimeInfo[];
@@ -130,6 +140,11 @@ export function parseDetectionOutput(raw: string): DetectionResult {
 }
 
 export async function detectRuntimes(machine: MachineRecord): Promise<DetectionResult> {
+  if (isLocalMachine(machine)) {
+    const { stdout } = await execLocal(DETECT_COMMAND, { timeout: 15_000 });
+    return parseDetectionOutput(stdout);
+  }
+
   const { client: conn, cleanup } = await connectWithRetry(machine);
   return new Promise((resolve, reject) => {
     const timeout = setTimeout(() => {

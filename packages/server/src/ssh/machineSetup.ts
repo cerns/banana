@@ -1,7 +1,17 @@
 import { Client } from 'ssh2';
+import { exec as execCb } from 'child_process';
 import type { MachineRecord } from '../machines/machineStore.js';
-import { connectWithRetry } from './sshRunner.js';
+import { connectWithRetry, isLocalMachine } from './sshRunner.js';
 import { parseDetectionOutput, DETECT_COMMAND, type DetectionResult } from './runtimeDetector.js';
+
+function execLocal(cmd: string, opts?: { timeout?: number }): Promise<{ stdout: string; stderr: string }> {
+  return new Promise((resolve, reject) => {
+    execCb(cmd, opts ?? {}, (err, stdout, stderr) => {
+      if (err) reject(err);
+      else resolve({ stdout: stdout as string, stderr: stderr as string });
+    });
+  });
+}
 
 export interface SetupStep {
   phase: 'bun' | 'claude' | 'detect';
@@ -32,6 +42,16 @@ export async function setupMachine(
   machine: MachineRecord,
   onStep: SetupStepCallback,
 ): Promise<DetectionResult> {
+  if (isLocalMachine(machine)) {
+    onStep({ phase: 'bun', status: 'skipped', message: 'Local machine — skipping SSH setup' });
+    onStep({ phase: 'claude', status: 'skipped', message: 'Local machine — skipping SSH setup' });
+    onStep({ phase: 'detect', status: 'running', message: 'Detecting local runtimes and system info...' });
+    const { stdout } = await execLocal(DETECT_COMMAND, { timeout: 15_000 });
+    const detection = parseDetectionOutput(stdout);
+    onStep({ phase: 'detect', status: 'done', message: `Found ${detection.runtimes.length} runtime(s)` });
+    return detection;
+  }
+
   const { client: conn, cleanup } = await connectWithRetry(machine);
   let timedOut = false;
   const timeout = setTimeout(() => {
