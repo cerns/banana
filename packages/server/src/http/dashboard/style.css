@@ -534,6 +534,60 @@ header h1 { font-size: 16px; color: var(--accent); }
   margin-top: 2px;
 }
 
+/* ── Channel group accordion ───────────────────────────────────────────────── */
+.channel-group {
+  border-bottom: 1px solid var(--border);
+}
+.channel-group-header {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--muted);
+  text-transform: uppercase;
+  letter-spacing: 0.3px;
+  user-select: none;
+  transition: background 0.1s;
+}
+.channel-group-header:hover {
+  background: var(--surface);
+  color: var(--text);
+}
+.channel-group.expanded > .channel-group-header {
+  color: var(--text);
+  background: rgba(88,166,255,0.05);
+}
+.channel-group-arrow {
+  font-size: 10px;
+  width: 10px;
+  flex-shrink: 0;
+  color: var(--muted);
+}
+.channel-group-name {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
+}
+.channel-group-count {
+  font-size: 10px;
+  color: var(--muted);
+  background: rgba(255,255,255,0.06);
+  padding: 1px 5px;
+  border-radius: 8px;
+  flex-shrink: 0;
+}
+.channel-group-body {
+  /* no extra padding — session-items already have their own */
+}
+.channel-group-body .session-item {
+  padding-left: 22px;
+}
+
 /* ── Hub panel ─────────────────────────────────────────────────────────────── */
 #hub-panel {
   flex: 1;

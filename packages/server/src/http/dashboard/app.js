@@ -397,24 +397,14 @@ function updateSessionSpinner(sessionId) {
   }
 }
 
-function renderSidebar() {
-  const items = Object.values(sessions).sort((a, b) => {
-    const nameA = (a.name || '').toLowerCase();
-    const nameB = (b.name || '').toLowerCase();
-    if (nameA && !nameB) return -1;
-    if (!nameA && nameB) return 1;
-    return nameA.localeCompare(nameB);
-  });
-  document.getElementById('session-count').textContent = items.length ? `(${items.length})` : '';
-  if (items.length === 0) {
-    sessionList.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:11px;">No sessions yet</div>';
-    return;
-  }
-  sessionList.innerHTML = items.map(s => {
-    const displayName = s.name || s.hostname || '?';
-    const hasUnread = unread[s.sessionId];
-    const running = isSessionRunning(s.sessionId);
-    return `
+// Track which channel group is expanded (null = none, string = channel name)
+let expandedChannelGroup = null;
+
+function renderSessionItem(s) {
+  const displayName = s.name || s.hostname || '?';
+  const hasUnread = unread[s.sessionId];
+  const running = isSessionRunning(s.sessionId);
+  return `
     <div class="session-item ${s.sessionId === activeSessionId ? 'active' : ''}" data-id="${s.sessionId}">
       <div class="session-top-row">
         <div class="session-name-row">
@@ -429,10 +419,113 @@ function renderSidebar() {
       ${s.name ? `<div class="session-host">${esc(s.hostname || '')}</div>` : ''}
       <div class="session-dir">${esc(s.workdir || s.remoteWorkdir || '')}</div>
     </div>`;
-  }).join('');
+}
+
+function renderSidebar() {
+  const items = Object.values(sessions).sort((a, b) => {
+    const nameA = (a.name || '').toLowerCase();
+    const nameB = (b.name || '').toLowerCase();
+    if (nameA && !nameB) return -1;
+    if (!nameA && nameB) return 1;
+    return nameA.localeCompare(nameB);
+  });
+  document.getElementById('session-count').textContent = items.length ? `(${items.length})` : '';
+  if (items.length === 0) {
+    sessionList.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:11px;">No sessions yet</div>';
+    return;
+  }
+
+  // Group sessions by channel — a session appears in each channel it subscribes to.
+  // Sessions with no channels go into "Ungrouped".
+  const groups = {};
+  const ungrouped = [];
+  for (const s of items) {
+    const channels = s.channels && s.channels.length > 0 ? s.channels : null;
+    if (!channels) {
+      ungrouped.push(s);
+    } else {
+      for (const ch of channels) {
+        if (!groups[ch]) groups[ch] = [];
+        groups[ch].push(s);
+      }
+    }
+  }
+
+  const channelNames = Object.keys(groups).sort();
+
+  // If no channels exist at all, render flat list (backward compat)
+  if (channelNames.length === 0) {
+    sessionList.innerHTML = items.map(renderSessionItem).join('');
+    _bindSidebarEvents();
+    return;
+  }
+
+  // Auto-expand: if active session is in a group, expand that group
+  if (activeSessionId && !expandedChannelGroup) {
+    const activeSession = sessions[activeSessionId];
+    if (activeSession?.channels?.length > 0) {
+      expandedChannelGroup = activeSession.channels[0];
+    }
+  }
+
+  let html = '';
+
+  for (const ch of channelNames) {
+    const sessionsInGroup = groups[ch];
+    const isExpanded = expandedChannelGroup === ch;
+    const runningCount = sessionsInGroup.filter(s => isSessionRunning(s.sessionId)).length;
+    const unreadCount = sessionsInGroup.filter(s => unread[s.sessionId]).length;
+
+    html += `<div class="channel-group${isExpanded ? ' expanded' : ''}" data-channel="${esc(ch)}">`;
+    html += `<div class="channel-group-header" data-channel-toggle="${esc(ch)}">`;
+    html += `<span class="channel-group-arrow">${isExpanded ? '▾' : '▸'}</span>`;
+    html += `<span class="channel-group-name">${esc(ch)}</span>`;
+    html += `<span class="channel-group-count">${sessionsInGroup.length}</span>`;
+    if (runningCount > 0) html += `<span class="session-spinner"></span>`;
+    if (unreadCount > 0) html += `<span class="unread-dot"></span>`;
+    html += `</div>`;
+    if (isExpanded) {
+      html += `<div class="channel-group-body">`;
+      html += sessionsInGroup.map(renderSessionItem).join('');
+      html += `</div>`;
+    }
+    html += `</div>`;
+  }
+
+  // Ungrouped sessions at the bottom
+  if (ungrouped.length > 0) {
+    const isExpanded = expandedChannelGroup === '__ungrouped__';
+    html += `<div class="channel-group${isExpanded ? ' expanded' : ''}" data-channel="__ungrouped__">`;
+    html += `<div class="channel-group-header" data-channel-toggle="__ungrouped__">`;
+    html += `<span class="channel-group-arrow">${isExpanded ? '▾' : '▸'}</span>`;
+    html += `<span class="channel-group-name" style="font-style:italic">Ungrouped</span>`;
+    html += `<span class="channel-group-count">${ungrouped.length}</span>`;
+    html += `</div>`;
+    if (isExpanded) {
+      html += `<div class="channel-group-body">`;
+      html += ungrouped.map(renderSessionItem).join('');
+      html += `</div>`;
+    }
+    html += `</div>`;
+  }
+
+  sessionList.innerHTML = html;
+
+  // Bind channel group toggle
+  sessionList.querySelectorAll('.channel-group-header').forEach(el => {
+    el.addEventListener('click', () => {
+      const ch = el.dataset.channelToggle;
+      expandedChannelGroup = expandedChannelGroup === ch ? null : ch;
+      renderSidebar();
+    });
+  });
+
+  _bindSidebarEvents();
+}
+
+function _bindSidebarEvents() {
   sessionList.querySelectorAll('.session-item').forEach(el => {
     el.addEventListener('click', (e) => {
-      // Don't select session when clicking edit button
       if (e.target.closest('.session-edit-btn')) return;
       selectSession(el.dataset.id);
     });
@@ -458,6 +551,12 @@ async function selectSession(id) {
   localStorage.setItem('banana_active_session', id);
   markRead(id);
   _lastRenderedJobKey = ''; // force full re-render on session switch
+
+  // Auto-expand the channel group containing the selected session
+  const sel = sessions[id];
+  if (sel?.channels?.length > 0) {
+    expandedChannelGroup = sel.channels[0];
+  }
 
   // 1. Restore from localStorage immediately — zero-latency render
   restoreOutputs(id);
