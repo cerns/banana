@@ -978,11 +978,55 @@ header h1 { font-size: 16px; color: var(--accent); }
   flex: 1;
   overflow-y: auto;
   padding: 16px;
+  font-size: 12px;
+  color: var(--text);
+}
+
+/* ── Markdown rendered body ────────────────────────────────────────────────── */
+.md-body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  font-size: 13px;
+  line-height: 1.6;
+}
+.md-body .md-h { margin: 16px 0 8px; color: var(--text); }
+.md-body h1.md-h { font-size: 20px; border-bottom: 1px solid var(--border); padding-bottom: 6px; }
+.md-body h2.md-h { font-size: 17px; border-bottom: 1px solid var(--border); padding-bottom: 4px; }
+.md-body h3.md-h { font-size: 15px; }
+.md-body h4.md-h, .md-body h5.md-h, .md-body h6.md-h { font-size: 13px; }
+.md-body .md-p { margin: 4px 0; }
+.md-body .md-code {
+  background: rgba(255,255,255,0.06);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+.md-body .md-codeblock {
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 10px 12px;
+  margin: 8px 0;
+  overflow-x: auto;
   font-family: var(--font-mono);
   font-size: 12px;
   white-space: pre-wrap;
-  color: var(--text);
 }
+.md-body .md-codeblock code { background: none; padding: 0; }
+.md-body .md-list { margin: 4px 0 4px 20px; padding: 0; }
+.md-body .md-list li { margin: 2px 0; }
+.md-body .md-hr { border: none; border-top: 1px solid var(--border); margin: 12px 0; }
+.md-body .md-bq {
+  border-left: 3px solid var(--accent);
+  padding: 4px 12px;
+  margin: 6px 0;
+  color: var(--muted);
+  background: rgba(255,255,255,0.02);
+}
+.md-body a { color: var(--blue); text-decoration: none; }
+.md-body a:hover { text-decoration: underline; }
+.md-body strong { color: var(--text); }
+.md-body del { color: var(--muted); }
 .doc-row {
   padding: 8px 10px;
   border-bottom: 1px solid var(--border);

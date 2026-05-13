@@ -2259,6 +2259,117 @@ function renderDocs() {
   }
 }
 
+// ── Markdown rendering toggle ─────────────────────────────────────────────
+let docRenderMd = (localStorage.getItem('banana_doc_md') ?? 'true') === 'true';
+
+/** Lightweight markdown → HTML. Handles headers, bold, italic, code, links, lists, hrs, blockquotes. */
+function renderMarkdown(src) {
+  // Escape HTML first, then apply markdown transformations
+  let html = esc(src);
+
+  // Code blocks (``` ... ```) — must be before inline transforms
+  html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (_m, _lang, code) =>
+    `<pre class="md-codeblock"><code>${code}</code></pre>`);
+
+  // Split into lines for block-level processing
+  const lines = html.split('\n');
+  const out = [];
+  let inList = false;
+  let listType = '';
+
+  for (let i = 0; i < lines.length; i++) {
+    let line = lines[i];
+
+    // Skip lines inside code blocks (already handled)
+    if (line.includes('<pre class="md-codeblock">')) {
+      // Collect until closing </pre>
+      let block = line;
+      while (!block.includes('</pre>') && i + 1 < lines.length) {
+        i++;
+        block += '\n' + lines[i];
+      }
+      if (inList) { out.push(`</${listType}>`); inList = false; }
+      out.push(block);
+      continue;
+    }
+
+    // HR
+    if (/^[-*_]{3,}\s*$/.test(line)) {
+      if (inList) { out.push(`</${listType}>`); inList = false; }
+      out.push('<hr class="md-hr"/>');
+      continue;
+    }
+
+    // Headers
+    const hMatch = line.match(/^(#{1,6})\s+(.+)/);
+    if (hMatch) {
+      if (inList) { out.push(`</${listType}>`); inList = false; }
+      const level = hMatch[1].length;
+      out.push(`<h${level} class="md-h">${applyInline(hMatch[2])}</h${level}>`);
+      continue;
+    }
+
+    // Blockquote
+    if (line.startsWith('&gt; ') || line === '&gt;') {
+      if (inList) { out.push(`</${listType}>`); inList = false; }
+      out.push(`<blockquote class="md-bq">${applyInline(line.replace(/^&gt;\s?/, ''))}</blockquote>`);
+      continue;
+    }
+
+    // Unordered list
+    const ulMatch = line.match(/^(\s*)[*\-+]\s+(.+)/);
+    if (ulMatch) {
+      if (!inList || listType !== 'ul') {
+        if (inList) out.push(`</${listType}>`);
+        out.push('<ul class="md-list">');
+        inList = true;
+        listType = 'ul';
+      }
+      out.push(`<li>${applyInline(ulMatch[2])}</li>`);
+      continue;
+    }
+
+    // Ordered list
+    const olMatch = line.match(/^(\s*)\d+\.\s+(.+)/);
+    if (olMatch) {
+      if (!inList || listType !== 'ol') {
+        if (inList) out.push(`</${listType}>`);
+        out.push('<ol class="md-list">');
+        inList = true;
+        listType = 'ol';
+      }
+      out.push(`<li>${applyInline(olMatch[2])}</li>`);
+      continue;
+    }
+
+    // Close list if not a list line
+    if (inList) { out.push(`</${listType}>`); inList = false; }
+
+    // Empty line → paragraph break
+    if (line.trim() === '') {
+      out.push('<br/>');
+      continue;
+    }
+
+    // Normal paragraph
+    out.push(`<p class="md-p">${applyInline(line)}</p>`);
+  }
+  if (inList) out.push(`</${listType}>`);
+  return out.join('\n');
+}
+
+/** Apply inline markdown: bold, italic, code, links, strikethrough. */
+function applyInline(text) {
+  return text
+    .replace(/`([^`]+)`/g, '<code class="md-code">$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/__([^_]+)__/g, '<strong>$1</strong>')
+    .replace(/\*([^*]+)\*/g, '<em>$1</em>')
+    .replace(/_([^_]+)_/g, '<em>$1</em>')
+    .replace(/~~([^~]+)~~/g, '<del>$1</del>')
+    .replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+}
+
 async function showDoc(docId) {
   currentDocId = docId;
   const doc = await apiFetch(`/api/hub/docs/${docId}`);
@@ -2267,19 +2378,29 @@ async function showDoc(docId) {
     ? `<span style="background:var(--red);color:#000;padding:1px 5px;border-radius:3px;font-size:10px;margin-left:6px">ARCHIVED</span>` : '';
   const restoreBtn = doc.archived
     ? `<button class="btn btn-sm" id="hub-doc-restore-btn" style="background:var(--green);color:#000">Restore</button>` : '';
+  const mdToggleLabel = docRenderMd ? 'Raw' : 'Rendered';
+  const bodyHtml = docRenderMd
+    ? `<div class="md-body">${renderMarkdown(doc.body)}</div>`
+    : `<pre style="white-space:pre-wrap;font-family:var(--font-mono);font-size:12px">${esc(doc.body)}</pre>`;
   bodyEl.innerHTML = `
     <div style="margin-bottom:12px">
       <div style="font-size:14px;font-weight:600">${esc(doc.title)}${archivedBadge}</div>
       <div style="font-size:11px;color:var(--muted)">${esc(doc.id)} · v${doc.version} · ${esc(doc.author)} · ${new Date(doc.updatedAt).toLocaleString()}</div>
       <div style="margin-top:6px;display:flex;gap:6px">
         <button class="btn btn-sm" id="hub-doc-edit-btn">Edit</button>
+        <button class="btn btn-sm" id="hub-doc-md-toggle" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">${mdToggleLabel}</button>
         <button class="btn btn-sm" id="hub-doc-history-btn" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">History (v${doc.version})</button>
         ${restoreBtn}
       </div>
     </div>
-    <pre style="white-space:pre-wrap;font-family:var(--font-mono);font-size:12px">${esc(doc.body)}</pre>
+    ${bodyHtml}
   `;
   document.getElementById('hub-doc-edit-btn').addEventListener('click', () => openDocModal(docId));
+  document.getElementById('hub-doc-md-toggle').addEventListener('click', () => {
+    docRenderMd = !docRenderMd;
+    localStorage.setItem('banana_doc_md', String(docRenderMd));
+    showDoc(docId);
+  });
   document.getElementById('hub-doc-history-btn').addEventListener('click', () => showDocHistory(docId));
   document.getElementById('hub-doc-restore-btn')?.addEventListener('click', async () => {
     await apiFetch(`/api/hub/docs/${docId}/restore`, { method: 'POST' });
