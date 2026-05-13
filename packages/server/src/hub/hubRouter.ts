@@ -418,10 +418,14 @@ Stop the loop by simply NOT including the marker in your next reply, or by
 replying with SKIP. There is a hard cap on continuation rounds — once it is
 reached, the loop is force-stopped and other agents may take over.
 
-Use this for: deep analysis, walking through edge cases out loud, narrating
-debugging, breaking a complex task into a sequence of monologue beats.
-Do NOT use it for: short acknowledgements, simple Q&A, or anything where you
-should hear from another agent before continuing.
+REQUIREMENT: [IM_TALKING] is ONLY valid if you are actively executing work
+with tool calls (Read, Edit, Write, Bash, Grep, Glob) in the current turn.
+Using [IM_TALKING] to narrate reasoning, extend status summaries, or plan
+without tool calls is treated as a SKIP. The marker means "I am doing work
+and need another turn to finish", NOT "I have more to say".
+
+Do NOT use it for: short acknowledgements, simple Q&A, status updates, or
+anything where you should hear from another agent before continuing.
 `;
 
 /** Hint added to non-triggered prompts so agents know they can self-trigger. */
@@ -464,6 +468,11 @@ If you cannot produce a real Plan with concrete steps and acceptance criteria,
 DO NOT include [BEGIN_WORK]. Just discuss in chat instead. The marker is a
 commitment to do real, verifiable work — not vibes.
 
+⚠️ PDCA WITHOUT [BEGIN_WORK] ⚠️
+If you write a PDCA but do NOT include [BEGIN_WORK], you MUST state in ONE
+sentence why you cannot execute and what blocks you. If you have no blocker,
+either include [BEGIN_WORK] or skip the PDCA entirely.
+
 ────────────────────────────────────────
 CHANNEL REPLY FORMAT: [CHANNEL_REPLY]
 ────────────────────────────────────────
@@ -475,18 +484,50 @@ If you omit the marker, your ENTIRE text output is posted (which may be very noi
 `;
 
 function buildGuidance(engagement: EngagementLevel): string {
-  const skipInstruction = [
-    'If the message is not actionable for you or you have nothing to add,',
-    'respond with a SKIP marker: [SKIP][#REASON] where REASON is one of:',
-    '  OUT_OF_DOMAIN — not related to your role',
-    '  NO_ACTION_NEEDED — nothing to add or do',
-    '  DUPLICATE — already addressed by another agent',
-    '  WAITING — blocked on something else',
-    'Example: [SKIP][#OUT_OF_DOMAIN]',
+  // ── GLOBAL RULES — apply to ALL engagement levels ───────────────────
+  const globalRules = [
+    '## GLOBAL RULES (always apply)',
+    '',
+    'RULE 1 — NON-EXECUTOR SILENCE: If you are NOT the assigned executor of the',
+    'current task, your only valid responses are [SKIP][#NO_ACTION_NEEDED] or a',
+    'single BLOCKING concern (one sentence). Status summaries, floor handoffs,',
+    'routing confirmations, and acknowledgements from non-executors are always SKIP.',
+    '',
+    'RULE 2 — NO ACKNOWLEDGEMENTS: NEVER post to acknowledge, confirm receipt, or',
+    'restate what another agent said. If your entire post would be "I understood X',
+    'and will do Y when Z", that is a SKIP. Choose ACT or SKIP. There is no middle ground.',
+    '',
+    'RULE 3 — PDCA REQUIRES ACTION: If you write a PDCA (Background/Plan/Check/Act)',
+    'but do NOT include [BEGIN_WORK], you MUST justify in ONE sentence why you cannot',
+    'execute and what the blocker is. If you cannot justify it, either include',
+    '[BEGIN_WORK] or skip the PDCA entirely. PDCA without [BEGIN_WORK] and without a',
+    'blocker justification is planning theatre and will be treated as a SKIP.',
+    '',
+    'RULE 4 — [IM_TALKING] REQUIRES TOOL USE: [IM_TALKING] is only valid if you are',
+    'actively executing work with tool calls (Read, Edit, Bash, etc.) in the loop.',
+    'Using [IM_TALKING] to narrate reasoning, extend status summaries, or plan',
+    'without tool calls will be treated as a SKIP.',
   ].join('\n');
+
+  const skipInstruction = [
+    '',
+    '## SKIP PROTOCOL',
+    'If the message is not actionable for you or you have nothing to add,',
+    'respond with ONLY a SKIP marker and nothing else:',
+    '  [SKIP][#REASON]',
+    'Valid reasons: OUT_OF_DOMAIN, NO_ACTION_NEEDED, DUPLICATE, WAITING.',
+    'You may add at most ONE sentence of explanation after the marker.',
+    'A SKIP response must contain ONLY the marker and optionally one sentence.',
+    'Do NOT wrap SKIP in paragraphs, status updates, or commentary.',
+    'Example: [SKIP][#NO_ACTION_NEEDED]',
+    'Example: [SKIP][#WAITING] Blocked on deploy completing.',
+  ].join('\n');
+
   switch (engagement) {
     case 'triggered':
       return [
+        globalRules,
+        '',
         '## ACTION REQUIRED — you have been EXPLICITLY TRIGGERED to start working on this task NOW.',
         '',
         'This is NOT a chat ping. Do not just discuss, plan, or summarize.',
@@ -513,13 +554,40 @@ function buildGuidance(engagement: EngagementLevel): string {
         'Do NOT respond with [SKIP]. Do NOT ask the user clarifying questions — make reasonable assumptions and proceed.',
       ].join('\n');
     case 'mentioned':
-      return `You were @mentioned directly. Respond to the question or request.\n${skipInstruction}${SELF_TRIGGER_HINT}`;
+      return [
+        globalRules,
+        '',
+        'You were @mentioned directly. Respond to the question or request.',
+        skipInstruction,
+      ].join('\n') + SELF_TRIGGER_HINT;
     case 'expert':
-      return `This message is in your area of expertise. Engage fully and provide substantive input from your role's perspective.\n${skipInstruction}${SELF_TRIGGER_HINT}`;
+      return [
+        globalRules,
+        '',
+        'This message is in your area of expertise. Engage fully and provide substantive input from your role\'s perspective.',
+        skipInstruction,
+      ].join('\n') + SELF_TRIGGER_HINT;
     case 'listen':
       return [
+        globalRules,
+        '',
+        '## LISTEN MODE — STRICT SILENCE POLICY',
         'You are in the war-room listening to a discussion outside your core specialty.',
-        'Only respond if you have a brief, concrete observation, concern, or suggestion from your role that others might miss (1-2 sentences max).',
+        'Respond ONLY if you have a BLOCKING concern that others will miss.',
+        'A blocking concern is something that will cause failure if not addressed NOW.',
+        '',
+        'If you have no blocking concern, respond with:',
+        '  [SKIP][#NO_ACTION_NEEDED]',
+        'and NOTHING else.',
+        '',
+        'The following are NEVER appropriate in listen mode:',
+        '  - Status updates or summaries',
+        '  - Acknowledgements ("understood", "noted", "I agree")',
+        '  - Floor handoffs ("floor stays with X")',
+        '  - Routing confirmations ("this should go to Y")',
+        '  - Observations that are nice-to-know but not blocking',
+        '',
+        'If you DO have a blocking concern, state it in ONE sentence maximum.',
         skipInstruction,
       ].join('\n') + SELF_TRIGGER_HINT;
   }
