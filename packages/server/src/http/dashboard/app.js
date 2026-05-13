@@ -2035,7 +2035,7 @@ async function openCompactionHistory(channelId) {
 
 // ── Tasks ────────────────────────────────────────────────────────────────
 // ── Task view mode: list vs board ─────────────────────────────────────────
-let taskViewMode = localStorage.getItem('banana_task_view') || 'list';
+let taskViewMode = localStorage.getItem('banana_task_view') || 'board';
 
 async function loadChannelTasks(channelId) {
   const params = new URLSearchParams();
