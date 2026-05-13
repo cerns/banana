@@ -111,14 +111,17 @@
               <option value="">All statuses</option>
               <option value="open">Open</option>
               <option value="in_progress">In progress</option>
+              <option value="qa_test">QA / Test</option>
               <option value="blocked">Blocked</option>
               <option value="done">Done</option>
               <option value="wontfix">Won't fix</option>
             </select>
             <input id="hub-task-search" placeholder="search bJira..." autocomplete="off" data-1p-ignore />
+            <button id="hub-task-view-toggle" class="btn btn-sm" title="Toggle list/board view">&#9638;</button>
             <button id="hub-new-task-btn" class="btn btn-sm">+ bJira</button>
           </div>
           <div id="hub-task-list"></div>
+          <div id="hub-task-board" style="display:none"></div>
         </div>
         <div id="hub-docs-view" style="display:none">
           <div class="hub-toolbar">
@@ -148,6 +151,7 @@
           <select id="te-status">
             <option value="open">open</option>
             <option value="in_progress">in_progress</option>
+            <option value="qa_test">qa_test</option>
             <option value="blocked">blocked</option>
             <option value="done">done</option>
             <option value="wontfix">wontfix</option>

@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { config } from '../config.js';
 
-export type TaskStatus = 'open' | 'in_progress' | 'blocked' | 'done' | 'wontfix';
+export type TaskStatus = 'open' | 'in_progress' | 'qa_test' | 'blocked' | 'done' | 'wontfix';
 export type TaskPriority = 'low' | 'medium' | 'high';
 
 export interface TaskActivity {

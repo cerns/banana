@@ -34,7 +34,7 @@ export interface ArtifactActions {
   cleanedText: string;
 }
 
-const VALID_STATUSES: TaskStatus[] = ['open', 'in_progress', 'blocked', 'done', 'wontfix'];
+const VALID_STATUSES: TaskStatus[] = ['open', 'in_progress', 'qa_test', 'blocked', 'done', 'wontfix'];
 const VALID_PRIORITIES: TaskPriority[] = ['low', 'medium', 'high'];
 
 function parseAttrs(input: string): Record<string, string> {

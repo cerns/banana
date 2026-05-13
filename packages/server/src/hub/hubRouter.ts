@@ -295,7 +295,7 @@ function buildChannelContext(hubMessage: HubMessage, session?: SessionRecord): s
   const interests = session?.interests ?? [];
 
   const openTasks = taskStore
-    .getByChannel(hubMessage.channelId, { status: ['open', 'in_progress', 'blocked'] })
+    .getByChannel(hubMessage.channelId, { status: ['open', 'in_progress', 'qa_test', 'blocked'] })
     .slice(0, config.taskContextMax ?? 8);
 
   const recentDocs = docStore
@@ -399,7 +399,7 @@ WHEN to use these vs plain chat:
   - Concrete actionable work that needs status tracking → bJira.
   - Casual discussion, questions, replies → just write normal chat (no markers).
 
-Status values:  open · in_progress · blocked · done · wontfix
+Status values:  open · in_progress · qa_test · blocked · done · wontfix
 Priority values: low · medium · high
 `;
 

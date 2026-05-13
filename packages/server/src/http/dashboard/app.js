@@ -2034,6 +2034,9 @@ async function openCompactionHistory(channelId) {
 }
 
 // ── Tasks ────────────────────────────────────────────────────────────────
+// ── Task view mode: list vs board ─────────────────────────────────────────
+let taskViewMode = localStorage.getItem('banana_task_view') || 'list';
+
 async function loadChannelTasks(channelId) {
   const params = new URLSearchParams();
   const status = document.getElementById('hub-task-status-filter').value;
@@ -2046,31 +2049,106 @@ async function loadChannelTasks(channelId) {
   renderTasks();
 }
 
+function renderTaskCard(t, compact) {
+  const tags = t.tags.map(tag => `<span class="task-tag-chip">${esc(tag)}</span>`).join('');
+  const assignee = t.assignee ? `<span class="task-assignee-chip">@${esc(t.assignee)}</span>` : '';
+  const prio = t.priority ? `<span class="task-priority-${t.priority}">!${t.priority}</span>` : '';
+  if (compact) {
+    // Board card — vertical, no status badge (column implies status)
+    return `
+      <div class="task-card task-board-card" data-task-id="${esc(t.id)}">
+        <div class="task-board-card-header">
+          <span class="task-card-id">${esc(t.id)}</span>
+          ${prio}
+        </div>
+        <span class="task-card-title">${esc(t.title)}</span>
+        <div class="task-card-meta">${assignee}${tags}</div>
+      </div>`;
+  }
+  // List card — horizontal
+  return `
+    <div class="task-card" data-task-id="${esc(t.id)}">
+      <span class="task-card-id">${esc(t.id)}</span>
+      <span class="task-card-title">${esc(t.title)}</span>
+      <div class="task-card-meta">
+        <span class="task-status-badge task-status-${t.status}">${esc(t.status)}</span>
+        ${assignee}${tags}${prio}
+      </div>
+    </div>`;
+}
+
 function renderTasks() {
-  const container = document.getElementById('hub-task-list');
+  const listContainer = document.getElementById('hub-task-list');
+  const boardContainer = document.getElementById('hub-task-board');
   const tasks = channelTasks[activeChannelId] ?? [];
+
+  if (taskViewMode === 'board') {
+    listContainer.style.display = 'none';
+    boardContainer.style.display = 'flex';
+    renderTaskBoard(boardContainer, tasks);
+  } else {
+    boardContainer.style.display = 'none';
+    listContainer.style.display = '';
+    renderTaskList(listContainer, tasks);
+  }
+}
+
+function renderTaskList(container, tasks) {
   if (tasks.length === 0) {
     container.innerHTML = '<div class="empty-state"><div>No tasks</div></div>';
     return;
   }
-  container.innerHTML = tasks.map(t => {
-    const tags = t.tags.map(tag => `<span class="task-tag-chip">${esc(tag)}</span>`).join('');
-    const assignee = t.assignee ? `<span class="task-assignee-chip">@${esc(t.assignee)}</span>` : '';
-    const prio = t.priority ? `<span class="task-priority-${t.priority}">!${t.priority}</span>` : '';
-    return `
-      <div class="task-card" data-task-id="${esc(t.id)}">
-        <span class="task-card-id">${esc(t.id)}</span>
-        <span class="task-card-title">${esc(t.title)}</span>
-        <div class="task-card-meta">
-          <span class="task-status-badge task-status-${t.status}">${esc(t.status)}</span>
-          ${assignee}${tags}${prio}
-        </div>
-      </div>`;
-  }).join('');
+  container.innerHTML = tasks.map(t => renderTaskCard(t, false)).join('');
   container.querySelectorAll('.task-card').forEach(el => {
     el.addEventListener('click', () => openTaskModal(el.dataset.taskId));
   });
 }
+
+const BOARD_COLUMNS = [
+  { key: 'open',        label: 'Open',        statuses: ['open'] },
+  { key: 'in_progress', label: 'In Progress',  statuses: ['in_progress'] },
+  { key: 'qa_test',     label: 'QA / Test',    statuses: ['qa_test'] },
+  { key: 'blocked',     label: 'Blocked',      statuses: ['blocked'] },
+  { key: 'done',        label: 'Done',         statuses: ['done', 'wontfix'] },
+];
+
+function renderTaskBoard(container, tasks) {
+  let html = '';
+  for (const col of BOARD_COLUMNS) {
+    const colTasks = tasks.filter(t => col.statuses.includes(t.status));
+    html += `<div class="board-column board-col-${col.key}">`;
+    html += `<div class="board-column-header">`;
+    html += `<span class="board-column-title">${col.label}</span>`;
+    html += `<span class="board-column-count">${colTasks.length}</span>`;
+    html += `</div>`;
+    html += `<div class="board-column-body">`;
+    if (colTasks.length === 0) {
+      html += `<div class="board-empty">—</div>`;
+    } else {
+      html += colTasks.map(t => renderTaskCard(t, true)).join('');
+    }
+    html += `</div></div>`;
+  }
+  container.innerHTML = html;
+  container.querySelectorAll('.task-card').forEach(el => {
+    el.addEventListener('click', () => openTaskModal(el.dataset.taskId));
+  });
+}
+
+// View toggle button
+document.getElementById('hub-task-view-toggle').addEventListener('click', () => {
+  taskViewMode = taskViewMode === 'list' ? 'board' : 'list';
+  localStorage.setItem('banana_task_view', taskViewMode);
+  updateViewToggleIcon();
+  renderTasks();
+});
+
+function updateViewToggleIcon() {
+  const btn = document.getElementById('hub-task-view-toggle');
+  btn.innerHTML = taskViewMode === 'list' ? '&#9638;' : '&#9776;';
+  btn.title = taskViewMode === 'list' ? 'Switch to board view' : 'Switch to list view';
+}
+updateViewToggleIcon();
 
 document.getElementById('hub-task-status-filter').addEventListener('change', () => {
   if (activeChannelId) loadChannelTasks(activeChannelId);
