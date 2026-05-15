@@ -1,5 +1,6 @@
 import { Client } from 'ssh2';
 import fs from 'fs';
+import path from 'path';
 import { spawn, exec as execCb } from 'child_process';
 import type { MachineRecord } from '../machines/machineStore.js';
 import { config } from '../config.js';
@@ -20,6 +21,102 @@ export function isLocalMachine(machine: MachineRecord): boolean {
   if (!machine.ip) return true;
   const ip = machine.ip.trim().toLowerCase();
   return ip === '' || ip === 'localhost' || ip === '127.0.0.1';
+}
+
+/** Default .claude/settings.json for enterprise plans that block --dangerously-skip-permissions.
+ *  Uses tool names without globs — allows ALL uses of each tool.
+ *  Combined with --permission-mode dontAsk, this auto-approves listed tools
+ *  and auto-denies everything else (no prompts, no hanging). */
+const DEFAULT_PERMISSION_SETTINGS = {
+  permissions: {
+    allow: [
+      'Bash',
+      'Read',
+      'Edit',
+      'Write',
+      'Glob',
+      'Grep',
+      'WebFetch',
+      'WebSearch',
+      'NotebookEdit',
+    ],
+  },
+};
+
+/** Whether machine needs permission settings provisioned (skipPermissions is false). */
+function needsPermissionSettings(machine: MachineRecord): boolean {
+  return machine.skipPermissions === false;
+}
+
+/** Get the permission settings to write — machine override or defaults. */
+function getPermissionSettings(machine: MachineRecord): Record<string, unknown> {
+  return machine.permissionSettings ?? DEFAULT_PERMISSION_SETTINGS;
+}
+
+/** Write settings JSON to a path, creating directories as needed. */
+async function writeSettingsFile(settingsPath: string, content: string): Promise<void> {
+  const dir = path.dirname(settingsPath);
+  await fs.promises.mkdir(dir, { recursive: true });
+  await fs.promises.writeFile(settingsPath, content, { mode: 0o644 });
+}
+
+/** Provision .claude/settings.json locally before running claude.
+ *  Writes to both project-level (workdir/.claude/) and user-level (~/.claude/)
+ *  to maximize compatibility with enterprise managed settings. */
+async function provisionLocalSettings(workdir: string, machine: MachineRecord): Promise<void> {
+  const content = JSON.stringify(getPermissionSettings(machine), null, 2);
+
+  // Project-level: workdir/.claude/settings.json
+  const projectSettings = path.join(workdir, '.claude', 'settings.json');
+  await writeSettingsFile(projectSettings, content);
+
+  // User-level: ~/.claude/settings.json (fallback if project-level is overridden)
+  const home = process.env.HOME || process.env.USERPROFILE || '/root';
+  const userSettings = path.join(home, '.claude', 'settings.json');
+  await writeSettingsFile(userSettings, content);
+
+  console.log(`[ssh-runner] Provisioned permission settings (project + user level) for enterprise mode`);
+}
+
+/** Provision .claude/settings.json on remote via SSH + SFTP.
+ *  Writes to both project-level and user-level (~/.claude/). */
+async function provisionRemoteSettings(conn: Client, workdir: string, machine: MachineRecord): Promise<void> {
+  const content = JSON.stringify(getPermissionSettings(machine), null, 2);
+  const projectDir = `${workdir}/.claude`;
+  const userDir = '$HOME/.claude';
+
+  // mkdir -p for both locations
+  await new Promise<void>((resolve, reject) => {
+    conn.exec(`mkdir -p ${shellEscape(projectDir)} && mkdir -p ${userDir}`, (err, stream) => {
+      if (err) { reject(err); return; }
+      stream.on('close', () => resolve());
+      stream.on('error', (e: Error) => reject(e));
+      stream.resume();
+    });
+  });
+
+  // Write project-level settings via SFTP
+  await new Promise<void>((resolve, reject) => {
+    conn.sftp((err, sftp) => {
+      if (err) { reject(err); return; }
+      const ws = sftp.createWriteStream(`${projectDir}/settings.json`, { mode: 0o644 });
+      ws.on('error', (e: Error) => { sftp.end(); reject(e); });
+      ws.end(Buffer.from(content, 'utf8'), () => { sftp.end(); resolve(); });
+    });
+  });
+
+  // Write user-level settings via exec (SFTP can't expand $HOME)
+  await new Promise<void>((resolve, reject) => {
+    const escaped = content.replace(/'/g, "'\"'\"'");
+    conn.exec(`cat > ${userDir}/settings.json << 'BANANA_EOF'\n${content}\nBANANA_EOF`, (err, stream) => {
+      if (err) { reject(err); return; }
+      stream.on('close', () => resolve());
+      stream.on('error', (e: Error) => reject(e));
+      stream.resume();
+    });
+  });
+
+  console.log(`[ssh-runner] Provisioned permission settings (project + user level) for enterprise mode`);
 }
 
 export interface SshRunResult {
@@ -455,10 +552,20 @@ async function runClaudeLocally(
     '--output-format', 'stream-json',
     '--verbose',
     '--include-partial-messages',
-    '--dangerously-skip-permissions',
   ];
+  if (machine.skipPermissions === false) {
+    // Enterprise mode: use dontAsk + settings.json allow rules (no prompts)
+    args.push('--permission-mode', 'dontAsk');
+  } else {
+    args.push('--dangerously-skip-permissions');
+  }
   if (model) args.push('--model', model);
   if (resumeId) args.push('--resume', resumeId);
+
+  // Provision .claude/settings.json for enterprise plans
+  if (needsPermissionSettings(machine) && workdir) {
+    await provisionLocalSettings(workdir, machine);
+  }
 
   // Write prompt to a local temp file
   const tmpFile = `/tmp/banana-prompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
@@ -587,8 +694,13 @@ export async function runClaudeOverSsh(
     '--output-format', 'stream-json',
     '--verbose',
     '--include-partial-messages',
-    '--dangerously-skip-permissions',
   ];
+  if (machine.skipPermissions === false) {
+    // Enterprise mode: use dontAsk + settings.json allow rules (no prompts)
+    args.push('--permission-mode', 'dontAsk');
+  } else {
+    args.push('--dangerously-skip-permissions');
+  }
 
   if (model) {
     args.push('--model', shellEscape(model));
@@ -620,6 +732,11 @@ export async function runClaudeOverSsh(
   console.log(`[ssh-runner] Command: ${claudeBin}${model ? ` --model ${model}` : ''}${resumeId ? ' --resume' : ''} (prompt ${prompt.length} chars via SFTP temp file)`);
 
   const { client: conn, cleanup } = await connectWithRetry(machine, signal);
+
+  // Provision .claude/settings.json for enterprise plans
+  if (needsPermissionSettings(machine) && workdir) {
+    await provisionRemoteSettings(conn, workdir, machine);
+  }
 
   // Write prompt to remote temp file via SFTP (binary-safe, no shell involved)
   await new Promise<void>((resolve, reject) => {

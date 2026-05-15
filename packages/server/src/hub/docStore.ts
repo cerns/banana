@@ -84,8 +84,8 @@ class DocStore {
     return doc;
   }
 
-  updateDoc(id: string, patch: UpdateDocFields, by: string): ChannelDoc | undefined {
-    const doc = this.findDoc(id);
+  updateDoc(id: string, patch: UpdateDocFields, by: string, channelId?: string): ChannelDoc | undefined {
+    const doc = this.findDoc(id, channelId);
     if (!doc) return undefined;
     const now = new Date().toISOString();
 
@@ -108,8 +108,8 @@ class DocStore {
     return doc;
   }
 
-  appendDoc(id: string, text: string, by: string): ChannelDoc | undefined {
-    const doc = this.findDoc(id);
+  appendDoc(id: string, text: string, by: string, channelId?: string): ChannelDoc | undefined {
+    const doc = this.findDoc(id, channelId);
     if (!doc) return undefined;
     const now = new Date().toISOString();
 
@@ -138,8 +138,8 @@ class DocStore {
   }
 
   /** Soft-delete: marks doc as archived (preserves history). */
-  archiveDoc(id: string, by: string): ChannelDoc | undefined {
-    const doc = this.findDoc(id);
+  archiveDoc(id: string, by: string, channelId?: string): ChannelDoc | undefined {
+    const doc = this.findDoc(id, channelId);
     if (!doc || doc.archived) return undefined;
     doc.archived = true;
     doc.archivedAt = new Date().toISOString();
@@ -150,8 +150,8 @@ class DocStore {
   }
 
   /** Undo soft-delete. */
-  restoreDoc(id: string): ChannelDoc | undefined {
-    const doc = this.findDoc(id);
+  restoreDoc(id: string, channelId?: string): ChannelDoc | undefined {
+    const doc = this.findDoc(id, channelId);
     if (!doc || !doc.archived) return undefined;
     doc.archived = false;
     doc.archivedAt = undefined;

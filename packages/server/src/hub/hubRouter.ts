@@ -1207,15 +1207,15 @@ function applyArtifactActions(
     docsChanged = true;
   }
   for (const u of actions.docUpdates) {
-    if (docStore.updateDoc(u.id, { title: u.title, body: u.body, tags: u.tags }, by)) {
+    if (docStore.updateDoc(u.id, { title: u.title, body: u.body, tags: u.tags }, by, channelId)) {
       docsChanged = true;
     }
   }
   for (const a of actions.docAppends) {
-    if (docStore.appendDoc(a.id, a.text, by)) docsChanged = true;
+    if (docStore.appendDoc(a.id, a.text, by, channelId)) docsChanged = true;
   }
   for (const d of actions.docDeletes) {
-    if (docStore.archiveDoc(d.id, by)) docsChanged = true;
+    if (docStore.archiveDoc(d.id, by, channelId)) docsChanged = true;
   }
 
   if (tasksChanged) {

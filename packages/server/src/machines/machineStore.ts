@@ -44,6 +44,14 @@ export interface MachineRecord {
   claudePath?: string;
   systemInfo?: SystemInfo;
   runtimeDetectedAt?: string;
+  /** When true (default), passes --dangerously-skip-permissions to claude CLI.
+   *  Enterprise managed plans may block this flag — set to false and use
+   *  permissionSettings instead. */
+  skipPermissions?: boolean;
+  /** Custom .claude/settings.json content to write into the workdir before
+   *  running claude. Used to pre-approve tools on enterprise plans where
+   *  --dangerously-skip-permissions is blocked. */
+  permissionSettings?: Record<string, unknown>;
   createdAt: string;
   updatedAt: string;
 }

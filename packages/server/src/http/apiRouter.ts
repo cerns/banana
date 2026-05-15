@@ -296,6 +296,8 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       macAddress: body.macAddress,
       os: body.os,
       notes: body.notes,
+      skipPermissions: body.skipPermissions,
+      permissionSettings: body.permissionSettings,
       createdAt: now,
       updatedAt: now,
     };
@@ -702,11 +704,12 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
   if (docMatch) {
     const docId = docMatch[1];
     const sub = docMatch[2];
+    const chId = url.searchParams.get('channelId') ?? undefined;
 
     if (sub === '/append' && method === 'POST') {
       const body = await readBody(req) as { text?: string; by?: string };
       if (!body.text) { json(res, 400, { error: 'text required' }); return true; }
-      const updated = docStore.appendDoc(docId, body.text, body.by ?? 'user');
+      const updated = docStore.appendDoc(docId, body.text, body.by ?? 'user', chId);
       if (!updated) { json(res, 404, { error: 'Doc not found' }); return true; }
       broadcastToDashboards({ type: 'DASHBOARD_EVENT', event: 'DOCS_CHANGED', channelId: updated.channelId });
       json(res, 200, updated);
@@ -714,14 +717,14 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     }
 
     if (sub === '/history' && method === 'GET') {
-      const doc = docStore.getDoc(docId);
+      const doc = docStore.getDoc(docId, chId);
       if (!doc) { json(res, 404, { error: 'Doc not found' }); return true; }
       json(res, 200, doc.history);
       return true;
     }
 
     if (sub === '/restore' && method === 'POST') {
-      const restored = docStore.restoreDoc(docId);
+      const restored = docStore.restoreDoc(docId, chId);
       if (!restored) { json(res, 404, { error: 'Doc not found or not archived' }); return true; }
       broadcastToDashboards({ type: 'DASHBOARD_EVENT', event: 'DOCS_CHANGED', channelId: restored.channelId });
       json(res, 200, restored);
@@ -729,7 +732,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     }
 
     if (!sub && method === 'GET') {
-      const doc = docStore.getDoc(docId);
+      const doc = docStore.getDoc(docId, chId);
       if (!doc) { json(res, 404, { error: 'Doc not found' }); return true; }
       json(res, 200, doc);
       return true;
@@ -737,7 +740,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
 
     if (!sub && method === 'PATCH') {
       const body = await readBody(req) as UpdateDocFields & { by?: string };
-      const updated = docStore.updateDoc(docId, body, body.by ?? 'user');
+      const updated = docStore.updateDoc(docId, body, body.by ?? 'user', chId);
       if (!updated) { json(res, 404, { error: 'Doc not found' }); return true; }
       broadcastToDashboards({ type: 'DASHBOARD_EVENT', event: 'DOCS_CHANGED', channelId: updated.channelId });
       json(res, 200, updated);
@@ -747,7 +750,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     // DELETE now does soft delete (archive). Use removeDoc only for permanent cleanup.
     if (!sub && method === 'DELETE') {
       const body = await readBody(req).catch(() => ({})) as { by?: string };
-      const doc = docStore.archiveDoc(docId, (body as any)?.by ?? 'user');
+      const doc = docStore.archiveDoc(docId, (body as any)?.by ?? 'user', chId);
       if (!doc) { json(res, 404, { error: 'Doc not found or already archived' }); return true; }
       broadcastToDashboards({ type: 'DASHBOARD_EVENT', event: 'DOCS_CHANGED', channelId: doc.channelId });
       json(res, 200, { ok: true, archived: true });

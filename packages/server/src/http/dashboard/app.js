@@ -984,6 +984,11 @@ function showMachineForm(machine) {
   document.getElementById('mf-os').value = machine?.os || '';
   document.getElementById('mf-mac').value = machine?.macAddress || '';
   document.getElementById('mf-notes').value = machine?.notes || '';
+  const skipPerms = machine?.skipPermissions !== false; // default true
+  document.getElementById('mf-skip-perms').checked = skipPerms;
+  document.getElementById('mf-perm-settings-row').style.display = skipPerms ? 'none' : '';
+  document.getElementById('mf-perm-settings').value = machine?.permissionSettings
+    ? JSON.stringify(machine.permissionSettings, null, 2) : '';
   document.getElementById('mf-status').textContent = '';
 
   // Show runtime/system info if available
@@ -1016,6 +1021,9 @@ function hideMachineForm() {
 
 document.getElementById('add-machine-btn').addEventListener('click', () => showMachineForm(null));
 document.getElementById('mf-cancel').addEventListener('click', hideMachineForm);
+document.getElementById('mf-skip-perms').addEventListener('change', (e) => {
+  document.getElementById('mf-perm-settings-row').style.display = e.target.checked ? 'none' : '';
+});
 
 function editMachine(id) {
   const m = machines.find(x => x.id === id);
@@ -1073,7 +1081,19 @@ document.getElementById('mf-save').addEventListener('click', async () => {
     os: document.getElementById('mf-os').value || undefined,
     macAddress: document.getElementById('mf-mac').value || undefined,
     notes: document.getElementById('mf-notes').value || undefined,
+    skipPermissions: document.getElementById('mf-skip-perms').checked,
   };
+  // Parse permission settings JSON if provided
+  const permSettingsRaw = document.getElementById('mf-perm-settings').value.trim();
+  if (!body.skipPermissions && permSettingsRaw) {
+    try {
+      body.permissionSettings = JSON.parse(permSettingsRaw);
+    } catch (e) {
+      document.getElementById('mf-status').textContent = 'Invalid permission settings JSON';
+      return;
+    }
+  }
+  if (body.skipPermissions) body.permissionSettings = undefined;
   const pw = document.getElementById('mf-password').value;
   if (pw) body.password = pw;
   const pp = document.getElementById('mf-passphrase').value;
@@ -1587,12 +1607,15 @@ function renderHubChannels() {
 
 async function selectHubChannel(channelId) {
   activeChannelId = channelId;
+  currentDocId = null;
   renderHubChannels();
   const ch = hubChannels.find(c => c.id === channelId);
   document.getElementById('hub-channel-title').textContent = ch?.name ?? channelId;
   const msgs = await apiFetch(`/api/hub/channels/${channelId}/messages`);
   hubMessages[channelId] = Array.isArray(msgs) ? msgs : [];
   renderHubMessages();
+  // Clear doc body on channel switch so stale content from previous channel doesn't persist
+  document.getElementById('hub-doc-body').innerHTML = '<div style="color:var(--muted);padding:16px">Select a doc</div>';
   // Refresh whatever view is currently active
   if (hubViewMode === 'tasks') loadChannelTasks(channelId);
   if (hubViewMode === 'docs') loadChannelDocs(channelId);
@@ -2372,7 +2395,8 @@ function applyInline(text) {
 
 async function showDoc(docId) {
   currentDocId = docId;
-  const doc = await apiFetch(`/api/hub/docs/${docId}`);
+  const chParam = activeChannelId ? `?channelId=${encodeURIComponent(activeChannelId)}` : '';
+  const doc = await apiFetch(`/api/hub/docs/${docId}${chParam}`);
   const bodyEl = document.getElementById('hub-doc-body');
   const archivedBadge = doc.archived
     ? `<span style="background:var(--red);color:#000;padding:1px 5px;border-radius:3px;font-size:10px;margin-left:6px">ARCHIVED</span>` : '';
@@ -2403,7 +2427,8 @@ async function showDoc(docId) {
   });
   document.getElementById('hub-doc-history-btn').addEventListener('click', () => showDocHistory(docId));
   document.getElementById('hub-doc-restore-btn')?.addEventListener('click', async () => {
-    await apiFetch(`/api/hub/docs/${docId}/restore`, { method: 'POST' });
+    const chP = activeChannelId ? `?channelId=${encodeURIComponent(activeChannelId)}` : '';
+    await apiFetch(`/api/hub/docs/${docId}/restore${chP}`, { method: 'POST' });
     loadChannelDocs(activeChannelId);
     showDoc(docId);
   });
@@ -2414,8 +2439,9 @@ async function showDoc(docId) {
 }
 
 async function showDocHistory(docId) {
-  const history = await apiFetch(`/api/hub/docs/${docId}/history`);
-  const doc = await apiFetch(`/api/hub/docs/${docId}`);
+  const chParam2 = activeChannelId ? `?channelId=${encodeURIComponent(activeChannelId)}` : '';
+  const history = await apiFetch(`/api/hub/docs/${docId}/history${chParam2}`);
+  const doc = await apiFetch(`/api/hub/docs/${docId}${chParam2}`);
   const bodyEl = document.getElementById('hub-doc-body');
   if (!Array.isArray(history) || history.length === 0) {
     bodyEl.innerHTML = `
@@ -2461,7 +2487,8 @@ async function openDocModal(docId) {
   _editingDocId = docId;
   let doc = null;
   if (docId) {
-    doc = await apiFetch(`/api/hub/docs/${docId}`);
+    const chP3 = activeChannelId ? `?channelId=${encodeURIComponent(activeChannelId)}` : '';
+    doc = await apiFetch(`/api/hub/docs/${docId}${chP3}`);
     document.getElementById('de-title').textContent = `${doc.id} v${doc.version}`;
     document.getElementById('de-version').textContent = `Version ${doc.version} — saving will create v${doc.version + 1}`;
   } else {
@@ -2481,7 +2508,8 @@ document.getElementById('de-save').addEventListener('click', async () => {
   const tags = document.getElementById('de-tags').value.split(',').map(s => s.trim()).filter(Boolean);
   if (!title) { alert('Title required'); return; }
   if (_editingDocId) {
-    await apiFetch(`/api/hub/docs/${_editingDocId}`, {
+    const chP4 = activeChannelId ? `?channelId=${encodeURIComponent(activeChannelId)}` : '';
+    await apiFetch(`/api/hub/docs/${_editingDocId}${chP4}`, {
       method: 'PATCH',
       body: JSON.stringify({ title, body, tags }),
     });
@@ -2498,7 +2526,8 @@ document.getElementById('de-save').addEventListener('click', async () => {
 document.getElementById('de-delete').addEventListener('click', async () => {
   if (!_editingDocId) return;
   if (!confirm('Delete this doc?')) return;
-  await apiFetch(`/api/hub/docs/${_editingDocId}`, { method: 'DELETE' });
+  const chP5 = activeChannelId ? `?channelId=${encodeURIComponent(activeChannelId)}` : '';
+  await apiFetch(`/api/hub/docs/${_editingDocId}${chP5}`, { method: 'DELETE' });
   closeModal('doc-edit-modal');
   if (currentDocId === _editingDocId) currentDocId = null;
   loadChannelDocs(activeChannelId);
