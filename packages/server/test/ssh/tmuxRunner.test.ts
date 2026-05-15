@@ -52,9 +52,16 @@ const execCalls: { cmd: string; stream: any }[] = [];
 const mockConnectWithRetry = vi.fn();
 const mockShellEscape = vi.fn((s: string) => `'${s.replace(/'/g, "'\"'\"'")}'`);
 
+const mockIsLocalMachine = vi.fn(() => false);
+const mockExecLocal = vi.fn(async () => ({ stdout: '', stderr: '' }));
+const mockGetLocalShell = vi.fn((m: any) => [m.localShell || '/bin/bash', ['-ic']]);
+
 vi.mock('../../src/ssh/sshRunner.js', () => ({
   connectWithRetry: mockConnectWithRetry,
   shellEscape: mockShellEscape,
+  isLocalMachine: mockIsLocalMachine,
+  execLocal: mockExecLocal,
+  getLocalShell: mockGetLocalShell,
 }));
 
 async function flush() {
@@ -117,6 +124,9 @@ describe('tmuxRunner', () => {
     vi.doMock('../../src/ssh/sshRunner.js', () => ({
       connectWithRetry: mockConnectWithRetry,
       shellEscape: mockShellEscape,
+      isLocalMachine: mockIsLocalMachine,
+      execLocal: mockExecLocal,
+      getLocalShell: mockGetLocalShell,
     }));
     tmuxRunner = await import('../../src/ssh/tmuxRunner.js');
     // Reset config to defaults

@@ -1,6 +1,8 @@
+import { spawn } from 'child_process';
+import * as fs from 'fs';
 import type { MachineRecord } from '../machines/machineStore.js';
 import type { SshRunResult, SshChunkCallback, TunneledConnection } from './sshRunner.js';
-import { connectWithRetry, shellEscape } from './sshRunner.js';
+import { connectWithRetry, shellEscape, isLocalMachine, execLocal, getLocalShell } from './sshRunner.js';
 import { config } from '../config.js';
 
 // ── Types ──────────────────────────────────────────────────────────────────
@@ -209,18 +211,24 @@ export class TmuxOutputParser {
   }
 }
 
-// ── SSH helpers ─────────────────────────────────────────────────────────────
+// ── Exec helpers ────────────────────────────────────────────────────────────
 
 const PATH_PREFIX = 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$PATH"';
 
-/** Execute a command over SSH (short-lived connection) and return stdout. */
-async function sshExec(
+/** Execute a command — locally or over SSH depending on machine type. */
+async function tmuxExec(
   machine: MachineRecord,
   command: string,
   signal?: AbortSignal,
   timeoutMs = 30_000,
 ): Promise<string> {
   if (signal?.aborted) throw new Error('Aborted');
+
+  if (isLocalMachine(machine)) {
+    const { stdout } = await execLocal(`${PATH_PREFIX} && ${command}`, { timeout: timeoutMs });
+    return stdout;
+  }
+
   const { client: conn, cleanup } = await connectWithRetry(machine, signal);
   return new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => { cleanup(); reject(new Error(`SSH exec timed out (${timeoutMs}ms)`)); }, timeoutMs);
@@ -244,24 +252,30 @@ async function sshExec(
   });
 }
 
-/** Send tmux keys via a short-lived SSH connection. */
+/** Send tmux keys via exec (local or SSH). */
 async function tmuxSendKeys(
   machine: MachineRecord,
   tmuxName: string,
   keys: string,
   signal?: AbortSignal,
 ): Promise<void> {
-  await sshExec(machine, `tmux send-keys -t ${shellEscape(tmuxName)} ${keys}`, signal, 10_000);
+  await tmuxExec(machine, `tmux send-keys -t ${shellEscape(tmuxName)} ${keys}`, signal, 10_000);
 }
 
-/** Write content to a remote temp file via SFTP, return the path. */
-async function writeRemoteTempFile(
+/** Write content to a temp file, return the path. Uses local fs or SFTP depending on machine. */
+async function writeTempFile(
   machine: MachineRecord,
   content: string,
   signal?: AbortSignal,
-): Promise<{ path: string; cleanup: () => void; conn: TunneledConnection }> {
+): Promise<{ path: string; cleanup: () => void }> {
   if (signal?.aborted) throw new Error('Aborted');
   const tmpPath = `/tmp/banana-tmux-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+  if (isLocalMachine(machine)) {
+    fs.writeFileSync(tmpPath, content, { mode: 0o600 });
+    return { path: tmpPath, cleanup: () => {} };
+  }
+
   const tunneled = await connectWithRetry(machine, signal);
   await new Promise<void>((resolve, reject) => {
     tunneled.client.sftp((err, sftp) => {
@@ -274,7 +288,6 @@ async function writeRemoteTempFile(
   return {
     path: tmpPath,
     cleanup: () => { tunneled.cleanup(); },
-    conn: tunneled,
   };
 }
 
@@ -295,7 +308,7 @@ export async function ensureTmuxSession(
   if (existing) {
     // Verify tmux session still exists on remote
     try {
-      await sshExec(machine, `tmux has-session -t ${shellEscape(existing.tmuxName)} 2>/dev/null`, signal, 10_000);
+      await tmuxExec(machine, `tmux has-session -t ${shellEscape(existing.tmuxName)} 2>/dev/null`, signal, 10_000);
       return existing;
     } catch {
       // Session died — clean up and recreate
@@ -310,17 +323,17 @@ export async function ensureTmuxSession(
 
   // Kill any stale session with the same name
   try {
-    await sshExec(machine, `tmux kill-session -t ${shellEscape(tmuxName)} 2>/dev/null || true`, signal, 10_000);
+    await tmuxExec(machine, `tmux kill-session -t ${shellEscape(tmuxName)} 2>/dev/null || true`, signal, 10_000);
   } catch { /* ignore */ }
 
   // Remove stale log file
   try {
-    await sshExec(machine, `rm -f ${shellEscape(logPath)}`, signal, 10_000);
+    await tmuxExec(machine, `rm -f ${shellEscape(logPath)}`, signal, 10_000);
   } catch { /* ignore */ }
 
   // Create tmux session in detached mode
   const cdPart = workdir ? `cd ${shellEscape(workdir)} && ` : '';
-  await sshExec(
+  await tmuxExec(
     machine,
     `tmux new-session -d -s ${shellEscape(tmuxName)} -x 200 -y 50`,
     signal,
@@ -328,7 +341,7 @@ export async function ensureTmuxSession(
   );
 
   // Set up pipe-pane to log all output
-  await sshExec(
+  await tmuxExec(
     machine,
     `tmux pipe-pane -t ${shellEscape(tmuxName)} -o 'cat >> ${shellEscape(logPath)}'`,
     signal,
@@ -361,7 +374,7 @@ export async function ensureTmuxSession(
     if (signal?.aborted) throw new Error('Aborted');
     await new Promise(r => setTimeout(r, 2000));
     try {
-      const logContent = await sshExec(
+      const logContent = await tmuxExec(
         machine,
         `cat ${shellEscape(logPath)} 2>/dev/null || echo ''`,
         signal,
@@ -385,13 +398,13 @@ export async function ensureTmuxSession(
 
   if (!ready) {
     // Clean up
-    try { await sshExec(machine, `tmux kill-session -t ${shellEscape(tmuxName)} 2>/dev/null || true`); } catch { /* ignore */ }
+    try { await tmuxExec(machine, `tmux kill-session -t ${shellEscape(tmuxName)} 2>/dev/null || true`); } catch { /* ignore */ }
     throw new Error(`Claude did not start within ${timeoutMs}ms`);
   }
 
   // Truncate the startup log so we start clean for the first prompt
   try {
-    await sshExec(machine, `truncate -s 0 ${shellEscape(logPath)}`, signal, 10_000);
+    await tmuxExec(machine, `truncate -s 0 ${shellEscape(logPath)}`, signal, 10_000);
   } catch { /* ignore */ }
 
   const session: TmuxSession = {
@@ -417,14 +430,14 @@ export async function sendPromptViaTmux(
 ): Promise<void> {
   // Truncate the log file so we only capture output from this prompt
   try {
-    await sshExec(machine, `truncate -s 0 ${shellEscape(session.logPath)}`, signal, 10_000);
+    await tmuxExec(machine, `truncate -s 0 ${shellEscape(session.logPath)}`, signal, 10_000);
   } catch { /* ignore */ }
 
   // Write prompt to temp file via SFTP
-  const tmp = await writeRemoteTempFile(machine, prompt + '\n', signal);
+  const tmp = await writeTempFile(machine, prompt + '\n', signal);
   try {
     // Load into tmux buffer and paste it (binary-safe prompt delivery)
-    await sshExec(
+    await tmuxExec(
       machine,
       `tmux load-buffer -t ${shellEscape(session.tmuxName)} ${shellEscape(tmp.path)} && tmux paste-buffer -t ${shellEscape(session.tmuxName)} -d`,
       signal,
@@ -434,7 +447,7 @@ export async function sendPromptViaTmux(
     await tmuxSendKeys(machine, session.tmuxName, 'Enter', signal);
   } finally {
     // Clean up temp file
-    try { await sshExec(machine, `rm -f ${shellEscape(tmp.path)}`, signal, 5_000); } catch { /* ignore */ }
+    try { await tmuxExec(machine, `rm -f ${shellEscape(tmp.path)}`, signal, 5_000); } catch { /* ignore */ }
     tmp.cleanup();
   }
 }
@@ -452,110 +465,133 @@ export async function streamTmuxOutput(
 ): Promise<{ completed: boolean }> {
   if (signal?.aborted) throw new Error('Aborted');
 
-  const { client: conn, cleanup } = await connectWithRetry(machine, signal);
-  session.tailConn = { client: conn, cleanup };
+  // Shared stream processing — same logic for local and SSH tail -f
+  const processStream = (
+    stdout: NodeJS.ReadableStream,
+    stderr: NodeJS.ReadableStream | null,
+    kill: () => void,
+    cleanupFn: () => void,
+  ): Promise<{ completed: boolean }> => {
+    return new Promise<{ completed: boolean }>((resolve, reject) => {
+      let settled = false;
+      const settle = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
 
-  return new Promise<{ completed: boolean }>((resolve, reject) => {
-    let settled = false;
-    const settle = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+      let idleTimer: ReturnType<typeof setTimeout> | undefined;
+      const resetIdle = () => {
+        if (idleTimer) clearTimeout(idleTimer);
+        idleTimer = setTimeout(() => {
+          console.log(`[tmux-runner] Idle timeout (${config.tmuxIdleCompletionMs}ms) — response complete`);
+          onChunk({ type: 'stderr', text: `[banana-tmux] Idle timeout — response complete\n` });
+          parser.flush();
+          cleanupAndResolve(true);
+        }, config.tmuxIdleCompletionMs);
+      };
 
-    // Idle timeout — no output for tmuxIdleCompletionMs → consider done
-    let idleTimer: ReturnType<typeof setTimeout> | undefined;
-    const resetIdle = () => {
-      if (idleTimer) clearTimeout(idleTimer);
-      idleTimer = setTimeout(() => {
-        console.log(`[tmux-runner] Idle timeout (${config.tmuxIdleCompletionMs}ms) — response complete`);
-        onChunk({ type: 'stderr', text: `[banana-tmux] Idle timeout — response complete\n` });
-        parser.flush();
-        cleanupAndResolve(true);
-      }, config.tmuxIdleCompletionMs);
-    };
+      const cleanupAndResolve = (completed: boolean) => {
+        if (idleTimer) clearTimeout(idleTimer);
+        session.tailConn = null;
+        cleanupFn();
+        settle(() => resolve({ completed }));
+      };
 
-    const cleanupAndResolve = (completed: boolean) => {
-      if (idleTimer) clearTimeout(idleTimer);
-      session.tailConn = null;
-      cleanup();
-      settle(() => resolve({ completed }));
-    };
+      const sendKeysForApprove = (keys: string) => {
+        tmuxSendKeys(machine, session.tmuxName, keys, signal).catch((e) => {
+          console.warn(`[tmux-runner] Failed to send auto-approve keys: ${e.message}`);
+        });
+      };
 
-    // Create sendKeys callback for auto-approve
-    const sendKeysForApprove = (keys: string) => {
-      // Fire-and-forget — don't block parsing
-      tmuxSendKeys(machine, session.tmuxName, keys, signal).catch((e) => {
-        console.warn(`[tmux-runner] Failed to send auto-approve keys: ${e.message}`);
-      });
-    };
-
-    const parser = new TmuxOutputParser(onChunk, sendKeysForApprove);
-
-    conn.on('error', (err) => {
-      if (idleTimer) clearTimeout(idleTimer);
-      session.tailConn = null;
-      settle(() => reject(err));
-    });
-
-    const shell = machine.localShell || '/bin/bash';
-    conn.exec(`${shell} -ic ${shellEscape('tail -f ' + shellEscape(session.logPath))}`, (err, stream) => {
-      if (err) { cleanup(); settle(() => reject(err)); return; }
+      const parser = new TmuxOutputParser(onChunk, sendKeysForApprove);
 
       resetIdle();
 
-      stream.on('data', (data: Buffer) => {
+      stdout.on('data', (data: Buffer) => {
         resetIdle();
         const text = data.toString();
         const cleaned = stripAnsi(text);
 
         parser.feed(text);
 
-        // Check for prompt reappearance (response complete)
         if (parser.hasContent() && /^>\s*$/m.test(cleaned)) {
           console.log('[tmux-runner] Prompt detected — response complete');
           parser.flush();
-          stream.close();
+          kill();
           cleanupAndResolve(true);
           return;
         }
 
-        // Check for shell prompt (claude exited)
         if (parser.hasContent() && /\$\s*$/m.test(cleaned) && !/\\\$/m.test(cleaned)) {
           console.warn('[tmux-runner] Shell prompt detected — claude may have exited');
           parser.flush();
           onChunk({ type: 'stderr', text: '[banana-tmux] Claude process exited\n' });
-          stream.close();
+          kill();
           cleanupAndResolve(true);
           return;
         }
       });
 
-      stream.stderr.on('data', (data: Buffer) => {
-        resetIdle();
-        const text = data.toString();
-        console.error(`[tmux-runner] tail stderr: ${text.trim()}`);
-      });
+      if (stderr) {
+        stderr.on('data', (data: Buffer) => {
+          resetIdle();
+          console.error(`[tmux-runner] tail stderr: ${data.toString().trim()}`);
+        });
+      }
 
-      stream.on('close', () => {
+      stdout.on('close', () => {
         if (idleTimer) clearTimeout(idleTimer);
         parser.flush();
         session.tailConn = null;
         settle(() => resolve({ completed: true }));
       });
 
-      stream.on('error', (e: Error) => {
+      stdout.on('error', (e: Error) => {
         if (idleTimer) clearTimeout(idleTimer);
         console.error(`[tmux-runner] tail stream error: ${e.message}`);
         session.tailConn = null;
         settle(() => reject(e));
       });
 
-      // Abort support
       const onAbort = () => {
         if (idleTimer) clearTimeout(idleTimer);
-        stream.close();
+        kill();
         session.tailConn = null;
         settle(() => reject(new Error('Aborted')));
       };
       signal?.addEventListener('abort', onAbort, { once: true });
-      stream.on('close', () => signal?.removeEventListener('abort', onAbort));
+      stdout.on('close', () => signal?.removeEventListener('abort', onAbort));
+    });
+  };
+
+  // ── Local: spawn `tail -f` directly ──
+  if (isLocalMachine(machine)) {
+    const proc = spawn('tail', ['-f', session.logPath], { stdio: ['ignore', 'pipe', 'pipe'] });
+    return processStream(
+      proc.stdout,
+      proc.stderr,
+      () => proc.kill(),
+      () => { try { proc.kill(); } catch { /* noop */ } },
+    );
+  }
+
+  // ── Remote: SSH tail -f ──
+  const { client: conn, cleanup } = await connectWithRetry(machine, signal);
+  session.tailConn = { client: conn, cleanup };
+
+  conn.on('error', (err) => {
+    session.tailConn = null;
+    // Error will propagate through stream events
+    console.error(`[tmux-runner] SSH connection error: ${err.message}`);
+  });
+
+  return new Promise<{ completed: boolean }>((resolve, reject) => {
+    const shell = machine.localShell || '/bin/bash';
+    conn.exec(`${shell} -ic ${shellEscape('tail -f ' + shellEscape(session.logPath))}`, (err, stream) => {
+      if (err) { cleanup(); reject(err); return; }
+      processStream(
+        stream,
+        stream.stderr,
+        () => stream.close(),
+        () => cleanup(),
+      ).then(resolve, reject);
     });
   });
 }
@@ -614,10 +650,10 @@ export async function runClaudeViaTmuxForSession(
 
   // Truncate log if too large (keep last 1MB)
   try {
-    const sizeOutput = await sshExec(machine, `stat -c%s ${shellEscape(session.logPath)} 2>/dev/null || echo 0`, signal, 5_000);
+    const sizeOutput = await tmuxExec(machine, `stat -c%s ${shellEscape(session.logPath)} 2>/dev/null || echo 0`, signal, 5_000);
     const size = parseInt(sizeOutput.trim(), 10);
     if (size > 1_048_576) {
-      await sshExec(machine, `tail -c 1048576 ${shellEscape(session.logPath)} > ${shellEscape(session.logPath)}.tmp && mv ${shellEscape(session.logPath)}.tmp ${shellEscape(session.logPath)}`, signal, 10_000);
+      await tmuxExec(machine, `tail -c 1048576 ${shellEscape(session.logPath)} > ${shellEscape(session.logPath)}.tmp && mv ${shellEscape(session.logPath)}.tmp ${shellEscape(session.logPath)}`, signal, 10_000);
       console.log(`[tmux-runner] Truncated log to 1MB (was ${(size / 1_048_576).toFixed(1)}MB)`);
     }
   } catch { /* non-critical */ }
@@ -675,12 +711,12 @@ export async function killTmuxSession(machine: MachineRecord, sessionId: string)
 
   // Kill tmux session
   try {
-    await sshExec(machine, `tmux kill-session -t ${shellEscape(session.tmuxName)} 2>/dev/null || true`);
+    await tmuxExec(machine, `tmux kill-session -t ${shellEscape(session.tmuxName)} 2>/dev/null || true`);
   } catch { /* ignore */ }
 
   // Clean up log file
   try {
-    await sshExec(machine, `rm -f ${shellEscape(session.logPath)}`);
+    await tmuxExec(machine, `rm -f ${shellEscape(session.logPath)}`);
   } catch { /* ignore */ }
 
   tmuxSessions.delete(sessionId);

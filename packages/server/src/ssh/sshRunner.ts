@@ -8,7 +8,7 @@ import { config } from '../config.js';
 import { jumpHostStore, type JumpHost } from './jumpHostStore.js';
 
 /** Manual exec wrapper — avoids util.promisify's custom symbol requirement for exec. */
-function execLocal(cmd: string, opts?: { timeout?: number }): Promise<{ stdout: string; stderr: string }> {
+export function execLocal(cmd: string, opts?: { timeout?: number }): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     execCb(cmd, opts ?? {}, (err, stdout, stderr) => {
       if (err) reject(err);
@@ -18,7 +18,7 @@ function execLocal(cmd: string, opts?: { timeout?: number }): Promise<{ stdout: 
 }
 
 /** Get shell + args for local execution. Uses interactive mode to load user PATH/env. */
-function getLocalShell(machine: MachineRecord): [string, string[]] {
+export function getLocalShell(machine: MachineRecord): [string, string[]] {
   if (machine.localShell) {
     return [machine.localShell, ['-ic']];
   }
@@ -407,9 +407,9 @@ export async function connectWithRetry(
   machine: MachineRecord,
   signal?: AbortSignal,
 ): Promise<TunneledConnection> {
-  // Check if jump hosts are enabled
+  // Check if jump hosts are enabled — skip for local machines (no IP to forward to)
   const jhCfg = jumpHostStore.getConfig();
-  const useJumpHosts = jhCfg.enabled && jhCfg.hosts.length > 0;
+  const useJumpHosts = jhCfg.enabled && jhCfg.hosts.length > 0 && !isLocalMachine(machine);
 
   const maxAttempts = Math.max(1, config.sshConnectRetries + 1);
   let lastErr: Error = new Error('SSH connect failed');
