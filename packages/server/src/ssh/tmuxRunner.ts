@@ -494,8 +494,8 @@ export function isResponseLine(line: string): boolean {
   // Auto-update / deprecation
   if (/^globalVersion:/.test(t)) return false;
   if (/^Claude Code has switched/.test(t)) return false;
-  // Spinner / progress lines (✳ Misting…, ✻ Thinking…, etc.)
-  if (/^[✳✻✽·✢∗☆★✦✧⊹] \w+/.test(t)) return false;
+  // Spinner / progress lines (✳ Misting…, ✻ Thinking…, ✶ Mulling…, etc.)
+  if (/^[✳✻✽·✢∗☆★✦✧⊹✶] \w+/.test(t)) return false;
   // Streaming indicators with timing/tokens
   if (/^\(?\d+s\s*·/.test(t)) return false;
   if (/^↑|^↓/.test(t)) return false;
@@ -598,15 +598,20 @@ export async function streamTmuxOutput(
     }
 
     // Check for prompt (response complete)
-    const lastLines = lines.filter(l => l.trim()).slice(-3).map(l => l.trim());
-    if (hasContent && lastLines.some(isPromptLine)) {
+    // Scan last ~10 non-empty lines: the ❯ prompt can be several lines from
+    // the bottom (above horizontal rule, status bar, auto-update message)
+    const bottomLines = lines.filter(l => l.trim()).slice(-10).map(l => l.trim());
+    const hasPrompt = bottomLines.some(isPromptLine);
+    // Also verify no spinner is active (Claude is still working)
+    const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶] \w+/.test(l));
+    if (hasContent && hasPrompt && !hasSpinner) {
       console.log('[tmux-runner] Prompt detected — response complete');
       parser.flush();
       return { completed: true };
     }
 
     // Check for shell prompt (claude exited)
-    if (hasContent && lastLines.some(l => /\$\s*$/.test(l) && !/\\\$/.test(l))) {
+    if (hasContent && bottomLines.some(l => /\$\s*$/.test(l) && !/\\\$/.test(l))) {
       console.warn('[tmux-runner] Shell prompt detected — claude may have exited');
       parser.flush();
       onChunk({ type: 'stderr', text: '[banana-tmux] Claude process exited\n' });
