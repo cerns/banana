@@ -571,7 +571,7 @@ describe('tmuxRunner', () => {
           callCount++;
 
           // For the "cat logPath" command, return the prompt to indicate ready
-          if (cmd.includes('cat ')) {
+          if (cmd.includes('capture-pane')) {
             process.nextTick(() => {
               stream.emit('data', Buffer.from('>\n'));
               stream.emit('close', 0);
@@ -599,7 +599,7 @@ describe('tmuxRunner', () => {
         client.exec.mockImplementation((cmd: string, cb: Function) => {
           const stream = createMockStream();
           cb(null, stream);
-          if (cmd.includes('cat ')) {
+          if (cmd.includes('capture-pane')) {
             process.nextTick(() => {
               stream.emit('data', Buffer.from('>\n'));
               stream.emit('close', 0);
@@ -636,7 +636,7 @@ describe('tmuxRunner', () => {
             // First has-session → success (for initial creation verify it won't be called)
             // Later has-session → fail (session died)
             process.nextTick(() => stream.emit('close', 1)); // exit 1 = not found
-          } else if (cmd.includes('cat ')) {
+          } else if (cmd.includes('capture-pane')) {
             process.nextTick(() => {
               stream.emit('data', Buffer.from('>\n'));
               stream.emit('close', 0);
@@ -671,7 +671,7 @@ describe('tmuxRunner', () => {
           const stream = createMockStream();
           cb(null, stream);
           // Never return the ">" prompt for cat commands — simulate timeout
-          if (cmd.includes('cat ')) {
+          if (cmd.includes('capture-pane')) {
             process.nextTick(() => {
               stream.emit('data', Buffer.from('loading...\n'));
               stream.emit('close', 0);
@@ -698,7 +698,7 @@ describe('tmuxRunner', () => {
           executedCmds.push(cmd);
           const stream = createMockStream();
           cb(null, stream);
-          if (cmd.includes('cat ')) {
+          if (cmd.includes('capture-pane')) {
             process.nextTick(() => {
               stream.emit('data', Buffer.from('>\n'));
               stream.emit('close', 0);
@@ -728,7 +728,7 @@ describe('tmuxRunner', () => {
           executedCmds.push(cmd);
           const stream = createMockStream();
           cb(null, stream);
-          if (cmd.includes('cat ')) {
+          if (cmd.includes('capture-pane')) {
             process.nextTick(() => {
               stream.emit('data', Buffer.from('>\n'));
               stream.emit('close', 0);
@@ -800,7 +800,7 @@ describe('tmuxRunner', () => {
           executedCmds.push(cmd);
           const stream = createMockStream();
           cb(null, stream);
-          if (cmd.includes('cat ')) {
+          if (cmd.includes('capture-pane')) {
             process.nextTick(() => {
               stream.emit('data', Buffer.from('>\n'));
               stream.emit('close', 0);
@@ -843,7 +843,7 @@ describe('tmuxRunner', () => {
           executedCmds.push(cmd);
           const stream = createMockStream();
           cb(null, stream);
-          if (cmd.includes('cat ')) {
+          if (cmd.includes('capture-pane')) {
             process.nextTick(() => {
               stream.emit('data', Buffer.from('>\n'));
               stream.emit('close', 0);
@@ -891,7 +891,7 @@ describe('tmuxRunner', () => {
         client.exec.mockImplementation((cmd: string, cb: Function) => {
           const stream = createMockStream();
           cb(null, stream);
-          if (cmd.includes('cat ')) {
+          if (cmd.includes('capture-pane')) {
             process.nextTick(() => {
               stream.emit('data', Buffer.from('>\n'));
               stream.emit('close', 0);

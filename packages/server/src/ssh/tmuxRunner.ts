@@ -321,6 +321,16 @@ export async function ensureTmuxSession(
   const tmuxName = `banana-${sessionId}`;
   const logPath = `/tmp/banana-tmux-log-${sessionId}`;
 
+  // Verify tmux is installed
+  try {
+    await tmuxExec(machine, 'command -v tmux', signal, 10_000);
+  } catch {
+    const hint = isLocalMachine(machine)
+      ? 'Install it with: brew install tmux (macOS) or apt install tmux (Linux)'
+      : 'Install it on the remote machine: apt install tmux / yum install tmux';
+    throw new Error(`tmux is not installed or not in PATH. ${hint}`);
+  }
+
   // Kill any stale session with the same name
   try {
     await tmuxExec(machine, `tmux kill-session -t ${shellEscape(tmuxName)} 2>/dev/null || true`, signal, 10_000);
@@ -370,18 +380,27 @@ export async function ensureTmuxSession(
   const timeoutMs = config.tmuxStartupTimeoutMs;
   let ready = false;
 
+  let lastScreen = '';
   while (Date.now() - startedAt < timeoutMs) {
     if (signal?.aborted) throw new Error('Aborted');
     await new Promise(r => setTimeout(r, 2000));
     try {
-      const logContent = await tmuxExec(
+      // capture-pane -p returns the rendered screen content as plain text
+      // (much more reliable than pipe-pane log for TUI apps like Claude)
+      const screen = await tmuxExec(
         machine,
-        `cat ${shellEscape(logPath)} 2>/dev/null || echo ''`,
+        `tmux capture-pane -t ${shellEscape(tmuxName)} -p`,
         signal,
         10_000,
       );
-      const cleaned = stripAnsi(logContent);
-      // Claude TUI shows ">" when ready for input
+      const cleaned = stripAnsi(screen);
+      lastScreen = cleaned;
+      const elapsed = ((Date.now() - startedAt) / 1000).toFixed(1);
+      const summary = cleaned.trim().split('\n').filter(l => l.trim()).slice(-3).join(' | ');
+      if (summary) {
+        console.log(`[tmux-runner] Startup screen (${elapsed}s): ${summary.slice(-200)}`);
+      }
+      // Claude TUI shows ">" at start of line when ready for input
       if (/^>\s*$/m.test(cleaned)) {
         ready = true;
         break;
@@ -392,14 +411,14 @@ export async function ensureTmuxSession(
       }
     } catch (e) {
       if ((e as Error).message.includes('Claude failed')) throw e;
-      // transient SSH error — keep trying
+      // transient error — keep trying
     }
   }
 
   if (!ready) {
     // Clean up
     try { await tmuxExec(machine, `tmux kill-session -t ${shellEscape(tmuxName)} 2>/dev/null || true`); } catch { /* ignore */ }
-    throw new Error(`Claude did not start within ${timeoutMs}ms`);
+    throw new Error(`Claude did not start within ${timeoutMs}ms. Last screen:\n${lastScreen.slice(-1000)}`);
   }
 
   // Truncate the startup log so we start clean for the first prompt
