@@ -1,4 +1,3 @@
-import { spawn } from 'child_process';
 import * as fs from 'fs';
 import type { MachineRecord } from '../machines/machineStore.js';
 import type { SshRunResult, SshChunkCallback, TunneledConnection } from './sshRunner.js';
@@ -157,9 +156,12 @@ export class TmuxOutputParser {
     }
 
     // ── Prompt detection (response complete) ───────────────────────────
-    // Claude TUI shows ">" at start of line when waiting for input.
+    // Claude TUI shows ">" or "❯" when waiting for input.
+    // "❯ Try ..." is the placeholder prompt; "❯ Allow/Deny/Yes/No" are menu items (not prompts).
     // Only counts if we've already seen response content.
-    if (/^>\s*$/.test(trimmed) && this.hasContent()) {
+    const isPrompt = /^[>❯]\s*$/.test(trimmed)
+      || (/^❯\s+/.test(trimmed) && !/^❯\s+(?:Allow|Deny|Yes|No)\b/i.test(trimmed));
+    if (isPrompt && this.hasContent()) {
       // Signal completion — handled by the caller via isPrompt flag
       return;
     }
@@ -318,8 +320,9 @@ export async function ensureTmuxSession(
     }
   }
 
-  const tmuxName = `banana-${sessionId}`;
-  const logPath = `/tmp/banana-tmux-log-${sessionId}`;
+  const sid8 = sessionId.slice(0, 8);
+  const tmuxName = `banana-${sid8}`;
+  const logPath = `/tmp/banana-tmux-log-${sid8}`;
 
   // Verify tmux is installed
   try {
@@ -400,8 +403,13 @@ export async function ensureTmuxSession(
       if (summary) {
         console.log(`[tmux-runner] Startup screen (${elapsed}s): ${summary.slice(-200)}`);
       }
-      // Claude TUI shows ">" at start of line when ready for input
-      if (/^>\s*$/m.test(cleaned)) {
+      // Claude TUI shows ">" or "❯" prompt when ready for input
+      // Older: ">" on its own line; Newer: "❯ Try ..." or bare "❯"
+      // Exclude menu items: "❯ Allow/Deny/Yes/No"
+      const hasPrompt = /^[>❯]\s*$/m.test(cleaned)
+        || (cleaned.split('\n').some(l =>
+          /^❯\s+/.test(l.trim()) && !/^❯\s+(?:Allow|Deny|Yes|No)\b/i.test(l.trim())));
+      if (hasPrompt) {
         ready = true;
         break;
       }
@@ -472,8 +480,10 @@ export async function sendPromptViaTmux(
 }
 
 /**
- * Stream output from a tmux session's log file.
- * Opens a persistent SSH connection with `tail -f` and feeds through TmuxOutputParser.
+ * Stream output from a tmux session by polling `tmux capture-pane`.
+ * TUI apps (like Claude) render full-screen, so pipe-pane/tail-f produces
+ * unusable raw terminal data. capture-pane returns the rendered screen as
+ * plain text — we diff successive captures to extract new content.
  * Resolves when the response is complete (prompt reappears or idle timeout).
  */
 export async function streamTmuxOutput(
@@ -484,135 +494,106 @@ export async function streamTmuxOutput(
 ): Promise<{ completed: boolean }> {
   if (signal?.aborted) throw new Error('Aborted');
 
-  // Shared stream processing — same logic for local and SSH tail -f
-  const processStream = (
-    stdout: NodeJS.ReadableStream,
-    stderr: NodeJS.ReadableStream | null,
-    kill: () => void,
-    cleanupFn: () => void,
-  ): Promise<{ completed: boolean }> => {
-    return new Promise<{ completed: boolean }>((resolve, reject) => {
-      let settled = false;
-      const settle = (fn: () => void) => { if (!settled) { settled = true; fn(); } };
+  const pollIntervalMs = 500;
+  let prevScreen = '';
+  let hasContent = false;
 
-      let idleTimer: ReturnType<typeof setTimeout> | undefined;
-      const resetIdle = () => {
-        if (idleTimer) clearTimeout(idleTimer);
-        idleTimer = setTimeout(() => {
-          console.log(`[tmux-runner] Idle timeout (${config.tmuxIdleCompletionMs}ms) — response complete`);
-          onChunk({ type: 'stderr', text: `[banana-tmux] Idle timeout — response complete\n` });
-          parser.flush();
-          cleanupAndResolve(true);
-        }, config.tmuxIdleCompletionMs);
-      };
-
-      const cleanupAndResolve = (completed: boolean) => {
-        if (idleTimer) clearTimeout(idleTimer);
-        session.tailConn = null;
-        cleanupFn();
-        settle(() => resolve({ completed }));
-      };
-
-      const sendKeysForApprove = (keys: string) => {
-        tmuxSendKeys(machine, session.tmuxName, keys, signal).catch((e) => {
-          console.warn(`[tmux-runner] Failed to send auto-approve keys: ${e.message}`);
-        });
-      };
-
-      const parser = new TmuxOutputParser(onChunk, sendKeysForApprove);
-
-      resetIdle();
-
-      stdout.on('data', (data: Buffer) => {
-        resetIdle();
-        const text = data.toString();
-        const cleaned = stripAnsi(text);
-
-        parser.feed(text);
-
-        if (parser.hasContent() && /^>\s*$/m.test(cleaned)) {
-          console.log('[tmux-runner] Prompt detected — response complete');
-          parser.flush();
-          kill();
-          cleanupAndResolve(true);
-          return;
-        }
-
-        if (parser.hasContent() && /\$\s*$/m.test(cleaned) && !/\\\$/m.test(cleaned)) {
-          console.warn('[tmux-runner] Shell prompt detected — claude may have exited');
-          parser.flush();
-          onChunk({ type: 'stderr', text: '[banana-tmux] Claude process exited\n' });
-          kill();
-          cleanupAndResolve(true);
-          return;
-        }
-      });
-
-      if (stderr) {
-        stderr.on('data', (data: Buffer) => {
-          resetIdle();
-          console.error(`[tmux-runner] tail stderr: ${data.toString().trim()}`);
-        });
-      }
-
-      stdout.on('close', () => {
-        if (idleTimer) clearTimeout(idleTimer);
-        parser.flush();
-        session.tailConn = null;
-        settle(() => resolve({ completed: true }));
-      });
-
-      stdout.on('error', (e: Error) => {
-        if (idleTimer) clearTimeout(idleTimer);
-        console.error(`[tmux-runner] tail stream error: ${e.message}`);
-        session.tailConn = null;
-        settle(() => reject(e));
-      });
-
-      const onAbort = () => {
-        if (idleTimer) clearTimeout(idleTimer);
-        kill();
-        session.tailConn = null;
-        settle(() => reject(new Error('Aborted')));
-      };
-      signal?.addEventListener('abort', onAbort, { once: true });
-      stdout.on('close', () => signal?.removeEventListener('abort', onAbort));
+  const sendKeysForApprove = (keys: string) => {
+    tmuxSendKeys(machine, session.tmuxName, keys, signal).catch((e) => {
+      console.warn(`[tmux-runner] Failed to send auto-approve keys: ${e.message}`);
     });
   };
 
-  // ── Local: spawn `tail -f` directly ──
-  if (isLocalMachine(machine)) {
-    const proc = spawn('tail', ['-f', session.logPath], { stdio: ['ignore', 'pipe', 'pipe'] });
-    return processStream(
-      proc.stdout,
-      proc.stderr,
-      () => proc.kill(),
-      () => { try { proc.kill(); } catch { /* noop */ } },
+  const parser = new TmuxOutputParser(onChunk, sendKeysForApprove);
+
+  let lastChangeAt = Date.now();
+
+  // Take initial snapshot so we only emit new content
+  try {
+    const initial = await tmuxExec(
+      machine,
+      `tmux capture-pane -t ${shellEscape(session.tmuxName)} -p`,
+      signal,
+      10_000,
     );
+    prevScreen = stripAnsi(initial);
+  } catch { /* start from empty */ }
+
+  while (true) {
+    if (signal?.aborted) throw new Error('Aborted');
+    await new Promise(r => setTimeout(r, pollIntervalMs));
+    if (signal?.aborted) throw new Error('Aborted');
+
+    let screen: string;
+    try {
+      const raw = await tmuxExec(
+        machine,
+        `tmux capture-pane -t ${shellEscape(session.tmuxName)} -p`,
+        signal,
+        10_000,
+      );
+      screen = stripAnsi(raw);
+    } catch (e) {
+      console.warn(`[tmux-runner] capture-pane failed: ${(e as Error).message}`);
+      continue;
+    }
+
+    // Diff: find new content by comparing with previous capture
+    const prevLines = prevScreen.split('\n');
+    const currLines = screen.split('\n');
+
+    // Find new or changed lines (simple: compare trimmed non-empty lines)
+    const prevTrimmed = prevLines.map(l => l.trim()).filter(Boolean).join('\n');
+    const currTrimmed = currLines.map(l => l.trim()).filter(Boolean).join('\n');
+
+    if (currTrimmed !== prevTrimmed) {
+      lastChangeAt = Date.now();
+
+      // Extract the portion that's new
+      const newContent = currTrimmed.startsWith(prevTrimmed)
+        ? currTrimmed.slice(prevTrimmed.length).trim()
+        : currTrimmed;
+
+      if (newContent) {
+        hasContent = true;
+        // Feed new lines through the parser
+        for (const line of newContent.split('\n')) {
+          if (line.trim()) {
+            parser.feed(line + '\n');
+          }
+        }
+      }
+
+      prevScreen = screen;
+    }
+
+    // Check for prompt (response complete)
+    // Look at last few non-empty lines of current screen
+    const lastLines = currLines.filter(l => l.trim()).slice(-3).map(l => l.trim());
+    const isPromptLine = (l: string) =>
+      /^[>❯]\s*$/.test(l) || (/^❯\s+/.test(l) && !/^❯\s+(?:Allow|Deny|Yes|No)\b/i.test(l));
+    if (hasContent && lastLines.some(isPromptLine)) {
+      console.log('[tmux-runner] Prompt detected — response complete');
+      parser.flush();
+      return { completed: true };
+    }
+
+    // Check for shell prompt (claude exited)
+    if (hasContent && lastLines.some(l => /\$\s*$/.test(l) && !/\\\$/.test(l))) {
+      console.warn('[tmux-runner] Shell prompt detected — claude may have exited');
+      parser.flush();
+      onChunk({ type: 'stderr', text: '[banana-tmux] Claude process exited\n' });
+      return { completed: true };
+    }
+
+    // Idle timeout — screen unchanged for tmuxIdleCompletionMs → done
+    if (hasContent && Date.now() - lastChangeAt > config.tmuxIdleCompletionMs) {
+      console.log(`[tmux-runner] Idle timeout (${config.tmuxIdleCompletionMs}ms) — response complete`);
+      onChunk({ type: 'stderr', text: `[banana-tmux] Idle timeout — response complete\n` });
+      parser.flush();
+      return { completed: true };
+    }
   }
-
-  // ── Remote: SSH tail -f ──
-  const { client: conn, cleanup } = await connectWithRetry(machine, signal);
-  session.tailConn = { client: conn, cleanup };
-
-  conn.on('error', (err) => {
-    session.tailConn = null;
-    // Error will propagate through stream events
-    console.error(`[tmux-runner] SSH connection error: ${err.message}`);
-  });
-
-  return new Promise<{ completed: boolean }>((resolve, reject) => {
-    const shell = machine.localShell || '/bin/bash';
-    conn.exec(`${shell} -ic ${shellEscape('tail -f ' + shellEscape(session.logPath))}`, (err, stream) => {
-      if (err) { cleanup(); reject(err); return; }
-      processStream(
-        stream,
-        stream.stderr,
-        () => stream.close(),
-        () => cleanup(),
-      ).then(resolve, reject);
-    });
-  });
 }
 
 /**

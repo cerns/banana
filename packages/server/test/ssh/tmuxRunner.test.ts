@@ -461,6 +461,30 @@ describe('tmuxRunner', () => {
       expect(chunks.length).toBe(countBefore);
     });
 
+    it('should detect "❯ Try ..." as prompt (completion signal)', () => {
+      const chunks: any[] = [];
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c));
+
+      parser.feed('Some response text\n');
+      const countBefore = chunks.length;
+      parser.feed('❯ Try "how do I log an error?"\n');
+
+      // The "❯ Try ..." line is a prompt, not emitted as text
+      expect(chunks.length).toBe(countBefore);
+    });
+
+    it('should NOT treat "❯ Allow once" as a prompt', () => {
+      const chunks: any[] = [];
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), undefined, false);
+
+      parser.feed('Some response text\n');
+      const countBefore = chunks.length;
+      parser.feed('❯ Allow once\n');
+
+      // "❯ Allow" is a menu item, should be emitted as text (not treated as prompt)
+      expect(chunks.length).toBeGreaterThan(countBefore);
+    });
+
     it('should treat ">" as regular text before any content (no completion)', () => {
       const chunks: any[] = [];
       const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c));
@@ -585,8 +609,8 @@ describe('tmuxRunner', () => {
 
       const session = await tmuxRunner.ensureTmuxSession(machine, 'test-session-id', '/work');
 
-      expect(session.tmuxName).toBe('banana-test-session-id');
-      expect(session.logPath).toBe('/tmp/banana-tmux-log-test-session-id');
+      expect(session.tmuxName).toBe('banana-test-ses');
+      expect(session.logPath).toBe('/tmp/banana-tmux-log-test-ses');
       expect(session.ready).toBe(true);
       expect(tmuxRunner.hasTmuxSession('test-session-id')).toBe(true);
     });
@@ -910,58 +934,28 @@ describe('tmuxRunner', () => {
     });
   });
 
-  // ── streamTmuxOutput ──────────────────────────────────────────────────────
+  // ── streamTmuxOutput (capture-pane polling) ──────────────────────────────
   describe('streamTmuxOutput', () => {
-    it('should use interactive shell for tail -f', async () => {
-      const machine = makeMachine({ localShell: '/bin/zsh' });
-      let tailCmd = '';
-
-      mockConnectWithRetry.mockImplementation(async () => {
-        const client = createMockClient();
-        client.exec.mockImplementation((cmd: string, cb: Function) => {
-          tailCmd = cmd;
-          const stream = createMockStream();
-          cb(null, stream);
-          // Emit some content then prompt to trigger completion
-          process.nextTick(() => {
-            stream.emit('data', Buffer.from('Response text\n'));
-            process.nextTick(() => {
-              stream.emit('data', Buffer.from('>\n'));
-            });
-          });
-        });
-        return { client, cleanup: vi.fn() };
-      });
-
-      const session = {
-        tmuxName: 'banana-stream-test',
-        logPath: '/tmp/banana-tmux-log-stream-test',
-        ready: true,
-        tailConn: null,
-      };
-
-      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
-      const chunks: any[] = [];
-      await tmuxRunner.streamTmuxOutput(machine, session as any, (c: any) => chunks.push(c));
-
-      expect(tailCmd).toMatch(/^\/bin\/zsh -ic /);
-      expect(tailCmd).toContain('tail -f');
-      logSpy.mockRestore();
-    });
-
     it('should complete when prompt is detected after content', async () => {
       const machine = makeMachine();
+      let callCount = 0;
 
       mockConnectWithRetry.mockImplementation(async () => {
         const client = createMockClient();
         client.exec.mockImplementation((cmd: string, cb: Function) => {
+          callCount++;
           const stream = createMockStream();
           cb(null, stream);
           process.nextTick(() => {
-            stream.emit('data', Buffer.from('Hello from Claude\n'));
-            process.nextTick(() => {
-              stream.emit('data', Buffer.from('>\n'));
-            });
+            if (cmd.includes('capture-pane')) {
+              // First poll: content; second poll: content + prompt
+              if (callCount <= 2) {
+                stream.emit('data', Buffer.from('Hello from Claude\n'));
+              } else {
+                stream.emit('data', Buffer.from('Hello from Claude\nDone.\n>\n'));
+              }
+            }
+            stream.emit('close', 0);
           });
         });
         return { client, cleanup: vi.fn() };
@@ -983,6 +977,45 @@ describe('tmuxRunner', () => {
       logSpy.mockRestore();
     });
 
+    it('should complete when ❯ prompt is detected', async () => {
+      const machine = makeMachine();
+      let callCount = 0;
+
+      mockConnectWithRetry.mockImplementation(async () => {
+        const client = createMockClient();
+        client.exec.mockImplementation((cmd: string, cb: Function) => {
+          callCount++;
+          const stream = createMockStream();
+          cb(null, stream);
+          process.nextTick(() => {
+            if (cmd.includes('capture-pane')) {
+              if (callCount <= 2) {
+                stream.emit('data', Buffer.from('Working on it...\n'));
+              } else {
+                stream.emit('data', Buffer.from('Working on it...\nDone.\n❯ Try something\n'));
+              }
+            }
+            stream.emit('close', 0);
+          });
+        });
+        return { client, cleanup: vi.fn() };
+      });
+
+      const session = {
+        tmuxName: 'banana-prompt2-test',
+        logPath: '/tmp/banana-tmux-log-prompt2-test',
+        ready: true,
+        tailConn: null,
+      };
+
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const chunks: any[] = [];
+      const result = await tmuxRunner.streamTmuxOutput(machine, session as any, (c: any) => chunks.push(c));
+
+      expect(result.completed).toBe(true);
+      logSpy.mockRestore();
+    });
+
     it('should reject if signal already aborted', async () => {
       const machine = makeMachine();
       const controller = new AbortController();
@@ -998,29 +1031,6 @@ describe('tmuxRunner', () => {
       await expect(
         tmuxRunner.streamTmuxOutput(machine, session as any, () => {}, controller.signal),
       ).rejects.toThrow('Aborted');
-    });
-
-    it('should reject on connection error', async () => {
-      const machine = makeMachine();
-
-      mockConnectWithRetry.mockImplementation(async () => {
-        const client = createMockClient();
-        client.exec.mockImplementation((cmd: string, cb: Function) => {
-          cb(new Error('exec failed'));
-        });
-        return { client, cleanup: vi.fn() };
-      });
-
-      const session = {
-        tmuxName: 'banana-err-test',
-        logPath: '/tmp/banana-tmux-log-err-test',
-        ready: true,
-        tailConn: null,
-      };
-
-      await expect(
-        tmuxRunner.streamTmuxOutput(machine, session as any, () => {}),
-      ).rejects.toThrow('exec failed');
     });
   });
 });
