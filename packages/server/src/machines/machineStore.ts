@@ -52,6 +52,9 @@ export interface MachineRecord {
    *  running claude. Used to pre-approve tools on enterprise plans where
    *  --dangerously-skip-permissions is blocked. */
   permissionSettings?: Record<string, unknown>;
+  /** Shell to use for local execution. Default: auto-detect (zsh on macOS, bash on Linux).
+   *  Examples: '/bin/zsh', '/bin/bash'. Uses interactive mode (-ic) to load user PATH. */
+  localShell?: string;
   createdAt: string;
   updatedAt: string;
 }

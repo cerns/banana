@@ -1,5 +1,6 @@
 import { Client } from 'ssh2';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { spawn, exec as execCb } from 'child_process';
 import type { MachineRecord } from '../machines/machineStore.js';
@@ -14,6 +15,18 @@ function execLocal(cmd: string, opts?: { timeout?: number }): Promise<{ stdout: 
       else resolve({ stdout: stdout as string, stderr: stderr as string });
     });
   });
+}
+
+/** Get shell + args for local execution. Uses interactive mode to load user PATH/env. */
+function getLocalShell(machine: MachineRecord): [string, string[]] {
+  if (machine.localShell) {
+    return [machine.localShell, ['-ic']];
+  }
+  // Auto-detect: zsh on macOS (default shell), bash elsewhere
+  if (os.platform() === 'darwin') {
+    return ['/bin/zsh', ['-ic']];
+  }
+  return ['/bin/bash', ['-ic']];
 }
 
 /** Returns true if the machine should execute locally (empty/localhost/127.0.0.1). */
@@ -579,8 +592,11 @@ async function runClaudeLocally(
 
   console.log(`[ssh-runner] Running locally: ${claudeBin}${model ? ` --model ${model}` : ''}${resumeId ? ' --resume' : ''} (prompt ${prompt.length} chars)`);
 
+  const [shell, shellArgs] = getLocalShell(machine);
+  console.log(`[ssh-runner] Shell: ${shell} ${shellArgs.join(' ')}`);
+
   return new Promise((resolve, reject) => {
-    const child = spawn('sh', ['-c', command], {
+    const child = spawn(shell, [...shellArgs, command], {
       cwd: workdir || undefined,
       stdio: ['ignore', 'pipe', 'pipe'],
     });

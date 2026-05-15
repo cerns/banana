@@ -983,6 +983,7 @@ function showMachineForm(machine) {
   document.getElementById('mf-workdir').value = machine?.defaultWorkdir || '';
   document.getElementById('mf-os').value = machine?.os || '';
   document.getElementById('mf-mac').value = machine?.macAddress || '';
+  document.getElementById('mf-shell').value = machine?.localShell || '';
   document.getElementById('mf-notes').value = machine?.notes || '';
   const skipPerms = machine?.skipPermissions !== false; // default true
   document.getElementById('mf-skip-perms').checked = skipPerms;
@@ -1080,6 +1081,7 @@ document.getElementById('mf-save').addEventListener('click', async () => {
     defaultWorkdir: document.getElementById('mf-workdir').value || undefined,
     os: document.getElementById('mf-os').value || undefined,
     macAddress: document.getElementById('mf-mac').value || undefined,
+    localShell: document.getElementById('mf-shell').value || undefined,
     notes: document.getElementById('mf-notes').value || undefined,
     skipPermissions: document.getElementById('mf-skip-perms').checked,
   };

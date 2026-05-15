@@ -846,8 +846,8 @@ describe('sshRunner', () => {
 
       await flush();
 
-      // spawn should have been called with sh -c
-      expect(mockSpawn).toHaveBeenCalledWith('sh', ['-c', expect.any(String)], expect.objectContaining({
+      // spawn should have been called with the local shell (auto-detected)
+      expect(mockSpawn).toHaveBeenCalledWith(expect.any(String), ['-ic', expect.any(String)], expect.objectContaining({
         cwd: '/work',
         stdio: ['ignore', 'pipe', 'pipe'],
       }));

@@ -296,6 +296,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       macAddress: body.macAddress,
       os: body.os,
       notes: body.notes,
+      localShell: body.localShell,
       skipPermissions: body.skipPermissions,
       permissionSettings: body.permissionSettings,
       createdAt: now,
