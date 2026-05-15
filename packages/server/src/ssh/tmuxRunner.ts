@@ -479,12 +479,46 @@ export async function sendPromptViaTmux(
   }
 }
 
+/** Filter TUI chrome/noise from capture-pane output. Returns true for response content lines. */
+export function isResponseLine(line: string): boolean {
+  const t = line.trim();
+  if (!t) return false;
+  // Horizontal rules
+  if (/^[─━═]{5,}$/.test(t)) return false;
+  // Claude logo
+  if (/^[▐▛▝▘]/.test(t)) return false;
+  // Status bar / footer
+  if (/^\? for shortcuts/.test(t)) return false;
+  if (/^esc to interrupt/.test(t)) return false;
+  if (/^\d+ tokens$/.test(t)) return false;
+  // Auto-update / deprecation
+  if (/^globalVersion:/.test(t)) return false;
+  if (/^Claude Code has switched/.test(t)) return false;
+  // Spinner / progress lines (✳ Misting…, ✻ Thinking…, etc.)
+  if (/^[✳✻✽·✢∗☆★✦✧⊹] \w+/.test(t)) return false;
+  // Streaming indicators with timing/tokens
+  if (/^\(?\d+s\s*·/.test(t)) return false;
+  if (/^↑|^↓/.test(t)) return false;
+  // Shell prompt
+  if (/^\w+@[\w.-]+:.*[\$#]\s*$/.test(t)) return false;
+  // Command echo (the tmux send-keys command)
+  if (/^cd\s+'.*&&.*export\s+PATH=/.test(t)) return false;
+  // Separator lines (MOTD === blocks)
+  if (/^={5,}$/.test(t)) return false;
+  return true;
+}
+
+/** Check if a line is a Claude prompt indicator (response complete). */
+function isPromptLine(line: string): boolean {
+  const t = line.trim();
+  return /^[>❯]\s*$/.test(t) || (/^❯\s+/.test(t) && !/^❯\s+(?:Allow|Deny|Yes|No)\b/i.test(t));
+}
+
 /**
  * Stream output from a tmux session by polling `tmux capture-pane`.
  * TUI apps (like Claude) render full-screen, so pipe-pane/tail-f produces
- * unusable raw terminal data. capture-pane returns the rendered screen as
- * plain text — we diff successive captures to extract new content.
- * Resolves when the response is complete (prompt reappears or idle timeout).
+ * unusable raw terminal data. capture-pane returns the rendered screen.
+ * We filter TUI chrome and deduplicate lines to emit clean response content.
  */
 export async function streamTmuxOutput(
   machine: MachineRecord,
@@ -495,8 +529,11 @@ export async function streamTmuxOutput(
   if (signal?.aborted) throw new Error('Aborted');
 
   const pollIntervalMs = 500;
-  let prevScreen = '';
   let hasContent = false;
+  let lastChangeAt = Date.now();
+
+  // Track emitted lines to avoid duplicates (TUI redraws same content)
+  const emittedLines = new Set<string>();
 
   const sendKeysForApprove = (keys: string) => {
     tmuxSendKeys(machine, session.tmuxName, keys, signal).catch((e) => {
@@ -506,9 +543,7 @@ export async function streamTmuxOutput(
 
   const parser = new TmuxOutputParser(onChunk, sendKeysForApprove);
 
-  let lastChangeAt = Date.now();
-
-  // Take initial snapshot so we only emit new content
+  // Seed emitted set with initial screen content so we only emit new response lines
   try {
     const initial = await tmuxExec(
       machine,
@@ -516,7 +551,10 @@ export async function streamTmuxOutput(
       signal,
       10_000,
     );
-    prevScreen = stripAnsi(initial);
+    for (const line of stripAnsi(initial).split('\n')) {
+      const t = line.trim();
+      if (t) emittedLines.add(t);
+    }
   } catch { /* start from empty */ }
 
   while (true) {
@@ -538,40 +576,29 @@ export async function streamTmuxOutput(
       continue;
     }
 
-    // Diff: find new content by comparing with previous capture
-    const prevLines = prevScreen.split('\n');
-    const currLines = screen.split('\n');
+    const lines = screen.split('\n');
 
-    // Find new or changed lines (simple: compare trimmed non-empty lines)
-    const prevTrimmed = prevLines.map(l => l.trim()).filter(Boolean).join('\n');
-    const currTrimmed = currLines.map(l => l.trim()).filter(Boolean).join('\n');
+    // Emit new response content lines (deduplicated, noise-filtered)
+    let newContentThisPoll = false;
+    for (const line of lines) {
+      const t = line.trim();
+      if (!t) continue;
+      if (emittedLines.has(t)) continue;
+      emittedLines.add(t);
 
-    if (currTrimmed !== prevTrimmed) {
-      lastChangeAt = Date.now();
-
-      // Extract the portion that's new
-      const newContent = currTrimmed.startsWith(prevTrimmed)
-        ? currTrimmed.slice(prevTrimmed.length).trim()
-        : currTrimmed;
-
-      if (newContent) {
+      if (isResponseLine(t)) {
+        newContentThisPoll = true;
         hasContent = true;
-        // Feed new lines through the parser
-        for (const line of newContent.split('\n')) {
-          if (line.trim()) {
-            parser.feed(line + '\n');
-          }
-        }
+        parser.feed(t + '\n');
       }
+    }
 
-      prevScreen = screen;
+    if (newContentThisPoll) {
+      lastChangeAt = Date.now();
     }
 
     // Check for prompt (response complete)
-    // Look at last few non-empty lines of current screen
-    const lastLines = currLines.filter(l => l.trim()).slice(-3).map(l => l.trim());
-    const isPromptLine = (l: string) =>
-      /^[>❯]\s*$/.test(l) || (/^❯\s+/.test(l) && !/^❯\s+(?:Allow|Deny|Yes|No)\b/i.test(l));
+    const lastLines = lines.filter(l => l.trim()).slice(-3).map(l => l.trim());
     if (hasContent && lastLines.some(isPromptLine)) {
       console.log('[tmux-runner] Prompt detected — response complete');
       parser.flush();
@@ -586,7 +613,7 @@ export async function streamTmuxOutput(
       return { completed: true };
     }
 
-    // Idle timeout — screen unchanged for tmuxIdleCompletionMs → done
+    // Idle timeout — no new content for tmuxIdleCompletionMs → done
     if (hasContent && Date.now() - lastChangeAt > config.tmuxIdleCompletionMs) {
       console.log(`[tmux-runner] Idle timeout (${config.tmuxIdleCompletionMs}ms) — response complete`);
       onChunk({ type: 'stderr', text: `[banana-tmux] Idle timeout — response complete\n` });

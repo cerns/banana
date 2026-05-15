@@ -1033,4 +1033,72 @@ describe('tmuxRunner', () => {
       ).rejects.toThrow('Aborted');
     });
   });
+
+  // ── isResponseLine (TUI noise filter) ──────────────────────────────────
+  describe('isResponseLine', () => {
+    it('should accept regular text content', () => {
+      expect(tmuxRunner.isResponseLine('Here are the files in your directory:')).toBe(true);
+    });
+
+    it('should accept tool use markers', () => {
+      expect(tmuxRunner.isResponseLine('⚙ Bash(ls -la)')).toBe(true);
+      expect(tmuxRunner.isResponseLine('⏺ Read(file.txt)')).toBe(true);
+    });
+
+    it('should accept tool result lines', () => {
+      expect(tmuxRunner.isResponseLine('⎿ file contents here')).toBe(true);
+      expect(tmuxRunner.isResponseLine('[tool result] output')).toBe(true);
+    });
+
+    it('should accept thinking markers', () => {
+      expect(tmuxRunner.isResponseLine('∴ Thinking…')).toBe(true);
+    });
+
+    it('should reject horizontal rules', () => {
+      expect(tmuxRunner.isResponseLine('─────────────────────')).toBe(false);
+      expect(tmuxRunner.isResponseLine('━━━━━━━━━━━━━━━━━━━━━')).toBe(false);
+    });
+
+    it('should reject Claude logo lines', () => {
+      expect(tmuxRunner.isResponseLine('▐▛███▜▌   Claude Code v2.1.63')).toBe(false);
+      expect(tmuxRunner.isResponseLine('▝▜█████▛▘  Sonnet 4.6')).toBe(false);
+    });
+
+    it('should reject status bar lines', () => {
+      expect(tmuxRunner.isResponseLine('? for shortcuts')).toBe(false);
+      expect(tmuxRunner.isResponseLine('esc to interrupt')).toBe(false);
+    });
+
+    it('should reject token count lines', () => {
+      expect(tmuxRunner.isResponseLine('23385 tokens')).toBe(false);
+    });
+
+    it('should reject auto-update messages', () => {
+      expect(tmuxRunner.isResponseLine('globalVersion: 2.1.63 · latestVersion: 2.1.142')).toBe(false);
+      expect(tmuxRunner.isResponseLine('Claude Code has switched from npm to native installer.')).toBe(false);
+    });
+
+    it('should reject spinner lines', () => {
+      expect(tmuxRunner.isResponseLine('✳ Misting… (3s)')).toBe(false);
+      expect(tmuxRunner.isResponseLine('✻ Thinking…')).toBe(false);
+      expect(tmuxRunner.isResponseLine('· Misting… (5s · ↑ 38 tokens)')).toBe(false);
+    });
+
+    it('should reject shell prompts', () => {
+      expect(tmuxRunner.isResponseLine('cern@CIA:~/Desktop/banana$')).toBe(false);
+    });
+
+    it('should reject command echo', () => {
+      expect(tmuxRunner.isResponseLine("cd '/Users/cern/Desktop/erp' && export PATH=\"$HOME/.bun/bin:$PATH\"")).toBe(false);
+    });
+
+    it('should reject MOTD separator lines', () => {
+      expect(tmuxRunner.isResponseLine('==============================')).toBe(false);
+    });
+
+    it('should reject empty lines', () => {
+      expect(tmuxRunner.isResponseLine('')).toBe(false);
+      expect(tmuxRunner.isResponseLine('   ')).toBe(false);
+    });
+  });
 });
