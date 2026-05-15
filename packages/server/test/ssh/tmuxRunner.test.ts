@@ -449,6 +449,52 @@ describe('tmuxRunner', () => {
       expect(chunks[0].type).toBe('stream_event');
     });
 
+    // ── Claude Code permission prompt format (newer) ──────────────────
+
+    it('should send "y Enter" for "Do you want to proceed?" (no y/n)', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('Do you want to proceed?\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('y Enter');
+      expect(chunks[0].text).toContain('confirm-proceed');
+    });
+
+it('should send "Enter" for numbered "1. Yes" menu item', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('1. Yes\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('Enter');
+      expect(chunks[0].text).toContain('menu-number-yes');
+    });
+
+    it('should send "Up Enter" for numbered "2. No" menu item', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('2. No\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('Up Enter');
+      expect(chunks[0].text).toContain('menu-number-no');
+    });
+
+    it('should send "Enter" for "❯ 1. Allow" menu item', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('❯ 1. Allow\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('Enter');
+      expect(chunks[0].text).toContain('menu-number-yes');
+    });
+
     it('should not emit prompt ">" after content (completion signal)', () => {
       const chunks: any[] = [];
       const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c));

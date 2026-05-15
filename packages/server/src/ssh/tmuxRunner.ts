@@ -59,11 +59,36 @@ const PERMISSION_PATTERNS: PermissionPattern[] = [
     test: (line) => /\bAllow\b.*\?\s*\(?\s*y(?:es)?\/n(?:o)?\s*\)?/i.test(line),
     keys: 'y Enter',
   },
-  // General confirmations: Proceed? Continue? Do you want to...?
+  // General confirmations with (y/n): Proceed? Continue? Do you want to...?
   {
     label: 'confirm-yn',
     test: (line) => /(?:Proceed|Continue|Do you (?:want|wish) to)\b.*\?\s*\(?\s*y(?:es)?\/n(?:o)?\s*\)?/i.test(line),
     keys: 'y Enter',
+  },
+  // Claude Code permission: "Do you want to proceed?" (no y/n, uses numbered menu)
+  // Send y as shortcut, fallback to Enter (if "Yes" is already selected)
+  {
+    label: 'confirm-proceed',
+    test: (line) => /Do you want to proceed\s*\??/i.test(line),
+    keys: 'y Enter',
+  },
+  // Claude Code permission: "Yes, allow" / "Yes, proceed" etc.
+  {
+    label: 'confirm-yes-text',
+    test: (line) => /^(?:Yes,?\s+(?:allow|proceed|continue))/i.test(line),
+    keys: 'Enter',
+  },
+  // Numbered menu: "1. Yes" or "1. Allow" (selected or not)
+  {
+    label: 'menu-number-yes',
+    test: (line) => /^[❯>►]?\s*1\.\s*(?:Yes|Allow)\b/i.test(line),
+    keys: 'Enter',
+  },
+  // Numbered menu: "2. No" or "2. Deny" (cursor is on No — navigate to Yes)
+  {
+    label: 'menu-number-no',
+    test: (line) => /^[❯>►]?\s*2\.\s*(?:No|Deny)\b/i.test(line),
+    keys: 'Up Enter',
   },
   // Menu: cursor on Allow/Yes option → press Enter
   {
