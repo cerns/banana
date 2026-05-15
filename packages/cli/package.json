@@ -1,14 +1,24 @@
 {
-  "name": "@banana/cli",
+  "name": "@isbael/bananab",
   "version": "1.0.0",
-  "private": true,
+  "description": "CLI client for remote session management over SSH",
   "main": "dist/index.js",
   "bin": {
     "banana": "dist/index.js"
   },
+  "files": [
+    "dist/"
+  ],
   "scripts": {
     "build": "tsc",
     "dev": "node dist/index.js",
     "watch": "tsc --watch"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
   }
 }

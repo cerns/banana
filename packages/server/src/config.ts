@@ -56,6 +56,13 @@ export const config = {
   // Default 10000 — triggers compact early to keep context lean.
   compactTokenThreshold: parseInt(process.env.BANANA_COMPACT_TOKEN_THRESHOLD ?? '10000', 10),
   jumpHostPersistPath: process.env.BANANA_JUMPHOSTS_PATH ?? path.join(os.homedir(), '.banana', 'jumphosts.json'),
+  // ── Persistent tmux mode ─────────────────────────────────────────────────
+  // How long to wait for claude to start inside tmux before giving up.
+  tmuxStartupTimeoutMs: parseInt(process.env.BANANA_TMUX_STARTUP_TIMEOUT ?? '60000', 10),
+  // Idle time (no output) before considering the response complete.
+  tmuxIdleCompletionMs: parseInt(process.env.BANANA_TMUX_IDLE_COMPLETION ?? '30000', 10),
+  // Auto-approve permission prompts (y/n) detected in TUI output.
+  tmuxAutoApprovePermissions: process.env.BANANA_TMUX_AUTO_APPROVE !== '0',
 };
 
 if (!config.token) {

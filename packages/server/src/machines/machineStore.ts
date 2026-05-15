@@ -55,6 +55,11 @@ export interface MachineRecord {
   /** Shell to use for local execution. Default: auto-detect (zsh on macOS, bash on Linux).
    *  Examples: '/bin/zsh', '/bin/bash'. Uses interactive mode (-ic) to load user PATH. */
   localShell?: string;
+  /** When true, keeps claude running in a persistent tmux session instead of
+   *  spawning `claude --print` per job. Permissions approved once persist for
+   *  the session lifetime — required for enterprise plans that block
+   *  --dangerously-skip-permissions and --permission-mode dontAsk. */
+  persistentMode?: boolean;
   createdAt: string;
   updatedAt: string;
 }

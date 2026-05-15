@@ -264,6 +264,9 @@
           <div class="form-row" style="align-items:center"><label>Permissions</label>
             <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;font-weight:normal"><input type="checkbox" id="mf-skip-perms" checked /> Use --dangerously-skip-permissions</label>
           </div>
+          <div class="form-row" style="align-items:center"><label>Session Mode</label>
+            <label style="display:flex;align-items:center;gap:6px;cursor:pointer;font-size:12px;font-weight:normal"><input type="checkbox" id="mf-persistent" /> Persistent (tmux) — keeps claude alive between jobs</label>
+          </div>
           <div id="mf-perm-settings-row" class="form-row" style="display:none"><label>Permission Settings</label><textarea id="mf-perm-settings" rows="6" placeholder='{"permissions":{"allow":["Bash(*)","Read(*)","Edit(*)","Write(*)"],"defaultMode":"acceptEdits"}}' style="font-family:var(--font-mono);font-size:11px" autocomplete="off" data-1p-ignore></textarea></div>
           <div id="mf-runtime-info" style="display:none;margin-top:12px;padding:10px;background:var(--bg);border:1px solid var(--border);border-radius:6px;font-size:11px">
             <div style="font-weight:600;margin-bottom:6px;color:var(--text)">Detected Info</div>

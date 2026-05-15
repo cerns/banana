@@ -37,6 +37,47 @@ export function stripAnsi(text: string): string {
     .replace(/\x07/g, '');
 }
 
+// ── Permission pattern registry ──────────────────────────────────────────────
+
+interface PermissionPattern {
+  label: string;
+  test: (line: string) => boolean;
+  keys: string;
+}
+
+const PERMISSION_PATTERNS: PermissionPattern[] = [
+  // y/n/a — prefer "always" to reduce future prompts
+  {
+    label: 'allow-always',
+    test: (line) => /\bAllow\b.*\?\s*\(?\s*y(?:es)?\/n(?:o)?\/a(?:lways)?\s*\)?/i.test(line),
+    keys: 'a Enter',
+  },
+  // Standard y/n Allow prompts
+  {
+    label: 'allow-yn',
+    test: (line) => /\bAllow\b.*\?\s*\(?\s*y(?:es)?\/n(?:o)?\s*\)?/i.test(line),
+    keys: 'y Enter',
+  },
+  // General confirmations: Proceed? Continue? Do you want to...?
+  {
+    label: 'confirm-yn',
+    test: (line) => /(?:Proceed|Continue|Do you (?:want|wish) to)\b.*\?\s*\(?\s*y(?:es)?\/n(?:o)?\s*\)?/i.test(line),
+    keys: 'y Enter',
+  },
+  // Menu: cursor on Allow/Yes option → press Enter
+  {
+    label: 'menu-allow',
+    test: (line) => /^[❯>►]\s+(?:Allow|Yes)\b/i.test(line),
+    keys: 'Enter',
+  },
+  // Menu: cursor on Deny/No → navigate up (to Allow) and press Enter
+  {
+    label: 'menu-deny',
+    test: (line) => /^[❯>►]\s+(?:Deny|No)\b/i.test(line),
+    keys: 'Up Enter',
+  },
+];
+
 // ── TmuxOutputParser ───────────────────────────────────────────────────────
 
 type ParserState = 'waiting' | 'text' | 'tool_use' | 'tool_result';
@@ -100,14 +141,17 @@ export class TmuxOutputParser {
     const trimmed = line.trim();
 
     // ── Permission prompt detection ────────────────────────────────────
-    // Claude TUI shows: "Allow <tool>? (y/n)" or "Allow all tools? (y/n)"
-    if (this.autoApprove && /\bAllow\b.*\?\s*\(?y\/n\)?/i.test(trimmed)) {
-      this.onChunk({
-        type: 'stderr',
-        text: `[banana-tmux] Auto-approved: ${trimmed}\n`,
-      });
-      if (this.sendKeys) this.sendKeys('y Enter');
-      return;
+    if (this.autoApprove) {
+      for (const pattern of PERMISSION_PATTERNS) {
+        if (pattern.test(trimmed)) {
+          this.onChunk({
+            type: 'stderr',
+            text: `[banana-tmux] Auto-approved (${pattern.label}): ${trimmed}\n`,
+          });
+          if (this.sendKeys) this.sendKeys(pattern.keys);
+          return;
+        }
+      }
     }
 
     // ── Prompt detection (response complete) ───────────────────────────

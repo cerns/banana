@@ -55,6 +55,11 @@ vi.mock('../../src/ssh/sshRunner.js', () => ({
   testJumpHostChain: mockTestJumpHostChain,
 }));
 
+const mockKillTmuxSession = vi.fn().mockResolvedValue(undefined);
+vi.mock('../../src/ssh/tmuxRunner.js', () => ({
+  killTmuxSession: mockKillTmuxSession,
+}));
+
 const mockJumpHostStore = {
   getConfig: vi.fn().mockReturnValue({ enabled: false, hosts: [] }),
   getRedactedConfig: vi.fn().mockReturnValue({ enabled: false, hosts: [] }),

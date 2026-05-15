@@ -272,6 +272,173 @@ describe('tmuxRunner', () => {
       expect(chunks.some((c: any) => c.type === 'stream_event')).toBe(true);
     });
 
+    // ── Expanded permission pattern tests ──────────────────────────────
+
+    it('should send "a Enter" for y/n/a prompts (allow-always)', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('Allow Bash? (y/n/a)\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('a Enter');
+      expect(chunks[0].text).toContain('allow-always');
+    });
+
+    it('should send "a Enter" for yes/no/always prompts', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('Allow Read? (yes/no/always)\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('a Enter');
+      expect(chunks[0].text).toContain('allow-always');
+    });
+
+    it('should still send "y Enter" for plain y/n prompts (allow-yn)', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('Allow Write? (y/n)\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('y Enter');
+      expect(chunks[0].text).toContain('allow-yn');
+    });
+
+    it('should send "y Enter" for "Proceed? (y/n)" prompts (confirm-yn)', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('Proceed? (y/n)\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('y Enter');
+      expect(chunks[0].text).toContain('confirm-yn');
+    });
+
+    it('should send "y Enter" for "Continue? (y/n)" prompts', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('Continue? (y/n)\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('y Enter');
+      expect(chunks[0].text).toContain('confirm-yn');
+    });
+
+    it('should send "y Enter" for "Do you want to overwrite? (y/n)" prompts', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('Do you want to overwrite? (y/n)\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('y Enter');
+      expect(chunks[0].text).toContain('confirm-yn');
+    });
+
+    it('should send "Enter" for "❯ Allow once" menu item (menu-allow)', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('❯ Allow once\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('Enter');
+      expect(chunks[0].text).toContain('menu-allow');
+    });
+
+    it('should send "Enter" for "❯ Allow always" menu item', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('❯ Allow always\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('Enter');
+      expect(chunks[0].text).toContain('menu-allow');
+    });
+
+    it('should send "Enter" for "❯ Yes" menu item', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('❯ Yes\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('Enter');
+      expect(chunks[0].text).toContain('menu-allow');
+    });
+
+    it('should send "Up Enter" for "❯ Deny" menu item (menu-deny)', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('❯ Deny\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('Up Enter');
+      expect(chunks[0].text).toContain('menu-deny');
+    });
+
+    it('should send "Up Enter" for "❯ No" menu item', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('❯ No\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('Up Enter');
+      expect(chunks[0].text).toContain('menu-deny');
+    });
+
+    it('should handle ">" as menu cursor (post-ANSI fallback)', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('> Allow once\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('Enter');
+      expect(chunks[0].text).toContain('menu-allow');
+    });
+
+    it('should NOT auto-approve y/n/a prompts when disabled', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, false);
+
+      parser.feed('Allow Bash? (y/n/a)\n');
+
+      expect(sendKeys).not.toHaveBeenCalled();
+      expect(chunks.some((c: any) => c.type === 'stream_event')).toBe(true);
+    });
+
+    it('should NOT match normal text containing "Allow" without prompt format', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('We allow users to configure settings\n');
+
+      expect(sendKeys).not.toHaveBeenCalled();
+      expect(chunks[0].type).toBe('stream_event');
+    });
+
+    it('should NOT match menu items with unrecognized options', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('❯ Some other option\n');
+
+      expect(sendKeys).not.toHaveBeenCalled();
+      expect(chunks[0].type).toBe('stream_event');
+    });
+
     it('should not emit prompt ">" after content (completion signal)', () => {
       const chunks: any[] = [];
       const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c));

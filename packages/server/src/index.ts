@@ -1,3 +1,4 @@
+#!/usr/bin/env node
 import { config } from './config.js';
 import { sessionStore } from './sessions/sessionStore.js';
 import { machineStore } from './machines/machineStore.js';

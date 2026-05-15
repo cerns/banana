@@ -299,6 +299,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       localShell: body.localShell,
       skipPermissions: body.skipPermissions,
       permissionSettings: body.permissionSettings,
+      persistentMode: body.persistentMode,
       createdAt: now,
       updatedAt: now,
     };
@@ -411,6 +412,13 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       if (session?.type === 'remote') {
         const { abortRemoteJob } = await import('../ssh/remoteSessionExecutor.js');
         abortRemoteJob(sessionId);
+        // Clean up persistent tmux session if applicable
+        if (session.machineId) {
+          const machine = machineStore.get(session.machineId);
+          if (machine?.persistentMode) {
+            import('../ssh/tmuxRunner.js').then(m => m.killTmuxSession(machine, sessionId)).catch(() => {});
+          }
+        }
       }
 
       json(res, 200, { ok: true });

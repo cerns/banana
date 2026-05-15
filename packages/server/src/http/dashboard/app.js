@@ -990,6 +990,7 @@ function showMachineForm(machine) {
   document.getElementById('mf-perm-settings-row').style.display = skipPerms ? 'none' : '';
   document.getElementById('mf-perm-settings').value = machine?.permissionSettings
     ? JSON.stringify(machine.permissionSettings, null, 2) : '';
+  document.getElementById('mf-persistent').checked = !!machine?.persistentMode;
   document.getElementById('mf-status').textContent = '';
 
   // Show runtime/system info if available
@@ -1084,6 +1085,7 @@ document.getElementById('mf-save').addEventListener('click', async () => {
     localShell: document.getElementById('mf-shell').value || undefined,
     notes: document.getElementById('mf-notes').value || undefined,
     skipPermissions: document.getElementById('mf-skip-perms').checked,
+    persistentMode: document.getElementById('mf-persistent').checked,
   };
   // Parse permission settings JSON if provided
   const permSettingsRaw = document.getElementById('mf-perm-settings').value.trim();

@@ -4,6 +4,7 @@ import { updateClaudeSessionId } from '../sessions/sessionManager.js';
 import { broadcastToDashboards } from '../ws/dashboardBroadcast.js';
 import { pushManager } from '../push/pushManager.js';
 import { runClaudeOverSsh, getRemoteContextTokens } from './sshRunner.js';
+import { runClaudeViaTmuxForSession, abortTmuxJob } from './tmuxRunner.js';
 import { config } from '../config.js';
 
 /** Active SSH executions — keyed by sessionId for abort support. */
@@ -150,6 +151,54 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
   try {
     const sid8 = sessionId.slice(0, 8);
     const jid8 = jobId.slice(0, 8);
+
+    // ── Persistent tmux mode ──────────────────────────────────────────
+    if (machine.persistentMode) {
+      console.log(`[remote-executor] Session ${sid8} job ${jid8} [tmux] — prompt ${prompt.length} chars`);
+
+      let outputBytes = 0;
+      const result = await runClaudeViaTmuxForSession(
+        machine,
+        sessionId,
+        prompt,
+        workdir,
+        (chunk) => {
+          outputBytes += JSON.stringify(chunk).length;
+          sessionStore.addChunk(sessionId, jobId, chunk);
+          broadcastToDashboards({
+            type: 'DASHBOARD_EVENT',
+            event: 'OUTPUT_CHUNK',
+            sessionId,
+            jobId,
+            chunk,
+          });
+        },
+        controller.signal,
+        modelOverride || session.model,
+      );
+
+      sessionStore.finishJob(sessionId, jobId, result.exitCode, result.durationMs);
+
+      console.log(`[remote-executor] Session ${sid8} job ${jid8} [tmux] done — ${fmtDuration(result.durationMs)}, output ${fmtBytes(outputBytes)}`);
+
+      broadcastToDashboards({
+        type: 'DASHBOARD_EVENT',
+        event: 'OUTPUT_DONE',
+        sessionId,
+        jobId,
+        exitCode: result.exitCode,
+        durationMs: result.durationMs,
+      });
+
+      const host = session.name ?? machine.alias;
+      const folder = workdir.split('/').pop() ?? '';
+      const dur = fmtDuration(result.durationMs);
+      pushManager.sendPush(`✅ ${host} finished in ${dur}`, `${folder} · "${prompt.slice(0, 80)}"`).catch(() => {});
+
+      return;
+    }
+
+    // ── Standard --print mode ──────────────────────────────────────────
 
     // ── Pre-job context check ──────────────────────────────────────────
     let preContextTokens: number | undefined;
@@ -325,5 +374,18 @@ export function abortRemoteJob(sessionId: string): boolean {
   const controller = activeExecutions.get(sessionId);
   if (!controller) return queuedCount > 0;
   controller.abort();
+
+  // For tmux sessions, also send C-c to interrupt the running tool
+  const session = sessionStore.get(sessionId);
+  if (session?.machineId) {
+    const machine = machineStore.get(session.machineId);
+    if (machine?.persistentMode) {
+      abortTmuxJob(machine, sessionId).catch((e) => {
+        console.warn(`[remote-executor] tmux abort failed: ${(e as Error).message}`);
+      });
+    }
+  }
+
   return true;
 }
+
