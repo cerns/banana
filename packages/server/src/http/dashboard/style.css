@@ -137,10 +137,56 @@ header h1 { font-size: 16px; color: var(--accent); }
   border-bottom: 1px solid var(--border);
   cursor: pointer;
   transition: background 0.1s;
+  position: relative;
 }
 
 .session-item:hover { background: var(--surface); }
 .session-item.active { background: #1c2128; border-left: 2px solid var(--accent); }
+
+/* ── Session command tooltip ──────────────────────────────────────────── */
+.session-tooltip {
+  display: none;
+  position: fixed;
+  z-index: 9999;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 10px;
+  min-width: 280px;
+  max-width: 420px;
+  box-shadow: 0 4px 16px rgba(0,0,0,0.4);
+  font-size: 11px;
+  pointer-events: none;
+}
+.session-tooltip-label {
+  color: var(--muted);
+  font-size: 10px;
+  margin-bottom: 3px;
+}
+.session-tooltip-label:not(:first-child) { margin-top: 8px; }
+.session-tooltip-cmd {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  background: var(--surface);
+  border-radius: 4px;
+  padding: 4px 8px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--text);
+  word-break: break-all;
+}
+.session-tooltip-cmd code { flex: 1; }
+.session-tooltip-copy {
+  background: none;
+  border: none;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+  padding: 0 2px;
+  flex-shrink: 0;
+}
+.session-tooltip-copy:hover { color: var(--accent); }
 
 .session-id {
   font-size: 11px;

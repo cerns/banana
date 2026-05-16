@@ -210,7 +210,7 @@ function tryConnect() {
   ws.addEventListener('message', e => {
     let msg;
     try { msg = JSON.parse(e.data); } catch { return; }
-    if (msg.type === 'DASHBOARD_ACK') { showMain(); setStatus('connected'); loadSessions(); return; }
+    if (msg.type === 'DASHBOARD_ACK') { showMain(); setStatus('connected'); loadMachines(); loadSessions(); return; }
     if (msg.type === 'DASHBOARD_REJECT') { alert('Invalid token'); localStorage.removeItem('banana_token'); showAuth(); return; }
     if (msg.type === 'DASHBOARD_EVENT') handleEvent(msg);
     if (msg.type === 'DASHBOARD_EVENT') handleHubEvent(msg);
@@ -404,6 +404,23 @@ function renderSessionItem(s) {
   const displayName = s.name || s.hostname || '?';
   const hasUnread = unread[s.sessionId];
   const running = isSessionRunning(s.sessionId);
+  const sid8 = s.sessionId.slice(0, 8);
+  const machine = machines.find(m => m.id === s.machineId);
+  const isPersistent = !!machine?.persistentMode;
+
+  // Build tooltip commands
+  let tooltipHtml = '';
+  if (s.claudeSessionId) {
+    const resumeCmd = `claude --resume ${s.claudeSessionId}`;
+    tooltipHtml += `<div class="session-tooltip-label">Resume session</div>
+      <div class="session-tooltip-cmd"><code>${esc(resumeCmd)}</code><button class="session-tooltip-copy" data-copy="${esc(resumeCmd)}" title="Copy">⧉</button></div>`;
+  }
+  if (isPersistent) {
+    const tmuxCmd = `tmux attach -t banana-${sid8}`;
+    tooltipHtml += `<div class="session-tooltip-label">Attach tmux</div>
+      <div class="session-tooltip-cmd"><code>${esc(tmuxCmd)}</code><button class="session-tooltip-copy" data-copy="${esc(tmuxCmd)}" title="Copy">⧉</button></div>`;
+  }
+
   return `
     <div class="session-item ${s.sessionId === activeSessionId ? 'active' : ''}" data-id="${s.sessionId}">
       <div class="session-top-row">
@@ -414,10 +431,11 @@ function renderSessionItem(s) {
         </div>
         <button class="session-edit-btn" data-edit-session="${s.sessionId}" title="Edit session">&#9998;</button>
       </div>
-      <div class="session-id">${s.sessionId.slice(0, 8)}${s.screenName ? ` · ${esc(s.screenName)}` : ''}</div>
+      <div class="session-id">${sid8}${s.screenName ? ` · ${esc(s.screenName)}` : ''}</div>
       ${s.role ? `<div class="session-role-badge">${esc(s.role)}</div>` : ''}
       ${s.name ? `<div class="session-host">${esc(s.hostname || '')}</div>` : ''}
       <div class="session-dir">${esc(s.workdir || s.remoteWorkdir || '')}</div>
+      ${tooltipHtml ? `<div class="session-tooltip">${tooltipHtml}</div>` : ''}
     </div>`;
 }
 
@@ -527,13 +545,46 @@ function _bindSidebarEvents() {
   sessionList.querySelectorAll('.session-item').forEach(el => {
     el.addEventListener('click', (e) => {
       if (e.target.closest('.session-edit-btn')) return;
+      if (e.target.closest('.session-tooltip-copy')) return;
       selectSession(el.dataset.id);
     });
+    // Tooltip positioning (fixed, escapes sidebar overflow)
+    const tip = el.querySelector('.session-tooltip');
+    if (tip) {
+      el.addEventListener('mouseenter', () => {
+        const rect = el.getBoundingClientRect();
+        tip.style.left = (rect.right + 4) + 'px';
+        tip.style.top = rect.top + 'px';
+        tip.style.display = 'block';
+        tip.style.pointerEvents = 'auto';
+      });
+      el.addEventListener('mouseleave', (e) => {
+        // Keep tooltip visible if mouse moved onto it
+        const related = e.relatedTarget;
+        if (related && (tip.contains(related) || related === tip)) return;
+        tip.style.display = 'none';
+        tip.style.pointerEvents = 'none';
+      });
+      tip.addEventListener('mouseleave', (e) => {
+        const related = e.relatedTarget;
+        if (related && (el.contains(related) || related === el)) return;
+        tip.style.display = 'none';
+        tip.style.pointerEvents = 'none';
+      });
+    }
   });
   sessionList.querySelectorAll('.session-edit-btn').forEach(btn => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
       openSessionEditModal(btn.dataset.editSession);
+    });
+  });
+  sessionList.querySelectorAll('.session-tooltip-copy').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(btn.dataset.copy);
+      btn.textContent = '✓';
+      setTimeout(() => { btn.textContent = '⧉'; }, 1000);
     });
   });
 }
