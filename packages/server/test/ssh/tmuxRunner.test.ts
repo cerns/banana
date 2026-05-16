@@ -451,34 +451,56 @@ describe('tmuxRunner', () => {
 
     // ── Claude Code permission prompt format (newer) ──────────────────
 
-    it('should send "y Enter" for "Do you want to proceed?" (no y/n)', () => {
+    it('should NOT match "Do you want to proceed?" without y/n (no typing into TUI)', () => {
       const chunks: any[] = [];
       const sendKeys = vi.fn();
       const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
 
       parser.feed('Do you want to proceed?\n');
 
-      expect(sendKeys).toHaveBeenCalledWith('y Enter');
-      expect(chunks[0].text).toContain('confirm-proceed');
+      expect(sendKeys).not.toHaveBeenCalled();
+      expect(chunks[0].type).toBe('stream_event');
     });
 
-it('should send "Enter" for numbered "1. Yes" menu item', () => {
+    it('should NOT match "1. Yes" without cursor prefix', () => {
       const chunks: any[] = [];
       const sendKeys = vi.fn();
       const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
 
       parser.feed('1. Yes\n');
 
-      expect(sendKeys).toHaveBeenCalledWith('Enter');
-      expect(chunks[0].text).toContain('menu-number-yes');
+      expect(sendKeys).not.toHaveBeenCalled();
+      expect(chunks[0].type).toBe('stream_event');
     });
 
-    it('should send "Up Enter" for numbered "2. No" menu item', () => {
+    it('should NOT match "2. No" without cursor prefix', () => {
       const chunks: any[] = [];
       const sendKeys = vi.fn();
       const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
 
       parser.feed('2. No\n');
+
+      expect(sendKeys).not.toHaveBeenCalled();
+      expect(chunks[0].type).toBe('stream_event');
+    });
+
+    it('should send "Enter" for "❯ 1. Yes" menu item (cursor present)', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('❯ 1. Yes\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('Enter');
+      expect(chunks[0].text).toContain('menu-number-yes');
+    });
+
+    it('should send "Up Enter" for "❯ 2. No" menu item (cursor present)', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('❯ 2. No\n');
 
       expect(sendKeys).toHaveBeenCalledWith('Up Enter');
       expect(chunks[0].text).toContain('menu-number-no');
@@ -528,6 +550,30 @@ it('should send "Enter" for numbered "1. Yes" menu item', () => {
       parser.feed('❯ Allow once\n');
 
       // "❯ Allow" is a menu item, should be emitted as text (not treated as prompt)
+      expect(chunks.length).toBeGreaterThan(countBefore);
+    });
+
+    it('should NOT treat "❯ 1. Yes" as a prompt (numbered menu item)', () => {
+      const chunks: any[] = [];
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), undefined, false);
+
+      parser.feed('Some response text\n');
+      const countBefore = chunks.length;
+      parser.feed('❯ 1. Yes\n');
+
+      // "❯ 1. Yes" is a numbered menu item, not a prompt
+      expect(chunks.length).toBeGreaterThan(countBefore);
+    });
+
+    it('should NOT treat "❯ 2. No" as a prompt (numbered menu item)', () => {
+      const chunks: any[] = [];
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), undefined, false);
+
+      parser.feed('Some response text\n');
+      const countBefore = chunks.length;
+      parser.feed('❯ 2. No\n');
+
+      // "❯ 2. No" is a numbered menu item, not a prompt
       expect(chunks.length).toBeGreaterThan(countBefore);
     });
 

@@ -65,29 +65,16 @@ const PERMISSION_PATTERNS: PermissionPattern[] = [
     test: (line) => /(?:Proceed|Continue|Do you (?:want|wish) to)\b.*\?\s*\(?\s*y(?:es)?\/n(?:o)?\s*\)?/i.test(line),
     keys: 'y Enter',
   },
-  // Claude Code permission: "Do you want to proceed?" (no y/n, uses numbered menu)
-  // Send y as shortcut, fallback to Enter (if "Yes" is already selected)
-  {
-    label: 'confirm-proceed',
-    test: (line) => /Do you want to proceed\s*\??/i.test(line),
-    keys: 'y Enter',
-  },
-  // Claude Code permission: "Yes, allow" / "Yes, proceed" etc.
-  {
-    label: 'confirm-yes-text',
-    test: (line) => /^(?:Yes,?\s+(?:allow|proceed|continue))/i.test(line),
-    keys: 'Enter',
-  },
-  // Numbered menu: "1. Yes" or "1. Allow" (selected or not)
+  // Numbered menu with cursor: "❯ 1. Yes" or "❯ 1. Allow" — only when cursor is present
   {
     label: 'menu-number-yes',
-    test: (line) => /^[❯>►]?\s*1\.\s*(?:Yes|Allow)\b/i.test(line),
+    test: (line) => /^[❯>►]\s*1\.\s*(?:Yes|Allow)\b/i.test(line),
     keys: 'Enter',
   },
-  // Numbered menu: "2. No" or "2. Deny" (cursor is on No — navigate to Yes)
+  // Numbered menu with cursor on No: "❯ 2. No" or "❯ 2. Deny" — navigate to Yes
   {
     label: 'menu-number-no',
-    test: (line) => /^[❯>►]?\s*2\.\s*(?:No|Deny)\b/i.test(line),
+    test: (line) => /^[❯>►]\s*2\.\s*(?:No|Deny)\b/i.test(line),
     keys: 'Up Enter',
   },
   // Menu: cursor on Allow/Yes option → press Enter
@@ -182,11 +169,9 @@ export class TmuxOutputParser {
 
     // ── Prompt detection (response complete) ───────────────────────────
     // Claude TUI shows ">" or "❯" when waiting for input.
-    // "❯ Try ..." is the placeholder prompt; "❯ Allow/Deny/Yes/No" are menu items (not prompts).
+    // "❯ Try ..." is the placeholder prompt; "❯ Allow/Deny/Yes/No" and "❯ 1. Yes" are menu items.
     // Only counts if we've already seen response content.
-    const isPrompt = /^[>❯]\s*$/.test(trimmed)
-      || (/^❯\s+/.test(trimmed) && !/^❯\s+(?:Allow|Deny|Yes|No)\b/i.test(trimmed));
-    if (isPrompt && this.hasContent()) {
+    if (isPromptLine(trimmed) && this.hasContent()) {
       // Signal completion — handled by the caller via isPrompt flag
       return;
     }
@@ -430,10 +415,8 @@ export async function ensureTmuxSession(
       }
       // Claude TUI shows ">" or "❯" prompt when ready for input
       // Older: ">" on its own line; Newer: "❯ Try ..." or bare "❯"
-      // Exclude menu items: "❯ Allow/Deny/Yes/No"
-      const hasPrompt = /^[>❯]\s*$/m.test(cleaned)
-        || (cleaned.split('\n').some(l =>
-          /^❯\s+/.test(l.trim()) && !/^❯\s+(?:Allow|Deny|Yes|No)\b/i.test(l.trim())));
+      // Exclude menu items: "❯ Allow/Deny/Yes/No" and "❯ 1. Yes" etc.
+      const hasPrompt = cleaned.split('\n').some(l => isPromptLine(l));
       if (hasPrompt) {
         ready = true;
         break;
@@ -536,7 +519,14 @@ export function isResponseLine(line: string): boolean {
 /** Check if a line is a Claude prompt indicator (response complete). */
 function isPromptLine(line: string): boolean {
   const t = line.trim();
-  return /^[>❯]\s*$/.test(t) || (/^❯\s+/.test(t) && !/^❯\s+(?:Allow|Deny|Yes|No)\b/i.test(t));
+  if (/^[>❯]\s*$/.test(t)) return true;
+  if (/^❯\s+/.test(t)) {
+    // Exclude permission menu items: "❯ Allow/Deny/Yes/No" or "❯ 1. Yes" / "❯ 2. No"
+    if (/^❯\s+(?:Allow|Deny|Yes|No)\b/i.test(t)) return false;
+    if (/^❯\s+\d+\.\s*(?:Yes|No|Allow|Deny)\b/i.test(t)) return false;
+    return true;
+  }
+  return false;
 }
 
 /**
