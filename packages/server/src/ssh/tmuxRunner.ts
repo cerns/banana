@@ -65,6 +65,12 @@ const PERMISSION_PATTERNS: PermissionPattern[] = [
     test: (line) => /(?:Proceed|Continue|Do you (?:want|wish) to)\b.*\?\s*\(?\s*y(?:es)?\/n(?:o)?\s*\)?/i.test(line),
     keys: 'y Enter',
   },
+  // Accept edits prompt: "⏵⏵ accept edits on" / "accept all" — press Enter to accept
+  {
+    label: 'accept-edits',
+    test: (line) => /^[⏵►>]{1,2}\s*accept\b/i.test(line),
+    keys: 'Enter',
+  },
   // Numbered menu with cursor: "❯ 1. Yes" or "❯ 1. Allow" — only when cursor is present
   {
     label: 'menu-number-yes',
@@ -91,6 +97,11 @@ const PERMISSION_PATTERNS: PermissionPattern[] = [
   },
 ];
 
+/** Check if a line matches any permission/approval pattern. */
+function matchesPermissionPattern(line: string): boolean {
+  return PERMISSION_PATTERNS.some(p => p.test(line));
+}
+
 // ── TmuxOutputParser ───────────────────────────────────────────────────────
 
 type ParserState = 'waiting' | 'text' | 'tool_use' | 'tool_result';
@@ -108,6 +119,8 @@ export class TmuxOutputParser {
   private sendKeys: ((keys: string) => void) | null;
   /** Lines accumulated since last prompt — used for completion detection. */
   private responseLines: string[] = [];
+  /** Cooldown: timestamp of last auto-approve to avoid re-firing while same prompt is visible. */
+  private lastAutoApproveAt = 0;
 
   constructor(
     onChunk: SshChunkCallback,
@@ -154,7 +167,8 @@ export class TmuxOutputParser {
     const trimmed = line.trim();
 
     // ── Permission prompt detection ────────────────────────────────────
-    if (this.autoApprove) {
+    // Cooldown: don't re-fire within 3s (same permission stays visible across polls)
+    if (this.autoApprove && Date.now() - this.lastAutoApproveAt > 3000) {
       for (const pattern of PERMISSION_PATTERNS) {
         if (pattern.test(trimmed)) {
           this.onChunk({
@@ -162,6 +176,7 @@ export class TmuxOutputParser {
             text: `[banana-tmux] Auto-approved (${pattern.label}): ${trimmed}\n`,
           });
           if (this.sendKeys) this.sendKeys(pattern.keys);
+          this.lastAutoApproveAt = Date.now();
           return;
         }
       }
@@ -497,8 +512,9 @@ export function isResponseLine(line: string): boolean {
   if (/^[▐▛▝▘]/.test(t)) return false;
   // Status bar / footer
   if (/^\? for shortcuts/.test(t)) return false;
-  if (/^esc to interrupt/.test(t)) return false;
-  if (/^\d+ tokens$/.test(t)) return false;
+  if (/^esc to interrupt/i.test(t)) return false;
+  if (/^esc to cancel/i.test(t)) return false;
+  if (/^\d+ tokens?$/.test(t)) return false;
   // Auto-update / deprecation
   if (/^globalVersion:/.test(t)) return false;
   if (/^Claude Code has switched/.test(t)) return false;
@@ -594,12 +610,18 @@ export async function streamTmuxOutput(
     const lines = screen.split('\n');
 
     // Emit new response content lines (deduplicated, noise-filtered)
+    // Permission-matching lines BYPASS dedup — they can appear identically
+    // across different permission prompts in the same session.
     let newContentThisPoll = false;
     for (const line of lines) {
       const t = line.trim();
       if (!t) continue;
-      if (emittedLines.has(t)) continue;
-      emittedLines.add(t);
+
+      const isPermission = matchesPermissionPattern(t);
+      if (!isPermission) {
+        if (emittedLines.has(t)) continue;
+        emittedLines.add(t);
+      }
 
       if (isResponseLine(t)) {
         newContentThisPoll = true;

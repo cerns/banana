@@ -517,6 +517,45 @@ describe('tmuxRunner', () => {
       expect(chunks[0].text).toContain('menu-number-yes');
     });
 
+    // ── Accept edits pattern ──────────────────────────────────────────
+
+    it('should send "Enter" for "⏵⏵ accept edits on" prompt', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('⏵⏵ accept edits on (shift+tab to cycle)\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('Enter');
+      expect(chunks[0].text).toContain('accept-edits');
+    });
+
+    it('should send "Enter" for "► accept all" prompt', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('► accept all\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('Enter');
+      expect(chunks[0].text).toContain('accept-edits');
+    });
+
+    // ── Cooldown prevents re-firing ─────────────────────────────────
+
+    it('should NOT re-fire auto-approve within 3s cooldown', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('❯ 1. Yes\n');
+      expect(sendKeys).toHaveBeenCalledTimes(1);
+
+      // Same line again within cooldown — should NOT fire
+      parser.feed('❯ 1. Yes\n');
+      expect(sendKeys).toHaveBeenCalledTimes(1);
+    });
+
     it('should not emit prompt ">" after content (completion signal)', () => {
       const chunks: any[] = [];
       const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c));
@@ -1159,6 +1198,7 @@ describe('tmuxRunner', () => {
     it('should reject status bar lines', () => {
       expect(tmuxRunner.isResponseLine('? for shortcuts')).toBe(false);
       expect(tmuxRunner.isResponseLine('esc to interrupt')).toBe(false);
+      expect(tmuxRunner.isResponseLine('Esc to cancel · Tab to amend')).toBe(false);
     });
 
     it('should reject token count lines', () => {
