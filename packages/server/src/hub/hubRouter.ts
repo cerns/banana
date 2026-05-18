@@ -17,7 +17,7 @@ import { sessionStore } from '../sessions/sessionStore.js';
 import type { SessionRecord } from '../sessions/sessionStore.js';
 import { createJob } from '../sessions/sessionManager.js';
 import { broadcastToDashboards } from '../ws/dashboardBroadcast.js';
-import { isSessionBusy, onJobComplete, executeRemoteJob } from '../ssh/remoteSessionExecutor.js';
+import { isSessionBusy, onJobComplete, executeRemoteJob, type ExecChannel } from '../ssh/remoteSessionExecutor.js';
 import { machineStore } from '../machines/machineStore.js';
 import type { MachineRecord } from '../machines/machineStore.js';
 
@@ -159,6 +159,11 @@ export function postHubMessage(opts: PostHubMessageOpts): HubMessage {
     dispatchOrQueue(entry.session, msg, entry.engagement);
   }
 
+  // No dispatches → message is immediately complete (nobody to process it)
+  if (matchingSessions.length === 0) {
+    hubStore.updateStatus(msg.id, 'complete');
+  }
+
   return msg;
 }
 
@@ -181,9 +186,9 @@ function dispatchOrQueue(
     return;
   }
 
-  // Check if session is busy
-  if (isSessionBusy(session.sessionId)) {
-    console.log(`[hub]   ${sid} QUEUE: session is busy`);
+  // Check if session's hub channel is busy
+  if (isSessionBusy(session.sessionId, 'hub')) {
+    console.log(`[hub]   ${sid} QUEUE: session hub channel is busy`);
     queueForSession(session.sessionId, hubMessage.id, engagement);
     return;
   }
@@ -236,6 +241,16 @@ function broadcastDispatchUpdate(messageId: string): void {
     status: msg.status,
     dispatches: msg.dispatches,
   });
+}
+
+/** Mark a hub message as 'complete' if all its dispatches have reached a terminal state. */
+function checkMessageComplete(messageId: string): void {
+  const msg = hubStore.getMessage(messageId);
+  if (!msg) return;
+  const allDone = msg.dispatches.every(d => ['acted', 'skipped', 'error'].includes(d.status));
+  if (allDone) {
+    hubStore.updateStatus(messageId, 'complete');
+  }
 }
 
 /** Maximum characters allowed in the formatted context block. */
@@ -432,12 +447,22 @@ anything where you should hear from another agent before continuing.
 const SELF_TRIGGER_HINT = `
 
 ────────────────────────────────────────
+⚠️ IMPORTANT: THIS IS A DISCUSSION-ONLY CHANNEL
+────────────────────────────────────────
+You are in a hub chat session for PLANNING AND DISCUSSION ONLY.
+Do NOT execute work here — no file edits, no bash commands, no tool use.
+Think, discuss, plan, and coordinate. When you are ready to execute,
+use [BEGIN_WORK] below. The system will run the work in your separate
+WORK session (a different tmux/claude instance with your full codebase).
+
+────────────────────────────────────────
 SELF-EXECUTION OPTION: [BEGIN_WORK]
 ────────────────────────────────────────
 If after replying you decide YOU should be the one to actually do this work,
 include the marker [BEGIN_WORK] at the END of your reply. The system will then
-automatically re-invoke you in "action" mode to execute the task with full tool
-access (file edits, bash, etc.).
+automatically invoke your WORK session in "action" mode to execute the task
+with full tool access (file edits, bash, etc.). Your work session is separate
+from this chat — it has its own context and tools.
 
 ⚠️ MANDATORY BEFORE USING [BEGIN_WORK] ⚠️
 You MUST first comply with the Plan–Do–Check–Act (PDCA) policy in your reply.
@@ -507,6 +532,11 @@ function buildGuidance(engagement: EngagementLevel): string {
     'actively executing work with tool calls (Read, Edit, Bash, etc.) in the loop.',
     'Using [IM_TALKING] to narrate reasoning, extend status summaries, or plan',
     'without tool calls will be treated as a SKIP.',
+    '',
+    'RULE 5 — NO TOOL USE IN CHAT: This is a DISCUSSION channel. Do NOT use any',
+    'tools (Read, Edit, Write, Bash, Grep, Glob, etc.). Do NOT read files, run',
+    'commands, or make changes. ONLY respond with text. If you need to do actual',
+    'work, include [BEGIN_WORK] and the system will run it in your separate work session.',
   ].join('\n');
 
   const skipInstruction = [
@@ -743,12 +773,17 @@ function dispatchToSession(
   runningHubJobs++;
   sessionCooldowns.set(session.sessionId, Date.now());
 
-  // Register completion callback and execute
+  // Register completion callback and execute.
+  // Triggered dispatches ([BEGIN_WORK] self-trigger or manual trigger button)
+  // route to the WORK channel so the agent executes with tools in its work
+  // tmux session. Non-triggered dispatches (chat/discussion) stay in hub.
+  const execChannel: ExecChannel = engagement === 'triggered' ? 'work' : 'hub';
+
   onJobComplete(job.jobId, () => {
     onSessionJobComplete(session.sessionId, job.jobId, hubMessage, engagement);
   });
 
-  executeRemoteJob(session.sessionId, job.jobId, prompt);
+  executeRemoteJob(session.sessionId, job.jobId, prompt, undefined, execChannel);
 }
 
 function onSessionJobComplete(
@@ -761,12 +796,18 @@ function onSessionJobComplete(
   console.log(`[hub] onSessionJobComplete fired: session=${sessionId.slice(0, 8)} job=${jobId.slice(0, 8)} engagement=${engagement} hubMsg=${hubMessage.id.slice(0, 8)} depth=${hubMessage.depth}`);
 
   const session = sessionStore.get(sessionId);
-  if (!session) { console.warn(`[hub] onSessionJobComplete: session ${sessionId.slice(0, 8)} not found — aborting`); return; }
+  if (!session) {
+    console.warn(`[hub] onSessionJobComplete: session ${sessionId.slice(0, 8)} not found — marking dispatch acted`);
+    hubStore.updateDispatch(hubMessage.id, sessionId, { status: 'acted', finishedAt: new Date().toISOString() }, jobId);
+    broadcastDispatchUpdate(hubMessage.id);
+    checkMessageComplete(hubMessage.id);
+    return;
+  }
 
   // Extract text from job chunks
   const storedSession = sessionStore.get(sessionId);
   const job = storedSession?.jobs.find(j => j.jobId === jobId);
-  const rawOutput = extractTextFromChunks(job?.chunks ?? []);
+  const rawOutput = extractTextFromChunks(job?.chunks ?? [], { skipToolOutput: true });
   console.log(`[hub] onSessionJobComplete: rawOutput ${rawOutput.length} chars, chunks=${job?.chunks?.length ?? 0}`);
 
   // SKIP detection — structured `[SKIP][#REASON]` or legacy bare "SKIP".
@@ -883,14 +924,7 @@ function onSessionJobComplete(
     broadcastDispatchUpdate(hubMessage.id);
   }
 
-  // Check if all dispatches are done
-  const msg = hubStore.getMessage(hubMessage.id);
-  if (msg) {
-    const allDone = msg.dispatches.every(d => ['acted', 'skipped', 'error'].includes(d.status));
-    if (allDone) {
-      hubStore.updateStatus(hubMessage.id, 'complete');
-    }
-  }
+  checkMessageComplete(hubMessage.id);
 
   // Queue drain is handled by the global onAnyJobComplete callback registered
   // in index.ts. That callback fires AFTER activeExecutions.delete (session is
@@ -924,7 +958,7 @@ function continueTalking(
     console.log(`[hub]   ${sessionId.slice(0, 8)} TALKING cap reached (${round}/${cap})`);
     return;
   }
-  if (isSessionBusy(sessionId)) {
+  if (isSessionBusy(sessionId, 'hub')) {
     console.log(`[hub]   ${sessionId.slice(0, 8)} TALKING → busy, dropping continuation`);
     return;
   }
@@ -989,7 +1023,7 @@ function continueTalking(
     onTalkingJobComplete(sessionId, job.jobId, originalMessage, round);
   });
 
-  executeRemoteJob(sessionId, job.jobId, prompt);
+  executeRemoteJob(sessionId, job.jobId, prompt, undefined, 'hub');
 }
 
 function onTalkingJobComplete(
@@ -1002,12 +1036,15 @@ function onTalkingJobComplete(
 
   const session = sessionStore.get(sessionId);
   if (!session) {
+    hubStore.updateDispatch(originalMessage.id, sessionId, { status: 'acted', finishedAt: new Date().toISOString() }, jobId);
+    broadcastDispatchUpdate(originalMessage.id);
+    checkMessageComplete(originalMessage.id);
     drainGlobalQueue();
     return;
   }
 
   const job = session.jobs.find(j => j.jobId === jobId);
-  const rawOutput = extractTextFromChunks(job?.chunks ?? []);
+  const rawOutput = extractTextFromChunks(job?.chunks ?? [], { skipToolOutput: true });
 
   const talkSkip = parseSkipResponse(rawOutput);
   if (talkSkip) {
@@ -1035,6 +1072,7 @@ function onTalkingJobComplete(
       });
     }
 
+    checkMessageComplete(originalMessage.id);
     // Queue drain handled by global onAnyJobComplete callback
     return;
   }
@@ -1083,6 +1121,7 @@ function onTalkingJobComplete(
     }
   }
 
+  checkMessageComplete(originalMessage.id);
   // Queue drain handled by global onAnyJobComplete callback
 }
 
@@ -1095,8 +1134,8 @@ export function processQueue(sessionId: string): void {
 
   // Respect concurrency limit even while draining
   if (runningHubJobs >= config.hubMaxConcurrentJobs) return;
-  // Respect busy state
-  if (isSessionBusy(sessionId)) return;
+  // Respect busy state (hub channel)
+  if (isSessionBusy(sessionId, 'hub')) return;
 
   // Take next message from queue
   const next = queue.shift()!;
@@ -1132,7 +1171,7 @@ export function drainGlobalQueue(): void {
     if (runningHubJobs >= config.hubMaxConcurrentJobs) break;
     const queue = session.hubQueue ?? [];
     if (queue.length === 0) continue;
-    if (isSessionBusy(session.sessionId)) continue;
+    if (isSessionBusy(session.sessionId, 'hub')) continue;
     const last = sessionCooldowns.get(session.sessionId);
     if (last && (Date.now() - last) < config.hubCooldownMs) continue;
     processQueue(session.sessionId);
@@ -1163,8 +1202,8 @@ export function triggerSessionOnMessage(
 
   const sid = sessionId.slice(0, 8);
 
-  if (isSessionBusy(sessionId)) {
-    console.log(`[hub]   ${sid} TRIGGER → queue (busy)`);
+  if (isSessionBusy(sessionId, 'work')) {
+    console.log(`[hub]   ${sid} TRIGGER → queue (work busy)`);
     queueForSession(sessionId, hubMessageId, 'triggered');
     return { ok: true, status: 'queued' };
   }
@@ -1258,7 +1297,7 @@ export function resolveScreenName(name: string): string | undefined {
   return match?.sessionId;
 }
 
-export function extractTextFromChunks(chunks: unknown[]): string {
+export function extractTextFromChunks(chunks: unknown[], opts?: { skipToolOutput?: boolean }): string {
   // With --include-partial-messages, Claude CLI emits BOTH stream_event
   // text deltas (incremental) AND assistant snapshot chunks (complete).
   // Collecting both would duplicate the text. Prefer stream deltas (they
@@ -1267,6 +1306,9 @@ export function extractTextFromChunks(chunks: unknown[]): string {
   const streamParts: string[] = [];
   const assistantParts: string[] = [];
   let resultFallback: string | null = null;
+  const skipTool = opts?.skipToolOutput ?? false;
+  // Track whether we're inside a tool_use block (content_block_start..stop)
+  let insideTool = false;
 
   for (const chunk of chunks) {
     if (!chunk || typeof chunk !== 'object') continue;
@@ -1289,10 +1331,28 @@ export function extractTextFromChunks(chunks: unknown[]): string {
 
     if (c.type === 'stream_event') {
       const evt = c.event as Record<string, unknown> | undefined;
+
+      // Track tool_use blocks so we can skip text_delta inside them
+      if (skipTool && evt?.type === 'content_block_start') {
+        const cb = evt.content_block as Record<string, unknown> | undefined;
+        if (cb?.type === 'tool_use') insideTool = true;
+      }
+      if (skipTool && evt?.type === 'content_block_stop') {
+        insideTool = false;
+      }
+
       if (evt?.type === 'content_block_delta') {
         const delta = evt.delta as Record<string, unknown> | undefined;
+        // Skip thinking_delta chunks (from tmux thinking filter)
+        if (skipTool && delta?.type === 'thinking_delta') continue;
         if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
-          streamParts.push(delta.text);
+          const text = delta.text;
+          // When skipToolOutput, drop tool results and text inside tool blocks
+          if (skipTool) {
+            if (insideTool) continue;
+            if (text.startsWith('[tool result] ')) continue;
+          }
+          streamParts.push(text);
         }
       }
     }

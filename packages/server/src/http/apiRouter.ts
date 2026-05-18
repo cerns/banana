@@ -416,7 +416,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
         if (session.machineId) {
           const machine = machineStore.get(session.machineId);
           if (machine?.persistentMode) {
-            import('../ssh/tmuxRunner.js').then(m => m.killTmuxSession(machine, sessionId)).catch(() => {});
+            import('../ssh/tmuxRunner.js').then(m => m.killAllTmuxSessions(machine, sessionId)).catch(() => {});
           }
         }
       }

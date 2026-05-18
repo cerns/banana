@@ -221,6 +221,74 @@ describe('tmuxRunner', () => {
       expect(chunks[0].event.content_block.name).toBe('Read');
     });
 
+    it('should treat ⏺ with unknown word as text, not tool use', () => {
+      const chunks: any[] = [];
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c));
+
+      parser.feed('⏺ It looks like your message was cut off.\n');
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0]).toEqual({
+        type: 'stream_event',
+        event: {
+          type: 'content_block_delta',
+          delta: { type: 'text_delta', text: '⏺ It looks like your message was cut off.\n' },
+        },
+      });
+    });
+
+    it('should recognize all known tool names', () => {
+      const knownTools = [
+        'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
+        'WebFetch', 'WebSearch', 'Agent', 'NotebookEdit',
+        'TodoWrite', 'TodoRead', 'Skill', 'AskUserQuestion',
+        'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList',
+      ];
+      for (const tool of knownTools) {
+        const chunks: any[] = [];
+        const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c));
+        parser.feed(`⏺ ${tool}\n`);
+        expect(chunks[0]?.event?.content_block?.name).toBe(tool);
+      }
+    });
+
+    it('should emit thinking_delta when setThinking is true', () => {
+      const chunks: any[] = [];
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c));
+
+      parser.setThinking(true);
+      parser.feed('Let me analyze the situation.\n');
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0].event.delta.type).toBe('thinking_delta');
+      expect(chunks[0].event.delta.text).toContain('Let me analyze');
+    });
+
+    it('should emit text_delta when setThinking is false', () => {
+      const chunks: any[] = [];
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c));
+
+      parser.setThinking(false);
+      parser.feed('Here is my response.\n');
+
+      expect(chunks).toHaveLength(1);
+      expect(chunks[0].event.delta.type).toBe('text_delta');
+    });
+
+    it('should switch between thinking and text delta types', () => {
+      const chunks: any[] = [];
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c));
+
+      parser.setThinking(true);
+      parser.feed('Thinking about this...\n');
+      parser.setThinking(false);
+      parser.feed('Here is the answer.\n');
+
+      expect(chunks).toHaveLength(2);
+      expect(chunks[0].event.delta.type).toBe('thinking_delta');
+      expect(chunks[1].event.delta.type).toBe('text_delta');
+    });
+
     it('should emit tool result for ⎿ output', () => {
       const chunks: any[] = [];
       const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c));
@@ -1065,6 +1133,93 @@ describe('tmuxRunner', () => {
     });
   });
 
+  // ── suffix-based tmux session variants ───────────────────────────────────
+  describe('suffix variants', () => {
+    function setupAutoReply() {
+      mockConnectWithRetry.mockImplementation(async () => {
+        const client = createMockClient();
+        client.exec.mockImplementation((cmd: string, cb: Function) => {
+          const stream = createMockStream();
+          cb(null, stream);
+          if (cmd.includes('capture-pane')) {
+            process.nextTick(() => {
+              stream.emit('data', Buffer.from('>\n'));
+              stream.emit('close', 0);
+            });
+          } else {
+            process.nextTick(() => stream.emit('close', 0));
+          }
+        });
+        return { client, cleanup: vi.fn() };
+      });
+    }
+
+    it('should create separate tmux sessions for different suffixes', async () => {
+      setupAutoReply();
+      const machine = makeMachine();
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      const work = await tmuxRunner.ensureTmuxSession(machine, 'dual-test', '/work');
+      const hub = await tmuxRunner.ensureTmuxSession(machine, 'dual-test', '/work', undefined, undefined, '-hub');
+
+      expect(work.tmuxName).toBe('banana-dual-tes');
+      expect(hub.tmuxName).toBe('banana-dual-tes-hub');
+      expect(work.logPath).toBe('/tmp/banana-tmux-log-dual-tes');
+      expect(hub.logPath).toBe('/tmp/banana-tmux-log-dual-tes-hub');
+
+      expect(tmuxRunner.hasTmuxSession('dual-test')).toBe(true);
+      expect(tmuxRunner.hasTmuxSession('dual-test', '-hub')).toBe(true);
+      logSpy.mockRestore();
+    });
+
+    it('hasTmuxSession should distinguish between suffixes', async () => {
+      setupAutoReply();
+      const machine = makeMachine();
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      await tmuxRunner.ensureTmuxSession(machine, 'suffix-check', '/work');
+
+      expect(tmuxRunner.hasTmuxSession('suffix-check')).toBe(true);
+      expect(tmuxRunner.hasTmuxSession('suffix-check', '-hub')).toBe(false);
+      logSpy.mockRestore();
+    });
+
+    it('killTmuxSession with suffix should only kill the suffixed session', async () => {
+      setupAutoReply();
+      const machine = makeMachine();
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      await tmuxRunner.ensureTmuxSession(machine, 'kill-sfx', '/work');
+      await tmuxRunner.ensureTmuxSession(machine, 'kill-sfx', '/work', undefined, undefined, '-hub');
+
+      expect(tmuxRunner.hasTmuxSession('kill-sfx')).toBe(true);
+      expect(tmuxRunner.hasTmuxSession('kill-sfx', '-hub')).toBe(true);
+
+      await tmuxRunner.killTmuxSession(machine, 'kill-sfx', '-hub');
+      expect(tmuxRunner.hasTmuxSession('kill-sfx')).toBe(true);
+      expect(tmuxRunner.hasTmuxSession('kill-sfx', '-hub')).toBe(false);
+      logSpy.mockRestore();
+    });
+
+    it('killAllTmuxSessions should kill both work and hub sessions', async () => {
+      setupAutoReply();
+      const machine = makeMachine();
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+
+      await tmuxRunner.ensureTmuxSession(machine, 'kill-all', '/work');
+      await tmuxRunner.ensureTmuxSession(machine, 'kill-all', '/work', undefined, undefined, '-hub');
+
+      expect(tmuxRunner.hasTmuxSession('kill-all')).toBe(true);
+      expect(tmuxRunner.hasTmuxSession('kill-all', '-hub')).toBe(true);
+
+      await tmuxRunner.killAllTmuxSessions(machine, 'kill-all');
+
+      expect(tmuxRunner.hasTmuxSession('kill-all')).toBe(false);
+      expect(tmuxRunner.hasTmuxSession('kill-all', '-hub')).toBe(false);
+      logSpy.mockRestore();
+    });
+  });
+
   // ── streamTmuxOutput (capture-pane polling) ──────────────────────────────
   describe('streamTmuxOutput', () => {
     it('should complete when prompt is detected after content', async () => {
@@ -1181,8 +1336,8 @@ describe('tmuxRunner', () => {
       expect(tmuxRunner.isResponseLine('[tool result] output')).toBe(true);
     });
 
-    it('should accept thinking markers', () => {
-      expect(tmuxRunner.isResponseLine('∴ Thinking…')).toBe(true);
+    it('should reject thinking spinner markers', () => {
+      expect(tmuxRunner.isResponseLine('∴ Thinking…')).toBe(false);
     });
 
     it('should reject horizontal rules', () => {
@@ -1226,6 +1381,30 @@ describe('tmuxRunner', () => {
 
     it('should reject MOTD separator lines', () => {
       expect(tmuxRunner.isResponseLine('==============================')).toBe(false);
+    });
+
+    it('should reject Claude TUI header lines', () => {
+      expect(tmuxRunner.isResponseLine('Claude Code v2.1.63')).toBe(false);
+      expect(tmuxRunner.isResponseLine('Claude Code v2.1.143')).toBe(false);
+    });
+
+    it('should reject model name lines', () => {
+      expect(tmuxRunner.isResponseLine('Sonnet 4.6 · Claude Max')).toBe(false);
+      expect(tmuxRunner.isResponseLine('Opus 4.6 · Claude Max')).toBe(false);
+      expect(tmuxRunner.isResponseLine('Haiku 4.5 · API')).toBe(false);
+    });
+
+    it('should reject latestVersion and auto-update lines', () => {
+      expect(tmuxRunner.isResponseLine('latestVersion: 2.1.143')).toBe(false);
+      expect(tmuxRunner.isResponseLine('Auto-update failed · Try claude doctor')).toBe(false);
+      expect(tmuxRunner.isResponseLine('globalVersion: 2.1.63 · latestVersion: 2.1.143 ✗ Auto-update failed · Try claude doctor or npm i -g @anthropic-ai/claude-code')).toBe(false);
+    });
+
+    it('should reject all spinner variants including ∴', () => {
+      expect(tmuxRunner.isResponseLine('∴ Thinking…')).toBe(false);
+      expect(tmuxRunner.isResponseLine('✳ Misting…')).toBe(false);
+      expect(tmuxRunner.isResponseLine('✶ Mulling…')).toBe(false);
+      expect(tmuxRunner.isResponseLine('⊹ Pondering…')).toBe(false);
     });
 
     it('should reject empty lines', () => {

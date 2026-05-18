@@ -27,6 +27,13 @@ vi.mock('../../src/ssh/sshRunner.js', () => ({
   getRemoteContextTokens: mockGetRemoteContextTokens,
 }));
 
+const mockRunClaudeViaTmuxForSession = vi.fn();
+const mockAbortTmuxJob = vi.fn().mockResolvedValue(true);
+vi.mock('../../src/ssh/tmuxRunner.js', () => ({
+  runClaudeViaTmuxForSession: mockRunClaudeViaTmuxForSession,
+  abortTmuxJob: mockAbortTmuxJob,
+}));
+
 const mockBroadcast = vi.fn();
 vi.mock('../../src/ws/dashboardBroadcast.js', () => ({
   broadcastToDashboards: mockBroadcast,
@@ -58,6 +65,10 @@ describe('remoteSessionExecutor', () => {
     vi.doMock('../../src/ssh/sshRunner.js', () => ({
       runClaudeOverSsh: mockRunClaudeOverSsh,
       getRemoteContextTokens: mockGetRemoteContextTokens,
+    }));
+    vi.doMock('../../src/ssh/tmuxRunner.js', () => ({
+      runClaudeViaTmuxForSession: mockRunClaudeViaTmuxForSession,
+      abortTmuxJob: mockAbortTmuxJob,
     }));
     vi.doMock('../../src/ws/dashboardBroadcast.js', () => ({
       broadcastToDashboards: mockBroadcast,
@@ -1389,6 +1400,174 @@ describe('remoteSessionExecutor', () => {
 
       const updated = sessionStore.sessionStore.get('sess-r1');
       expect(updated!.claudeSessionId).toBe('final-session');
+    });
+  });
+
+  describe('dual-channel execution (persistent tmux)', () => {
+    function setupPersistentSession(): { session: SessionRecord; machine: MachineRecord } {
+      const machine: MachineRecord = {
+        ...makeMachine(),
+        persistentMode: true,
+      };
+      machineStore.machineStore.upsert(machine);
+
+      const session: SessionRecord = {
+        sessionId: 'sess-p1', clientId: '', hostname: 'test', workdir: '',
+        connectedAt: new Date().toISOString(), status: 'connected', jobs: [],
+        type: 'remote', name: 'persistent-remote', machineId: 'machine-1', remoteWorkdir: '/remote/path',
+      };
+      sessionStore.sessionStore.upsert(session);
+
+      // Add jobs
+      session.jobs.push(
+        { jobId: 'job-w1', prompt: 'work prompt', startedAt: new Date().toISOString(), chunks: [] },
+        { jobId: 'job-h1', prompt: 'hub prompt', startedAt: new Date().toISOString(), chunks: [] },
+      );
+      sessionStore.sessionStore.upsert(session);
+
+      return { session, machine };
+    }
+
+    it('should run work and hub jobs in parallel on persistent machines', async () => {
+      setupPersistentSession();
+
+      const defs: Array<{ resolve: (v: any) => void }> = [];
+      const calledSuffixes: Array<string | undefined> = [];
+
+      mockRunClaudeViaTmuxForSession.mockImplementation(
+        async (_m: any, _sid: any, _p: any, _w: any, _on: Function, _sig: any, _model: any, suffix?: string) => {
+          calledSuffixes.push(suffix);
+          return new Promise(resolve => { defs.push({ resolve }); });
+        },
+      );
+
+      // Execute work job and hub job
+      executor.executeRemoteJob('sess-p1', 'job-w1', 'work prompt', undefined, 'work');
+      executor.executeRemoteJob('sess-p1', 'job-h1', 'hub prompt', undefined, 'hub');
+
+      // Both should run in parallel (different execution keys)
+      await vi.waitFor(() => expect(mockRunClaudeViaTmuxForSession).toHaveBeenCalledTimes(2));
+
+      // Verify suffixes: work=undefined, hub='-hub'
+      expect(calledSuffixes).toContain(undefined);
+      expect(calledSuffixes).toContain('-hub');
+
+      // Complete both
+      defs[0].resolve({ exitCode: 0, durationMs: 100 });
+      defs[1].resolve({ exitCode: 0, durationMs: 100 });
+
+      await vi.waitFor(() => expect(executor.isSessionBusy('sess-p1')).toBe(false));
+    });
+
+    it('should queue hub jobs independently from work jobs on persistent machines', async () => {
+      setupPersistentSession();
+      const session = sessionStore.sessionStore.get('sess-p1')!;
+      session.jobs.push(
+        { jobId: 'job-h2', prompt: 'hub 2', startedAt: new Date().toISOString(), chunks: [] },
+      );
+      sessionStore.sessionStore.upsert(session);
+
+      const defs: Array<{ resolve: (v: any) => void }> = [];
+      mockRunClaudeViaTmuxForSession.mockImplementation(async () => {
+        return new Promise(resolve => { defs.push({ resolve }); });
+      });
+
+      // Start one hub job
+      executor.executeRemoteJob('sess-p1', 'job-h1', 'hub prompt', undefined, 'hub');
+      await vi.waitFor(() => expect(mockRunClaudeViaTmuxForSession).toHaveBeenCalledTimes(1));
+
+      // Second hub job should queue (same channel)
+      executor.executeRemoteJob('sess-p1', 'job-h2', 'hub 2', undefined, 'hub');
+      expect(mockRunClaudeViaTmuxForSession).toHaveBeenCalledTimes(1); // still only 1
+
+      // But work job should run immediately (different channel)
+      executor.executeRemoteJob('sess-p1', 'job-w1', 'work prompt', undefined, 'work');
+      await vi.waitFor(() => expect(mockRunClaudeViaTmuxForSession).toHaveBeenCalledTimes(2));
+
+      // Complete hub-1, hub-2 should start
+      defs[0].resolve({ exitCode: 0, durationMs: 50 });
+      await vi.waitFor(() => expect(mockRunClaudeViaTmuxForSession).toHaveBeenCalledTimes(3));
+
+      // Complete all
+      defs[1].resolve({ exitCode: 0, durationMs: 50 });
+      defs[2].resolve({ exitCode: 0, durationMs: 50 });
+      await vi.waitFor(() => expect(executor.isSessionBusy('sess-p1')).toBe(false));
+    });
+
+    it('isSessionBusy with channel should check only that channel', async () => {
+      setupPersistentSession();
+
+      mockRunClaudeViaTmuxForSession.mockImplementation(async () => {
+        return new Promise(() => {}); // never resolves
+      });
+
+      executor.executeRemoteJob('sess-p1', 'job-w1', 'work', undefined, 'work');
+      await vi.waitFor(() => expect(mockRunClaudeViaTmuxForSession).toHaveBeenCalledTimes(1));
+
+      // Work channel is busy, hub is not
+      expect(executor.isSessionBusy('sess-p1', 'work')).toBe(true);
+      expect(executor.isSessionBusy('sess-p1', 'hub')).toBe(false);
+      // No channel = any busy
+      expect(executor.isSessionBusy('sess-p1')).toBe(true);
+    });
+
+    it('abortRemoteJob should abort both channels on persistent machines', async () => {
+      setupPersistentSession();
+
+      const defs: Array<{ resolve: (v: any) => void; reject: (e: Error) => void }> = [];
+      mockRunClaudeViaTmuxForSession.mockImplementation(
+        async (_m: any, _sid: any, _p: any, _w: any, _on: Function, signal: AbortSignal) => {
+          return new Promise((resolve, reject) => {
+            defs.push({ resolve, reject });
+            signal?.addEventListener('abort', () => reject(new Error('Aborted')));
+          });
+        },
+      );
+
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      executor.executeRemoteJob('sess-p1', 'job-w1', 'work', undefined, 'work');
+      executor.executeRemoteJob('sess-p1', 'job-h1', 'hub', undefined, 'hub');
+
+      await vi.waitFor(() => expect(mockRunClaudeViaTmuxForSession).toHaveBeenCalledTimes(2));
+
+      const aborted = executor.abortRemoteJob('sess-p1');
+      expect(aborted).toBe(true);
+
+      // Both tmux sessions should get C-c
+      expect(mockAbortTmuxJob).toHaveBeenCalledTimes(2);
+      expect(mockAbortTmuxJob).toHaveBeenCalledWith(expect.anything(), 'sess-p1');
+      expect(mockAbortTmuxJob).toHaveBeenCalledWith(expect.anything(), 'sess-p1', '-hub');
+
+      consoleSpy.mockRestore();
+    });
+
+    it('non-persistent machines should share one execution slot for both channels', async () => {
+      // Non-persistent: same key regardless of channel
+      const machine = makeMachine(); // no persistentMode
+      machineStore.machineStore.upsert(machine);
+
+      const session: SessionRecord = {
+        sessionId: 'sess-np', clientId: '', hostname: 'test', workdir: '',
+        connectedAt: new Date().toISOString(), status: 'connected',
+        jobs: [
+          { jobId: 'job-1', prompt: 'work', startedAt: new Date().toISOString(), chunks: [] },
+          { jobId: 'job-2', prompt: 'hub', startedAt: new Date().toISOString(), chunks: [] },
+        ],
+        type: 'remote', machineId: 'machine-1', remoteWorkdir: '/work',
+      };
+      sessionStore.sessionStore.upsert(session);
+
+      mockRunClaudeOverSsh.mockImplementation(async () => {
+        return new Promise(() => {}); // never resolves
+      });
+
+      executor.executeRemoteJob('sess-np', 'job-1', 'work', undefined, 'work');
+      await vi.waitFor(() => expect(mockRunClaudeOverSsh).toHaveBeenCalledTimes(1));
+
+      // Hub job on non-persistent should queue (same key)
+      executor.executeRemoteJob('sess-np', 'job-2', 'hub', undefined, 'hub');
+      expect(mockRunClaudeOverSsh).toHaveBeenCalledTimes(1); // still only 1
     });
   });
 });

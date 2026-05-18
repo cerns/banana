@@ -17,8 +17,13 @@ interface TmuxSession {
   tailConn: TunneledConnection | null;
 }
 
-/** Active tmux sessions keyed by banana sessionId. */
+/** Active tmux sessions keyed by `${sessionId}${suffix}` (suffix is '' for work, '-hub' for hub). */
 const tmuxSessions = new Map<string, TmuxSession>();
+
+/** Build the Map key for a tmux session. */
+function tmuxKey(sessionId: string, suffix?: string): string {
+  return `${sessionId}${suffix ?? ''}`;
+}
 
 // ── ANSI / TUI cleanup ────────────────────────────────────────────────────
 
@@ -106,6 +111,17 @@ function matchesPermissionPattern(line: string): boolean {
 
 type ParserState = 'waiting' | 'text' | 'tool_use' | 'tool_result';
 
+/** Known Claude Code tool names — used to distinguish "⏺ Read" (tool) from "⏺ It looks..." (text). */
+const KNOWN_TOOL_NAMES = new Set([
+  'Read', 'Edit', 'Write', 'Bash', 'Glob', 'Grep',
+  'WebFetch', 'WebSearch', 'Agent',
+  'NotebookEdit', 'TodoWrite', 'TodoRead',
+  'EnterPlanMode', 'ExitPlanMode',
+  'Skill', 'AskUserQuestion',
+  'TaskCreate', 'TaskUpdate', 'TaskGet', 'TaskList',
+  'EnterWorktree',
+]);
+
 /**
  * State machine that parses Claude TUI text output into synthetic stream-json
  * chunks matching the format produced by `claude --print --output-format stream-json`.
@@ -121,6 +137,8 @@ export class TmuxOutputParser {
   private responseLines: string[] = [];
   /** Cooldown: timestamp of last auto-approve to avoid re-firing while same prompt is visible. */
   private lastAutoApproveAt = 0;
+  /** Whether the screen currently shows a thinking spinner — text emitted as thinking_delta. */
+  private _thinking = false;
 
   constructor(
     onChunk: SshChunkCallback,
@@ -131,6 +149,9 @@ export class TmuxOutputParser {
     this.sendKeys = sendKeys ?? null;
     this.autoApprove = autoApprove;
   }
+
+  /** Set thinking mode — text lines emitted as thinking_delta instead of text_delta. */
+  setThinking(flag: boolean): void { this._thinking = flag; }
 
   /** Feed raw text from `tail -f`. May contain partial lines. */
   feed(raw: string): void {
@@ -192,9 +213,11 @@ export class TmuxOutputParser {
     }
 
     // ── Tool use start: "⏺ ToolName(...)" ─────────────────────────────
+    // Only match known tool names — otherwise "⏺ It looks like..." (response text)
+    // would be misidentified as tool use with name "It".
     if (/^[⏺●]\s+\w+/.test(trimmed)) {
       const match = trimmed.match(/^[⏺●]\s+(\w+)/);
-      if (match) {
+      if (match && KNOWN_TOOL_NAMES.has(match[1])) {
         this.state = 'tool_use';
         this.responseLines.push(trimmed);
         this.onChunk({
@@ -227,11 +250,12 @@ export class TmuxOutputParser {
     if (trimmed || this.state === 'text') {
       this.state = 'text';
       this.responseLines.push(line);
+      const deltaType = this._thinking ? 'thinking_delta' : 'text_delta';
       this.onChunk({
         type: 'stream_event',
         event: {
           type: 'content_block_delta',
-          delta: { type: 'text_delta', text: line + '\n' },
+          delta: { type: deltaType, text: line + '\n' },
         },
       });
     }
@@ -330,8 +354,10 @@ export async function ensureTmuxSession(
   workdir: string,
   model?: string,
   signal?: AbortSignal,
+  suffix?: string,
 ): Promise<TmuxSession> {
-  const existing = tmuxSessions.get(sessionId);
+  const key = tmuxKey(sessionId, suffix);
+  const existing = tmuxSessions.get(key);
   if (existing) {
     // Verify tmux session still exists on remote
     try {
@@ -340,14 +366,15 @@ export async function ensureTmuxSession(
     } catch {
       // Session died — clean up and recreate
       console.warn(`[tmux-runner] Session ${existing.tmuxName} died on remote, recreating`);
-      tmuxSessions.delete(sessionId);
+      tmuxSessions.delete(key);
       if (existing.tailConn) existing.tailConn.cleanup();
     }
   }
 
   const sid8 = sessionId.slice(0, 8);
-  const tmuxName = `banana-${sid8}`;
-  const logPath = `/tmp/banana-tmux-log-${sid8}`;
+  const sfx = suffix ?? '';
+  const tmuxName = `banana-${sid8}${sfx}`;
+  const logPath = `/tmp/banana-tmux-log-${sid8}${sfx}`;
 
   // Verify tmux is installed
   try {
@@ -463,7 +490,7 @@ export async function ensureTmuxSession(
     ready: true,
     tailConn: null,
   };
-  tmuxSessions.set(sessionId, session);
+  tmuxSessions.set(key, session);
   console.log(`[tmux-runner] Session ${tmuxName} ready on ${machine.alias || machine.ip}`);
   return session;
 }
@@ -493,6 +520,8 @@ export async function sendPromptViaTmux(
       signal,
       15_000,
     );
+    // Wait for TUI to process the paste before sending Enter (prevents stuck prompts with long pastes)
+    await new Promise(r => setTimeout(r, 300));
     // Send Enter to submit the prompt
     await tmuxSendKeys(machine, session.tmuxName, 'Enter', signal);
   } finally {
@@ -518,8 +547,8 @@ export function isResponseLine(line: string): boolean {
   // Auto-update / deprecation
   if (/^globalVersion:/.test(t)) return false;
   if (/^Claude Code has switched/.test(t)) return false;
-  // Spinner / progress lines (✳ Misting…, ✻ Thinking…, ✶ Mulling…, etc.)
-  if (/^[✳✻✽·✢∗☆★✦✧⊹✶] \w+/.test(t)) return false;
+  // Spinner / progress lines (✳ Misting…, ✻ Thinking…, ∴ Thinking…, ✶ Mulling…, etc.)
+  if (/^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+/.test(t)) return false;
   // Streaming indicators with timing/tokens
   if (/^\(?\d+s\s*·/.test(t)) return false;
   if (/^↑|^↓/.test(t)) return false;
@@ -529,6 +558,14 @@ export function isResponseLine(line: string): boolean {
   if (/^cd\s+'.*&&.*export\s+PATH=/.test(t)) return false;
   // Separator lines (MOTD === blocks)
   if (/^={5,}$/.test(t)) return false;
+  // Claude TUI header (version, model name)
+  if (/^Claude Code v[\d.]+/.test(t)) return false;
+  if (/^(Opus|Sonnet|Haiku)\s+[\d.]+/.test(t)) return false;
+  // Token count in footer
+  if (/^\d+ tokens?\s*$/.test(t)) return false;
+  // latestVersion / auto-update lines
+  if (/^latestVersion:/.test(t)) return false;
+  if (/Auto-update failed/.test(t)) return false;
   return true;
 }
 
@@ -549,13 +586,19 @@ function isPromptLine(line: string): boolean {
  * Stream output from a tmux session by polling `tmux capture-pane`.
  * TUI apps (like Claude) render full-screen, so pipe-pane/tail-f produces
  * unusable raw terminal data. capture-pane returns the rendered screen.
- * We filter TUI chrome and deduplicate lines to emit clean response content.
+ *
+ * Uses screen-diff approach: compares consecutive captures and emits only
+ * lines that are genuinely new (not present in the previous capture).
+ * This avoids the false-dedup problem where identical lines across different
+ * responses would be silently dropped.
  */
 export async function streamTmuxOutput(
   machine: MachineRecord,
   session: TmuxSession,
   onChunk: SshChunkCallback,
   signal?: AbortSignal,
+  promptText?: string,
+  filterThinking = false,
 ): Promise<{ completed: boolean }> {
   if (signal?.aborted) throw new Error('Aborted');
 
@@ -563,8 +606,20 @@ export async function streamTmuxOutput(
   let hasContent = false;
   let lastChangeAt = Date.now();
 
-  // Track emitted lines to avoid duplicates (TUI redraws same content)
-  const emittedLines = new Set<string>();
+  // Build a set of prompt lines to filter out echoed prompt text from capture-pane.
+  // When a long prompt is pasted via tmux, it appears on screen before claude processes it.
+  // The TUI also echoes prompts prefixed with "❯ ", so we add both forms.
+  const promptLines = new Set<string>();
+  if (promptText) {
+    for (const line of promptText.split('\n')) {
+      const t = line.trim();
+      if (t) {
+        promptLines.add(t);
+        promptLines.add(`❯ ${t}`);   // TUI prompt echo: "❯ <text>"
+        promptLines.add(`> ${t}`);    // alternative prompt char
+      }
+    }
+  }
 
   const sendKeysForApprove = (keys: string) => {
     tmuxSendKeys(machine, session.tmuxName, keys, signal).catch((e) => {
@@ -574,7 +629,9 @@ export async function streamTmuxOutput(
 
   const parser = new TmuxOutputParser(onChunk, sendKeysForApprove);
 
-  // Seed emitted set with initial screen content so we only emit new response lines
+  // Capture the initial screen as our baseline — everything here is "old".
+  // We store the full line array (with positions) so we can diff properly.
+  let prevLines: string[] = [];
   try {
     const initial = await tmuxExec(
       machine,
@@ -582,11 +639,18 @@ export async function streamTmuxOutput(
       signal,
       10_000,
     );
-    for (const line of stripAnsi(initial).split('\n')) {
-      const t = line.trim();
-      if (t) emittedLines.add(t);
-    }
+    prevLines = stripAnsi(initial).split('\n').map(l => l.trim());
   } catch { /* start from empty */ }
+
+  // Build a multiset (line → count) from a line array for diff comparison.
+  function buildLineMultiset(lines: string[]): Map<string, number> {
+    const m = new Map<string, number>();
+    for (const l of lines) {
+      if (!l) continue;
+      m.set(l, (m.get(l) ?? 0) + 1);
+    }
+    return m;
+  }
 
   while (true) {
     if (signal?.aborted) throw new Error('Aborted');
@@ -607,28 +671,51 @@ export async function streamTmuxOutput(
       continue;
     }
 
-    const lines = screen.split('\n');
+    const curLines = screen.split('\n').map(l => l.trim());
 
-    // Emit new response content lines (deduplicated, noise-filtered)
-    // Permission-matching lines BYPASS dedup — they can appear identically
-    // across different permission prompts in the same session.
-    let newContentThisPoll = false;
-    for (const line of lines) {
-      const t = line.trim();
+    // Diff: find lines in curLines that are new compared to prevLines.
+    // Uses multiset subtraction — handles duplicate lines correctly.
+    const prevSet = buildLineMultiset(prevLines);
+    const newLines: string[] = [];
+    for (const t of curLines) {
       if (!t) continue;
-
-      const isPermission = matchesPermissionPattern(t);
-      if (!isPermission) {
-        if (emittedLines.has(t)) continue;
-        emittedLines.add(t);
+      const prevCount = prevSet.get(t) ?? 0;
+      if (prevCount > 0) {
+        prevSet.set(t, prevCount - 1); // consume one occurrence
+      } else {
+        newLines.push(t);
       }
+    }
 
+    // Detect thinking mode (hub channel only): if a thinking/spinner symbol is on screen,
+    // text is thinking output. Tags text lines as thinking_delta (ignored by extractTextFromChunks).
+    if (filterThinking) {
+      const screenHasThinking = curLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+/.test(l));
+      parser.setThinking(screenHasThinking);
+    }
+
+    // Emit new response content lines (noise-filtered, prompt-echo-filtered)
+    let newContentThisPoll = false;
+    for (const t of newLines) {
+      // Skip echoed prompt text (pasted prompt appears on screen before processing)
+      if (promptLines.size > 0 && promptLines.has(t)) continue;
+
+      // Permission-matching always gets processed (auto-approve)
+      if (matchesPermissionPattern(t)) {
+        parser.feed(t + '\n');
+        newContentThisPoll = true;
+        hasContent = true;
+        continue;
+      }
       if (isResponseLine(t)) {
         newContentThisPoll = true;
         hasContent = true;
         parser.feed(t + '\n');
       }
     }
+
+    // Update baseline for next poll
+    prevLines = curLines;
 
     if (newContentThisPoll) {
       lastChangeAt = Date.now();
@@ -637,10 +724,10 @@ export async function streamTmuxOutput(
     // Check for prompt (response complete)
     // Scan last ~10 non-empty lines: the ❯ prompt can be several lines from
     // the bottom (above horizontal rule, status bar, auto-update message)
-    const bottomLines = lines.filter(l => l.trim()).slice(-10).map(l => l.trim());
+    const bottomLines = curLines.filter(l => l).slice(-10);
     const hasPrompt = bottomLines.some(isPromptLine);
     // Also verify no spinner is active (Claude is still working)
-    const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶] \w+/.test(l));
+    const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+/.test(l));
     if (hasContent && hasPrompt && !hasSpinner) {
       console.log('[tmux-runner] Prompt detected — response complete');
       parser.flush();
@@ -687,6 +774,52 @@ export async function runClaudeViaTmux(
 }
 
 /**
+ * Send /clear to a tmux session and wait for the prompt to reappear.
+ * Used to reset context before hub dispatches to avoid token accumulation.
+ */
+export async function clearTmuxSession(
+  machine: MachineRecord,
+  sessionId: string,
+  signal?: AbortSignal,
+  suffix?: string,
+): Promise<boolean> {
+  const key = tmuxKey(sessionId, suffix);
+  const session = tmuxSessions.get(key);
+  if (!session) return false;
+
+  const sid8 = sessionId.slice(0, 8);
+  const sfx = suffix ?? '';
+  console.log(`[tmux-runner] Session ${sid8}${sfx} — sending /clear`);
+
+  // Send /clear via keystroke (not paste-buffer — it's a short command)
+  await tmuxSendKeys(machine, session.tmuxName, '/clear Enter', signal);
+
+  // Wait for prompt to reappear (claude processes the /clear command)
+  const startedAt = Date.now();
+  const timeoutMs = 30_000;
+  while (Date.now() - startedAt < timeoutMs) {
+    if (signal?.aborted) throw new Error('Aborted');
+    await new Promise(r => setTimeout(r, 1000));
+    try {
+      const screen = await tmuxExec(
+        machine,
+        `tmux capture-pane -t ${shellEscape(session.tmuxName)} -p`,
+        signal,
+        10_000,
+      );
+      const lines = stripAnsi(screen).split('\n').filter(l => l.trim()).slice(-10).map(l => l.trim());
+      if (lines.some(isPromptLine)) {
+        console.log(`[tmux-runner] Session ${sid8}${sfx} — /clear done`);
+        return true;
+      }
+    } catch { /* retry */ }
+  }
+
+  console.warn(`[tmux-runner] Session ${sid8}${sfx} — /clear timed out, continuing anyway`);
+  return false;
+}
+
+/**
  * Execute a prompt in a persistent tmux session, keyed by banana sessionId.
  * Ensures tmux session exists, sends prompt, streams output, returns result.
  */
@@ -698,24 +831,28 @@ export async function runClaudeViaTmuxForSession(
   onChunk: SshChunkCallback,
   signal?: AbortSignal,
   model?: string,
+  suffix?: string,
 ): Promise<SshRunResult> {
   if (signal?.aborted) throw new Error('Aborted');
   const startedAt = Date.now();
 
   const sid8 = sessionId.slice(0, 8);
-  console.log(`[tmux-runner] Session ${sid8} — prompt ${prompt.length} chars`);
+  const sfx = suffix ?? '';
+  console.log(`[tmux-runner] Session ${sid8}${sfx} — prompt ${prompt.length} chars`);
 
   // Ensure tmux session is running
-  const session = await ensureTmuxSession(machine, sessionId, workdir, model, signal);
+  const session = await ensureTmuxSession(machine, sessionId, workdir, model, signal, suffix);
 
   // Send the prompt
   await sendPromptViaTmux(machine, session, prompt, signal);
 
-  // Stream output until response complete
-  const { completed } = await streamTmuxOutput(machine, session, onChunk, signal);
+  // Stream output until response complete (pass prompt text to filter echoed lines)
+  // Hub channels (suffix like '-hub') filter thinking to avoid polluting channel replies.
+  const isHubChannel = !!suffix;
+  const { completed } = await streamTmuxOutput(machine, session, onChunk, signal, prompt, isHubChannel);
 
   const durationMs = Date.now() - startedAt;
-  console.log(`[tmux-runner] Session ${sid8} — done in ${durationMs}ms (completed=${completed})`);
+  console.log(`[tmux-runner] Session ${sid8}${sfx} — done in ${durationMs}ms (completed=${completed})`);
 
   // Truncate log if too large (keep last 1MB)
   try {
@@ -739,8 +876,9 @@ export async function runClaudeViaTmuxForSession(
  * Abort the current job in a tmux session by sending Ctrl-C.
  * Claude stays alive — only the current tool/response is interrupted.
  */
-export async function abortTmuxJob(machine: MachineRecord, sessionId: string): Promise<boolean> {
-  const session = tmuxSessions.get(sessionId);
+export async function abortTmuxJob(machine: MachineRecord, sessionId: string, suffix?: string): Promise<boolean> {
+  const key = tmuxKey(sessionId, suffix);
+  const session = tmuxSessions.get(key);
   if (!session) return false;
 
   console.log(`[tmux-runner] Aborting job in ${session.tmuxName}`);
@@ -766,8 +904,9 @@ export async function abortTmuxJob(machine: MachineRecord, sessionId: string): P
  * Kill a tmux session and clean up resources.
  * Called when a banana session is deleted.
  */
-export async function killTmuxSession(machine: MachineRecord, sessionId: string): Promise<void> {
-  const session = tmuxSessions.get(sessionId);
+export async function killTmuxSession(machine: MachineRecord, sessionId: string, suffix?: string): Promise<void> {
+  const key = tmuxKey(sessionId, suffix);
+  const session = tmuxSessions.get(key);
   if (!session) return;
 
   console.log(`[tmux-runner] Killing session ${session.tmuxName}`);
@@ -788,10 +927,19 @@ export async function killTmuxSession(machine: MachineRecord, sessionId: string)
     await tmuxExec(machine, `rm -f ${shellEscape(session.logPath)}`);
   } catch { /* ignore */ }
 
-  tmuxSessions.delete(sessionId);
+  tmuxSessions.delete(key);
+}
+
+/**
+ * Kill ALL tmux session variants (work + hub) for a banana session.
+ * Called when a session is deleted.
+ */
+export async function killAllTmuxSessions(machine: MachineRecord, sessionId: string): Promise<void> {
+  await killTmuxSession(machine, sessionId);
+  await killTmuxSession(machine, sessionId, '-hub');
 }
 
 /** Check if a tmux session exists for the given banana sessionId. */
-export function hasTmuxSession(sessionId: string): boolean {
-  return tmuxSessions.has(sessionId);
+export function hasTmuxSession(sessionId: string, suffix?: string): boolean {
+  return tmuxSessions.has(tmuxKey(sessionId, suffix));
 }

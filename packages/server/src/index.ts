@@ -40,7 +40,7 @@ onAnyJobComplete((sessionId, jobId) => {
   // reply, we act as a safety net here. Ad-hoc jobs always go through this path.
   const isHubJob = job.source && job.source !== 'adhoc';
 
-  const rawOutput = extractTextFromChunks(job.chunks ?? []);
+  const rawOutput = extractTextFromChunks(job.chunks ?? [], { skipToolOutput: true });
 
   // ── Strategy 1: Full [REPLY_TO_CHANNEL][#ch][%msg]...[/REPLY_TO_CHANNEL] in output
   // (agent explicitly provided both routing and content in the output)

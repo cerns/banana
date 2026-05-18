@@ -4,10 +4,27 @@ import { updateClaudeSessionId } from '../sessions/sessionManager.js';
 import { broadcastToDashboards } from '../ws/dashboardBroadcast.js';
 import { pushManager } from '../push/pushManager.js';
 import { runClaudeOverSsh, getRemoteContextTokens } from './sshRunner.js';
-import { runClaudeViaTmuxForSession, abortTmuxJob } from './tmuxRunner.js';
+import { runClaudeViaTmuxForSession, abortTmuxJob, clearTmuxSession } from './tmuxRunner.js';
 import { config } from '../config.js';
 
-/** Active SSH executions — keyed by sessionId for abort support. */
+/** Execution channel — 'work' for direct sends, 'hub' for hub dispatches. */
+export type ExecChannel = 'work' | 'hub';
+
+/**
+ * Build the execution key for activeExecutions/pendingQueue Maps.
+ * Persistent tmux sessions get separate channels; non-persistent share one process.
+ */
+function execKey(sessionId: string, channel: ExecChannel, persistentMode?: boolean): string {
+  if (persistentMode && channel === 'hub') return `${sessionId}:hub`;
+  return sessionId;
+}
+
+/** Map ExecChannel to tmux suffix. */
+function tmuxSuffix(channel: ExecChannel): string | undefined {
+  return channel === 'hub' ? '-hub' : undefined;
+}
+
+/** Active SSH executions — keyed by execKey for abort support. */
 const activeExecutions = new Map<string, AbortController>();
 
 /** Per-session job queue — jobs waiting to run when the session is busy. */
@@ -15,6 +32,7 @@ interface PendingJob {
   jobId: string;
   prompt: string;
   modelOverride?: string;
+  channel: ExecChannel;
 }
 const pendingQueue = new Map<string, PendingJob[]>();
 
@@ -58,19 +76,38 @@ function fireGlobalCallbacks(sessionId: string, jobId: string): void {
   }
 }
 
-/** Check if a session has an active SSH execution. */
-export function isSessionBusy(sessionId: string): boolean {
-  return activeExecutions.has(sessionId);
+/**
+ * Check if a session has an active SSH execution.
+ * With no channel: returns true if ANY channel is busy.
+ * With channel: checks only that specific channel (requires knowing persistentMode).
+ */
+export function isSessionBusy(sessionId: string, channel?: ExecChannel): boolean {
+  if (!channel) {
+    // Check both possible keys
+    return activeExecutions.has(sessionId) || activeExecutions.has(`${sessionId}:hub`);
+  }
+  // Channel-specific check — need machine info
+  const session = sessionStore.get(sessionId);
+  const machine = session?.machineId ? machineStore.get(session.machineId) : undefined;
+  const key = execKey(sessionId, channel, machine?.persistentMode);
+  return activeExecutions.has(key);
 }
 
 /** Return the set of session IDs that currently have active SSH executions. */
 export function getActiveSessionIds(): string[] {
-  return Array.from(activeExecutions.keys());
+  const ids = new Set<string>();
+  for (const key of activeExecutions.keys()) {
+    // Strip ':hub' suffix to get the base session ID
+    ids.add(key.replace(/:hub$/, ''));
+  }
+  return Array.from(ids);
 }
 
 /** Return the number of jobs waiting in the per-session queue. */
 export function getPendingJobCount(sessionId: string): number {
-  return pendingQueue.get(sessionId)?.length ?? 0;
+  const base = pendingQueue.get(sessionId)?.length ?? 0;
+  const hub = pendingQueue.get(`${sessionId}:hub`)?.length ?? 0;
+  return base + hub;
 }
 
 function fmtDuration(ms: number): string {
@@ -97,13 +134,18 @@ function fmtBytes(n: number): string {
  * and will execute automatically when the current job finishes. This
  * ensures correct ordering when multiple prompts target the same session.
  */
-export function executeRemoteJob(sessionId: string, jobId: string, prompt: string, modelOverride?: string): void {
-  if (activeExecutions.has(sessionId)) {
-    // Session is busy — queue for sequential execution instead of aborting
-    const queue = pendingQueue.get(sessionId) ?? [];
-    queue.push({ jobId, prompt, modelOverride });
-    pendingQueue.set(sessionId, queue);
-    console.log(`[remote-executor] Session ${sessionId.slice(0, 8)} busy — queued job ${jobId.slice(0, 8)} (${queue.length} pending)`);
+export function executeRemoteJob(sessionId: string, jobId: string, prompt: string, modelOverride?: string, channel: ExecChannel = 'work'): void {
+  // Determine execution key based on channel and machine mode
+  const session = sessionStore.get(sessionId);
+  const machine = session?.machineId ? machineStore.get(session.machineId) : undefined;
+  const key = execKey(sessionId, channel, machine?.persistentMode);
+
+  if (activeExecutions.has(key)) {
+    // Channel is busy — queue for sequential execution
+    const queue = pendingQueue.get(key) ?? [];
+    queue.push({ jobId, prompt, modelOverride, channel });
+    pendingQueue.set(key, queue);
+    console.log(`[remote-executor] Session ${sessionId.slice(0, 8)} [${channel}] busy — queued job ${jobId.slice(0, 8)} (${queue.length} pending)`);
     broadcastToDashboards({
       type: 'DASHBOARD_EVENT',
       event: 'JOB_QUEUED',
@@ -115,19 +157,19 @@ export function executeRemoteJob(sessionId: string, jobId: string, prompt: strin
   }
 
   // Intentionally not awaited — runs in background
-  runJob(sessionId, jobId, prompt, modelOverride).catch((err) => {
+  runJob(sessionId, jobId, prompt, modelOverride, channel).catch((err) => {
     console.error(`[remote-executor] Unexpected error for session=${sessionId} job=${jobId}:`, err);
   });
 }
 
-async function runJob(sessionId: string, jobId: string, prompt: string, modelOverride?: string): Promise<void> {
+async function runJob(sessionId: string, jobId: string, prompt: string, modelOverride?: string, channel: ExecChannel = 'work'): Promise<void> {
   const session = sessionStore.get(sessionId);
   if (!session || session.type !== 'remote' || !session.machineId) {
     sessionStore.errorJob(sessionId, jobId, 'Invalid remote session configuration');
     broadcastError(sessionId, jobId, 'Invalid remote session configuration');
     // Still fire callbacks so hub can decrement counters and drain queues
     fireCompletionCallbacks(sessionId, jobId);
-    drainSessionQueue(sessionId);
+    drainSessionQueue(sessionId, channel);
     fireGlobalCallbacks(sessionId, jobId);
     return;
   }
@@ -137,7 +179,7 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
     sessionStore.errorJob(sessionId, jobId, `Machine ${session.machineId} not found`);
     broadcastError(sessionId, jobId, `Machine ${session.machineId} not found`);
     fireCompletionCallbacks(sessionId, jobId);
-    drainSessionQueue(sessionId);
+    drainSessionQueue(sessionId, channel);
     fireGlobalCallbacks(sessionId, jobId);
     return;
   }
@@ -145,8 +187,9 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
   const workdir = session.remoteWorkdir ?? machine.defaultWorkdir ?? '';
   let resumeId = session.claudeSessionId;
 
+  const key = execKey(sessionId, channel, machine.persistentMode);
   const controller = new AbortController();
-  activeExecutions.set(sessionId, controller);
+  activeExecutions.set(key, controller);
 
   try {
     const sid8 = sessionId.slice(0, 8);
@@ -154,7 +197,16 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
 
     // ── Persistent tmux mode ──────────────────────────────────────────
     if (machine.persistentMode) {
-      console.log(`[remote-executor] Session ${sid8} job ${jid8} [tmux] — prompt ${prompt.length} chars`);
+      console.log(`[remote-executor] Session ${sid8} job ${jid8} [tmux/${channel}] — prompt ${prompt.length} chars`);
+
+      // Hub channel: /clear before each dispatch to avoid token accumulation
+      if (channel === 'hub') {
+        try {
+          await clearTmuxSession(machine, sessionId, controller.signal, tmuxSuffix(channel));
+        } catch (e) {
+          console.warn(`[remote-executor] /clear failed for ${sid8} hub, continuing:`, e);
+        }
+      }
 
       let outputBytes = 0;
       const result = await runClaudeViaTmuxForSession(
@@ -175,6 +227,7 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
         },
         controller.signal,
         modelOverride || session.model,
+        tmuxSuffix(channel),
       );
 
       sessionStore.finishJob(sessionId, jobId, result.exitCode, result.durationMs);
@@ -313,18 +366,18 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
     pushManager.sendPush(`❌ ${host} couldn't start`, `${folder} · ${errorMsg.slice(0, 100)}`).catch(() => {});
 
   } finally {
-    // Free the session FIRST so callbacks see it as available for queue drain.
-    if (activeExecutions.get(sessionId) === controller) {
-      activeExecutions.delete(sessionId);
+    // Free the execution slot FIRST so callbacks see it as available for queue drain.
+    if (activeExecutions.get(key) === controller) {
+      activeExecutions.delete(key);
     }
 
     // Per-job callbacks (hub dispatch completion handlers — update hub state, don't start new jobs)
     fireCompletionCallbacks(sessionId, jobId);
 
-    // Drain per-session queue — start the next queued job before hub queue
+    // Drain per-channel queue — start the next queued job before hub queue
     // drain so that already-submitted jobs execute in order. Hub queue items
     // will wait until the per-session queue is empty.
-    drainSessionQueue(sessionId);
+    drainSessionQueue(sessionId, channel);
 
     // Global callbacks (hub queue drain for ALL job types including ad-hoc)
     fireGlobalCallbacks(sessionId, jobId);
@@ -332,22 +385,26 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
 }
 
 /**
- * Drain the per-session job queue — start the next queued job if the session
- * is free. Called in the finally block after each job completes.
+ * Drain the per-channel job queue — start the next queued job if the
+ * execution slot is free. Called in the finally block after each job completes.
  */
-function drainSessionQueue(sessionId: string): void {
-  if (activeExecutions.has(sessionId)) return; // safety check
-  const queue = pendingQueue.get(sessionId);
+function drainSessionQueue(sessionId: string, channel: ExecChannel = 'work'): void {
+  const session = sessionStore.get(sessionId);
+  const machine = session?.machineId ? machineStore.get(session.machineId) : undefined;
+  const key = execKey(sessionId, channel, machine?.persistentMode);
+
+  if (activeExecutions.has(key)) return; // safety check
+  const queue = pendingQueue.get(key);
   if (!queue || queue.length === 0) {
-    pendingQueue.delete(sessionId);
+    pendingQueue.delete(key);
     return;
   }
   const next = queue.shift()!;
-  if (queue.length === 0) pendingQueue.delete(sessionId);
+  if (queue.length === 0) pendingQueue.delete(key);
 
-  console.log(`[remote-executor] Draining queue for ${sessionId.slice(0, 8)} → job ${next.jobId.slice(0, 8)} (${queue.length} remaining)`);
+  console.log(`[remote-executor] Draining queue for ${sessionId.slice(0, 8)} [${channel}] → job ${next.jobId.slice(0, 8)} (${queue.length} remaining)`);
 
-  runJob(sessionId, next.jobId, next.prompt, next.modelOverride).catch((err) => {
+  runJob(sessionId, next.jobId, next.prompt, next.modelOverride, next.channel).catch((err) => {
     console.error(`[remote-executor] Unexpected error for session=${sessionId} job=${next.jobId}:`, err);
   });
 }
@@ -362,30 +419,42 @@ function broadcastError(sessionId: string, jobId: string, error: string): void {
   });
 }
 
-/** Abort an active SSH execution for a session and clear any pending queue. */
+/** Abort an active SSH execution for a session and clear any pending queues (both channels). */
 export function abortRemoteJob(sessionId: string): boolean {
-  // Clear pending queue — abort means "stop everything for this session"
-  const queuedCount = pendingQueue.get(sessionId)?.length ?? 0;
+  // Clear pending queues for both channels — abort means "stop everything for this session"
+  const workQueuedCount = pendingQueue.get(sessionId)?.length ?? 0;
+  const hubKey = `${sessionId}:hub`;
+  const hubQueuedCount = pendingQueue.get(hubKey)?.length ?? 0;
+  const queuedCount = workQueuedCount + hubQueuedCount;
   pendingQueue.delete(sessionId);
+  pendingQueue.delete(hubKey);
   if (queuedCount > 0) {
     console.log(`[remote-executor] Cleared ${queuedCount} queued job(s) for ${sessionId.slice(0, 8)}`);
   }
 
-  const controller = activeExecutions.get(sessionId);
-  if (!controller) return queuedCount > 0;
-  controller.abort();
+  // Abort work channel
+  const workController = activeExecutions.get(sessionId);
+  // Abort hub channel
+  const hubController = activeExecutions.get(hubKey);
 
-  // For tmux sessions, also send C-c to interrupt the running tool
+  let aborted = queuedCount > 0;
+  if (workController) { workController.abort(); aborted = true; }
+  if (hubController) { hubController.abort(); aborted = true; }
+
+  // For tmux sessions, send C-c to both tmux sessions
   const session = sessionStore.get(sessionId);
   if (session?.machineId) {
     const machine = machineStore.get(session.machineId);
     if (machine?.persistentMode) {
       abortTmuxJob(machine, sessionId).catch((e) => {
-        console.warn(`[remote-executor] tmux abort failed: ${(e as Error).message}`);
+        console.warn(`[remote-executor] tmux abort (work) failed: ${(e as Error).message}`);
+      });
+      abortTmuxJob(machine, sessionId, '-hub').catch((e) => {
+        console.warn(`[remote-executor] tmux abort (hub) failed: ${(e as Error).message}`);
       });
     }
   }
 
-  return true;
+  return aborted;
 }
 

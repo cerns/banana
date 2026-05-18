@@ -114,7 +114,7 @@ describe('hubRouter', () => {
       expect(msg.id).toBeDefined();
       expect(msg.content).toBe('Hello world');
       expect(msg.channelId).toBe('new-channel');
-      expect(msg.status).toBe('pending');
+      expect(msg.status).toBe('complete'); // no matching sessions → immediately complete
       expect(hubStore.hubStore.getChannel('new-channel')).toBeDefined();
     });
 
@@ -247,6 +247,8 @@ describe('hubRouter', () => {
         'backend-1',
         expect.any(String),
         expect.stringContaining('Build JWT auth'),
+        undefined,
+        'hub',
       );
     });
 
@@ -316,6 +318,8 @@ describe('hubRouter', () => {
         'general-1',
         expect.any(String),
         expect.stringContaining('Stand-up time'),
+        undefined,
+        'hub',
       );
     });
   });
@@ -357,6 +361,8 @@ describe('hubRouter', () => {
         'mentioned',
         expect.any(String),
         expect.any(String),
+        undefined,
+        'hub',
       );
     });
   });
@@ -520,6 +526,8 @@ describe('hubRouter', () => {
         'role-sess',
         expect.any(String),
         expect.stringContaining('Backend Dev'),
+        undefined,
+        'hub',
       );
 
       const prompt = mockExecuteRemoteJob.mock.calls[0][2];
@@ -1434,6 +1442,37 @@ describe('hubRouter', () => {
       const text = hubRouter.extractTextFromChunks(chunks);
       expect(text).toBe('Checking...All good. [CHANNEL_REPLY]Done.[/CHANNEL_REPLY]');
       expect(text).not.toContain('Checking...Checking...');
+    });
+
+    it('should skip tool results when skipToolOutput is true', () => {
+      const chunks = [
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Here is the plan:\n' } } },
+        { type: 'stream_event', event: { type: 'content_block_start', content_block: { type: 'tool_use', name: 'Bash' } } },
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'ls -la' } } },
+        { type: 'stream_event', event: { type: 'content_block_stop' } },
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '[tool result] file1.txt\n' } } },
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Done!\n' } } },
+      ];
+      const text = hubRouter.extractTextFromChunks(chunks, { skipToolOutput: true });
+      expect(text).toBe('Here is the plan:\nDone!\n');
+    });
+
+    it('should include tool results when skipToolOutput is false', () => {
+      const chunks = [
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Response\n' } } },
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '[tool result] output\n' } } },
+      ];
+      const text = hubRouter.extractTextFromChunks(chunks);
+      expect(text).toBe('Response\n[tool result] output\n');
+    });
+
+    it('should skip thinking_delta when skipToolOutput is true', () => {
+      const chunks = [
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'thinking_delta', text: 'Let me think about this...\n' } } },
+        { type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Here is my answer.\n' } } },
+      ];
+      const text = hubRouter.extractTextFromChunks(chunks, { skipToolOutput: true });
+      expect(text).toBe('Here is my answer.\n');
     });
   });
 });

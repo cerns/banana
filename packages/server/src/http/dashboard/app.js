@@ -1731,7 +1731,7 @@ function renderHubMessages() {
     <div class="hub-msg${isSkipMsg ? ' hub-msg-skip' : ''}" style="margin-left:${indent}px" data-msg-id="${m.id}">
       <div class="hub-msg-header">
         <button class="hub-retry-btn" data-retry="${m.id}" title="Retry / continue — re-dispatch a session that previously ran on this message (e.g. after rate limit reset)">↻</button>
-        <span class="hub-msg-from">${esc(m.fromName)}</span>
+        <span class="hub-msg-from" data-session-id="${m.from}">${esc(m.fromName)}</span>
         ${skipBadge}
         <span class="hub-msg-time">${new Date(m.timestamp).toLocaleTimeString()}</span>
         <span class="hub-msg-status hub-status-${m.status}">${m.status}</span>
@@ -1755,6 +1755,73 @@ function renderHubMessages() {
       openRetryPicker(btn.dataset.retry, btn);
     });
   });
+  // Tooltip hover for agent name — shows tmux commands in a floating popup
+  container.querySelectorAll('.hub-msg-from').forEach(el => {
+    const sessionId = el.dataset.sessionId;
+    if (!sessionId) return;
+    el.addEventListener('mouseenter', () => showHubFromTooltip(el, sessionId));
+    el.addEventListener('mouseleave', (e) => {
+      const tip = _hubFromTip;
+      if (tip && e.relatedTarget && (tip.contains(e.relatedTarget) || e.relatedTarget === tip)) return;
+      hideHubFromTooltip();
+    });
+  });
+}
+
+// ── Hub "from" tooltip (floating, shared, with copy buttons) ──────────────
+let _hubFromTip = null;
+let _hubFromAnchor = null;
+
+function showHubFromTooltip(anchor, sessionId) {
+  const s = sessions[sessionId];
+  const machine = s?.machineId ? machines.find(x => x.id === s.machineId) : null;
+  if (!s || !machine?.persistentMode) return;
+
+  const sid8 = s.sessionId.slice(0, 8);
+  const isLocal = !machine.ip || machine.ip === 'localhost' || machine.ip === '127.0.0.1';
+  const sshPrefix = isLocal ? '' : `ssh ${machine.username || 'root'}@${machine.ip} -t `;
+  const workCmd = `${sshPrefix}tmux attach -t banana-${sid8}`;
+  const hubCmd = `${sshPrefix}tmux attach -t banana-${sid8}-hub`;
+
+  if (!_hubFromTip) {
+    _hubFromTip = document.createElement('div');
+    _hubFromTip.className = 'session-tooltip hub-from-tooltip';
+    _hubFromTip.addEventListener('mouseleave', (e) => {
+      if (e.relatedTarget && _hubFromAnchor && (_hubFromAnchor.contains(e.relatedTarget) || e.relatedTarget === _hubFromAnchor)) return;
+      hideHubFromTooltip();
+    });
+    document.body.appendChild(_hubFromTip);
+  }
+
+  _hubFromAnchor = anchor;
+  _hubFromTip.innerHTML = `
+    <div class="session-tooltip-label">Work tmux</div>
+    <div class="session-tooltip-cmd"><code>${esc(workCmd)}</code><button class="session-tooltip-copy" data-copy="${esc(workCmd)}">⧉</button></div>
+    <div class="session-tooltip-label">Hub tmux</div>
+    <div class="session-tooltip-cmd"><code>${esc(hubCmd)}</code><button class="session-tooltip-copy" data-copy="${esc(hubCmd)}">⧉</button></div>`;
+
+  _hubFromTip.querySelectorAll('.session-tooltip-copy').forEach(btn => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      navigator.clipboard.writeText(btn.dataset.copy);
+      btn.textContent = '✓';
+      setTimeout(() => { btn.textContent = '⧉'; }, 1000);
+    };
+  });
+
+  const rect = anchor.getBoundingClientRect();
+  _hubFromTip.style.left = rect.left + 'px';
+  _hubFromTip.style.top = (rect.bottom + 4) + 'px';
+  _hubFromTip.style.display = 'block';
+  _hubFromTip.style.pointerEvents = 'auto';
+}
+
+function hideHubFromTooltip() {
+  if (_hubFromTip) {
+    _hubFromTip.style.display = 'none';
+    _hubFromTip.style.pointerEvents = 'none';
+  }
+  _hubFromAnchor = null;
 }
 
 let _triggerPickerEl = null;

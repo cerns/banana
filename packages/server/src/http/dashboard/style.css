@@ -1121,7 +1121,8 @@ header h1 { font-size: 16px; color: var(--accent); }
   margin-bottom: 4px;
 }
 
-.hub-msg-from { color: var(--accent); font-weight: 600; }
+.hub-msg-from { color: var(--accent); font-weight: 600; cursor: pointer; text-decoration: underline dotted; text-underline-offset: 2px; }
+.hub-from-tooltip { position: fixed; z-index: 9999; }
 .hub-msg-time { color: var(--muted); }
 .hub-msg-status { font-size: 10px; margin-left: auto; }
 
