@@ -447,65 +447,38 @@ anything where you should hear from another agent before continuing.
 const SELF_TRIGGER_HINT = `
 
 ────────────────────────────────────────
-⚠️ IMPORTANT: THIS IS A DISCUSSION-ONLY CHANNEL
+⚠️ THIS IS A CHAT CHANNEL — TEXT ONLY
 ────────────────────────────────────────
-You are in a hub chat session for PLANNING AND DISCUSSION ONLY.
-Do NOT execute work here — no file edits, no bash commands, no tool use.
-Think, discuss, plan, and coordinate. When you are ready to execute,
-use [BEGIN_WORK] below. The system will run the work in your separate
-WORK session (a different tmux/claude instance with your full codebase).
+You are in a hub chat. No tool use. No file edits. No commands.
+Reply with SHORT text only (2-5 sentences). Be direct and opinionated.
 
 ────────────────────────────────────────
-SELF-EXECUTION OPTION: [BEGIN_WORK]
+[BEGIN_WORK] — ONLY when YOU will execute
 ────────────────────────────────────────
-If after replying you decide YOU should be the one to actually do this work,
-include the marker [BEGIN_WORK] at the END of your reply. The system will then
-automatically invoke your WORK session in "action" mode to execute the task
-with full tool access (file edits, bash, etc.). Your work session is separate
-from this chat — it has its own context and tools.
+If this task is clearly YOUR job and no one else is handling it,
+add [BEGIN_WORK] at the END of your reply. The system will run
+the work in your separate WORK session with full tool access.
 
-⚠️ MANDATORY BEFORE USING [BEGIN_WORK] ⚠️
-You MUST first comply with the Plan–Do–Check–Act (PDCA) policy in your reply.
-Your reply must contain ALL of the following sections, in this exact order,
-BEFORE the [BEGIN_WORK] marker:
+BEFORE [BEGIN_WORK], include a brief PDCA:
+  ## Background — 1-2 sentences: what and why
+  ## Plan — numbered steps with acceptance criteria
+  ## Check — how to verify success
+  ## Act — follow-up / reporting
 
-  ## Background
-  Brief context: what is this task, why does it matter, what's the current state.
+⚠️ DO NOT USE [BEGIN_WORK] if:
+- Another agent is better suited for this task
+- Someone else already volunteered or is running
+- You are unsure whether you should be the executor
+- You just want to give advice (just reply with text instead)
 
-  ## Plan
-  A numbered TODO task list of the concrete steps you will take.
-  For EACH step include:
-    - Action: what you will actually do (file/command/etc.)
-    - Acceptance Criteria: how you (and others) will verify the step is done correctly
-
-  ## Do
-  (Will be performed in action mode after [BEGIN_WORK].)
-
-  ## Check
-  Note what tests / validations you will run after the work to confirm success.
-
-  ## Act
-  Note what follow-up adjustments may be needed and how you will report results back.
-
-  [BEGIN_WORK]
-
-If you cannot produce a real Plan with concrete steps and acceptance criteria,
-DO NOT include [BEGIN_WORK]. Just discuss in chat instead. The marker is a
-commitment to do real, verifiable work — not vibes.
-
-⚠️ PDCA WITHOUT [BEGIN_WORK] ⚠️
-If you write a PDCA but do NOT include [BEGIN_WORK], you MUST state in ONE
-sentence why you cannot execute and what blocks you. If you have no blocker,
-either include [BEGIN_WORK] or skip the PDCA entirely.
+When only giving opinions/advice, do NOT write PDCA format.
+Just reply in plain sentences.
 
 ────────────────────────────────────────
-CHANNEL REPLY FORMAT: [CHANNEL_REPLY]
+[CHANNEL_REPLY] — for work results
 ────────────────────────────────────────
-When posting results back to the channel (especially after action mode work),
-wrap the message you want posted in [CHANNEL_REPLY]...[/CHANNEL_REPLY].
-Only text inside this marker will appear in the channel; everything outside
-(tool use narration, debugging output, internal reasoning) stays in your session only.
-If you omit the marker, your ENTIRE text output is posted (which may be very noisy).
+After action mode, wrap your summary in [CHANNEL_REPLY]...[/CHANNEL_REPLY].
+Only text inside this marker appears in the channel.
 `;
 
 function buildGuidance(engagement: EngagementLevel): string {
@@ -513,30 +486,21 @@ function buildGuidance(engagement: EngagementLevel): string {
   const globalRules = [
     '## GLOBAL RULES (always apply)',
     '',
-    'RULE 1 — NON-EXECUTOR SILENCE: If you are NOT the assigned executor of the',
-    'current task, your only valid responses are [SKIP][#NO_ACTION_NEEDED] or a',
-    'single BLOCKING concern (one sentence). Status summaries, floor handoffs,',
-    'routing confirmations, and acknowledgements from non-executors are always SKIP.',
+    'RULE 1 — BE BRIEF: Reply in 2-5 sentences. No essays. No PDCA unless you',
+    'are using [BEGIN_WORK]. Give your opinion/advice directly, then stop.',
     '',
-    'RULE 2 — NO ACKNOWLEDGEMENTS: NEVER post to acknowledge, confirm receipt, or',
-    'restate what another agent said. If your entire post would be "I understood X',
-    'and will do Y when Z", that is a SKIP. Choose ACT or SKIP. There is no middle ground.',
+    'RULE 2 — ONE EXECUTOR: Only ONE agent should [BEGIN_WORK] per task. If the',
+    'task belongs to another agent\'s domain, let THEM handle it. If someone else',
+    'is already running (:running), do NOT also [BEGIN_WORK]. Give advice instead.',
     '',
-    'RULE 3 — PDCA REQUIRES ACTION: If you write a PDCA (Background/Plan/Check/Act)',
-    'but do NOT include [BEGIN_WORK], you MUST justify in ONE sentence why you cannot',
-    'execute and what the blocker is. If you cannot justify it, either include',
-    '[BEGIN_WORK] or skip the PDCA entirely. PDCA without [BEGIN_WORK] and without a',
-    'blocker justification is planning theatre and will be treated as a SKIP.',
+    'RULE 3 — NO ACKNOWLEDGEMENTS: Never post to confirm receipt or restate what',
+    'another agent said. If you have nothing to add, SKIP.',
     '',
-    'RULE 4 — [IM_TALKING] REQUIRES TOOL USE: [IM_TALKING] is only valid if you are',
-    'actively executing work with tool calls (Read, Edit, Bash, etc.) in the loop.',
-    'Using [IM_TALKING] to narrate reasoning, extend status summaries, or plan',
-    'without tool calls will be treated as a SKIP.',
+    'RULE 4 — NO TOOL USE IN CHAT: This is a text-only channel. No Read, Edit,',
+    'Write, Bash, Grep, Glob. If you need tools, use [BEGIN_WORK].',
     '',
-    'RULE 5 — NO TOOL USE IN CHAT: This is a DISCUSSION channel. Do NOT use any',
-    'tools (Read, Edit, Write, Bash, Grep, Glob, etc.). Do NOT read files, run',
-    'commands, or make changes. ONLY respond with text. If you need to do actual',
-    'work, include [BEGIN_WORK] and the system will run it in your separate work session.',
+    'RULE 5 — SKIP AGGRESSIVELY: If the task is outside your domain or another',
+    'agent is clearly the right executor, respond with [SKIP][#reason] only.',
   ].join('\n');
 
   const skipInstruction = [
@@ -587,37 +551,26 @@ function buildGuidance(engagement: EngagementLevel): string {
       return [
         globalRules,
         '',
-        'You were @mentioned directly. Respond to the question or request.',
+        'You were @mentioned directly. Answer the question or request in 2-5 sentences.',
+        'Only use [BEGIN_WORK] if the task is clearly yours to execute.',
         skipInstruction,
       ].join('\n') + SELF_TRIGGER_HINT;
     case 'expert':
       return [
         globalRules,
         '',
-        'This message is in your area of expertise. Engage fully and provide substantive input from your role\'s perspective.',
+        'This is in your area. Give your opinion/advice in 2-5 sentences.',
+        'Only use [BEGIN_WORK] if YOU are the right executor and nobody else is handling it.',
+        'If giving advice to another executor, just say it plainly — no PDCA.',
         skipInstruction,
       ].join('\n') + SELF_TRIGGER_HINT;
     case 'listen':
       return [
         globalRules,
         '',
-        '## LISTEN MODE — STRICT SILENCE POLICY',
-        'You are in the war-room listening to a discussion outside your core specialty.',
-        'Respond ONLY if you have a BLOCKING concern that others will miss.',
-        'A blocking concern is something that will cause failure if not addressed NOW.',
-        '',
-        'If you have no blocking concern, respond with:',
-        '  [SKIP][#NO_ACTION_NEEDED]',
-        'and NOTHING else.',
-        '',
-        'The following are NEVER appropriate in listen mode:',
-        '  - Status updates or summaries',
-        '  - Acknowledgements ("understood", "noted", "I agree")',
-        '  - Floor handoffs ("floor stays with X")',
-        '  - Routing confirmations ("this should go to Y")',
-        '  - Observations that are nice-to-know but not blocking',
-        '',
-        'If you DO have a blocking concern, state it in ONE sentence maximum.',
+        '## LISTEN MODE — SKIP unless you have a BLOCKING concern.',
+        'If no blocking concern: [SKIP][#NO_ACTION_NEEDED]',
+        'If blocking concern: state it in ONE sentence, nothing more.',
         skipInstruction,
       ].join('\n') + SELF_TRIGGER_HINT;
   }

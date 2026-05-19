@@ -272,8 +272,8 @@ describe('hubRouter', () => {
       const calls = mockExecuteRemoteJob.mock.calls;
       const qaCall = calls.find((c: any) => c[0] === 'qa-1');
       expect(qaCall).toBeDefined();
-      // Off-area sessions get the "war-room listening" guidance
-      expect(qaCall![2]).toContain('war-room');
+      // Off-area sessions get the listen-mode guidance
+      expect(qaCall![2]).toContain('LISTEN MODE');
     });
 
     it('should give expert-level guidance to sessions with matching interests', () => {
@@ -295,7 +295,7 @@ describe('hubRouter', () => {
       const calls = mockExecuteRemoteJob.mock.calls;
       const expertCall = calls.find((c: any) => c[0] === 'expert-1');
       expect(expertCall).toBeDefined();
-      expect(expertCall![2]).toContain('area of expertise');
+      expect(expertCall![2]).toContain('in your area');
     });
 
     it('should dispatch to subscribed sessions when no tags provided', () => {
