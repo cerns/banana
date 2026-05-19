@@ -717,17 +717,20 @@ export async function streamTmuxOutput(
     // Update baseline for next poll
     prevLines = curLines;
 
-    if (newContentThisPoll) {
+    // Check for spinner (agent is still working — thinking, running tools, etc.)
+    const bottomLines = curLines.filter(l => l).slice(-10);
+    const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+/.test(l));
+
+    if (newContentThisPoll || hasSpinner) {
+      // Reset idle timer when there's new content OR an active spinner.
+      // Spinner means agent is thinking/working even if no new text passes the filter.
       lastChangeAt = Date.now();
     }
 
     // Check for prompt (response complete)
     // Scan last ~10 non-empty lines: the ❯ prompt can be several lines from
     // the bottom (above horizontal rule, status bar, auto-update message)
-    const bottomLines = curLines.filter(l => l).slice(-10);
     const hasPrompt = bottomLines.some(isPromptLine);
-    // Also verify no spinner is active (Claude is still working)
-    const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+/.test(l));
     if (hasContent && hasPrompt && !hasSpinner) {
       console.log('[tmux-runner] Prompt detected — response complete');
       parser.flush();
