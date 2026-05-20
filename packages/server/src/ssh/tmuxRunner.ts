@@ -184,6 +184,13 @@ export class TmuxOutputParser {
       this.processLine(this.buffer);
       this.buffer = '';
     }
+    // Close any open tool block so extractTextFromChunks resets insideTool
+    if (this.state === 'tool_use' || this.state === 'tool_result') {
+      this.onChunk({
+        type: 'stream_event',
+        event: { type: 'content_block_stop' },
+      });
+    }
   }
 
   /** Whether we've seen response content (not just the initial prompt). */
@@ -242,6 +249,13 @@ export class TmuxOutputParser {
     if (/^[⏺●]\s+\w+/.test(trimmed)) {
       const match = trimmed.match(/^[⏺●]\s+(\w+)/);
       if (match && KNOWN_TOOL_NAMES.has(match[1])) {
+        // Close previous tool block if transitioning tool→tool
+        if (this.state === 'tool_use' || this.state === 'tool_result') {
+          this.onChunk({
+            type: 'stream_event',
+            event: { type: 'content_block_stop' },
+          });
+        }
         this.state = 'tool_use';
         this.responseLines.push(trimmed);
         this.onChunk({
@@ -272,6 +286,15 @@ export class TmuxOutputParser {
 
     // ── Regular text output ────────────────────────────────────────────
     if (trimmed || this.state === 'text') {
+      // Emit content_block_stop when transitioning from tool_use/tool_result → text.
+      // Without this, extractTextFromChunks keeps insideTool=true forever and
+      // silently drops all subsequent text (including [BEGIN_WORK] markers).
+      if (this.state === 'tool_use' || this.state === 'tool_result') {
+        this.onChunk({
+          type: 'stream_event',
+          event: { type: 'content_block_stop' },
+        });
+      }
       this.state = 'text';
       this.responseLines.push(line);
       const deltaType = this._thinking ? 'thinking_delta' : 'text_delta';

@@ -199,12 +199,16 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
     if (machine.persistentMode) {
       console.log(`[remote-executor] Session ${sid8} job ${jid8} [tmux/${channel}] — prompt ${prompt.length} chars`);
 
-      // Hub channel: /clear before each dispatch to avoid token accumulation
-      if (channel === 'hub') {
+      // Clear tmux before hub-originated dispatches to avoid context pollution.
+      // - Hub channel: always clear (chat responses should be stateless)
+      // - Work channel: clear when prompt contains hub metadata (triggered from hub),
+      //   but NOT for direct API sends (user wants context continuity)
+      const isHubOriginated = channel === 'hub' || prompt.includes('[REPLY_TO_CHANNEL]');
+      if (isHubOriginated) {
         try {
           await clearTmuxSession(machine, sessionId, controller.signal, tmuxSuffix(channel));
         } catch (e) {
-          console.warn(`[remote-executor] /clear failed for ${sid8} hub, continuing:`, e);
+          console.warn(`[remote-executor] /clear failed for ${sid8} ${channel}, continuing:`, e);
         }
       }
 

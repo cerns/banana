@@ -948,6 +948,65 @@ describe('hubRouter', () => {
     });
   });
 
+  describe('extractTextFromChunks with tool blocks', () => {
+    it('should extract text AFTER tool use blocks (content_block_stop resets insideTool)', () => {
+      const chunks = [
+        // Text before tool
+        {
+          type: 'stream_event',
+          event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'Before tool\n' } },
+        },
+        // Tool use start
+        {
+          type: 'stream_event',
+          event: { type: 'content_block_start', content_block: { type: 'tool_use', name: 'Read' } },
+        },
+        // Tool result (skipped with skipToolOutput)
+        {
+          type: 'stream_event',
+          event: { type: 'content_block_delta', delta: { type: 'text_delta', text: '[tool result] file contents\n' } },
+        },
+        // Tool use end
+        {
+          type: 'stream_event',
+          event: { type: 'content_block_stop' },
+        },
+        // Text AFTER tool — this must NOT be dropped
+        {
+          type: 'stream_event',
+          event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'After tool [BEGIN_WORK]\n' } },
+        },
+      ];
+
+      const text = hubRouter.extractTextFromChunks(chunks, { skipToolOutput: true });
+      expect(text).toContain('Before tool');
+      expect(text).toContain('[BEGIN_WORK]');
+      expect(text).not.toContain('[tool result]');
+    });
+
+    it('should drop text after tool_use if no content_block_stop is emitted (old parser bug)', () => {
+      // This test documents the OLD behavior that was broken.
+      // With the fix, content_block_stop IS emitted, so this scenario
+      // should not happen in practice. But if chunks somehow lack it,
+      // the text after the tool would still be dropped.
+      const chunks = [
+        {
+          type: 'stream_event',
+          event: { type: 'content_block_start', content_block: { type: 'tool_use', name: 'Bash' } },
+        },
+        // No content_block_stop — insideTool stays true
+        {
+          type: 'stream_event',
+          event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'This gets dropped\n' } },
+        },
+      ];
+
+      const text = hubRouter.extractTextFromChunks(chunks, { skipToolOutput: true });
+      // Without content_block_stop, text inside the tool block is skipped
+      expect(text).toBe('');
+    });
+  });
+
   describe('self-trigger marker', () => {
     function dispatchAndReply(replyText: string) {
       createSession({
