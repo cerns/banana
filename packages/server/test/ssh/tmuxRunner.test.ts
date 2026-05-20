@@ -624,6 +624,114 @@ describe('tmuxRunner', () => {
       expect(sendKeys).toHaveBeenCalledTimes(1);
     });
 
+    // ── Standalone (y/n) for wrapped permission prompts ────────────
+
+    it('should auto-approve standalone (y/n) on its own line', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('(y/n)\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('y Enter');
+      expect(chunks[0].text).toContain('standalone-yn');
+    });
+
+    it('should auto-approve standalone y/n without parens', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('y/n\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('y Enter');
+      expect(chunks[0].text).toContain('standalone-yn');
+    });
+
+    it('should auto-approve standalone (yes/no/always)', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('(yes/no/always)\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('y Enter');
+      expect(chunks[0].text).toContain('standalone-yn');
+    });
+
+    // ── "Do you...?" pattern ──────────────────────────────────────────
+
+    it('should auto-approve "Do you want to allow...? (y/n)" prompt', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('Do you want to allow this tool to run? (y/n)\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('y Enter');
+      // allow-yn matches first (contains "Allow...?(y/n)"), confirm-yn/do-you-yn are fallbacks
+      expect(chunks[0].text).toContain('allow-yn');
+    });
+
+    it('should auto-approve "Do you really want to...? (y/n)" prompt', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      // "Do you really..." doesn't match confirm-yn (needs "Do you want/wish to"),
+      // but matches do-you-yn
+      parser.feed('Do you really need to run this? (y/n)\n');
+
+      expect(sendKeys).toHaveBeenCalledWith('y Enter');
+      expect(chunks[0].text).toContain('do-you-yn');
+    });
+
+    it('should NOT auto-approve "Do you...?" without (y/n)', () => {
+      const chunks: any[] = [];
+      const sendKeys = vi.fn();
+      const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c), sendKeys, true);
+
+      parser.feed('Do you think this is a good approach?\n');
+
+      // No (y/n) suffix — should NOT be auto-approved
+      expect(sendKeys).not.toHaveBeenCalled();
+    });
+
+    // ── matchesPermissionPattern (exported) ──────────────────────────
+
+    it('matchesPermissionPattern should match all permission prompt variants', () => {
+      // allow-always
+      expect(tmuxRunner.matchesPermissionPattern('Allow tool to run? (y/n/a)')).toBe(true);
+      // allow-yn
+      expect(tmuxRunner.matchesPermissionPattern('Allow Bash? (y/n)')).toBe(true);
+      expect(tmuxRunner.matchesPermissionPattern('Allow Read: /etc/hosts? (y/n)')).toBe(true);
+      // Complex wrapped command — won't match on its own (needs join)
+      expect(tmuxRunner.matchesPermissionPattern('Allow Bash: cd /very/long/path && complex-command')).toBe(false);
+      // confirm-yn
+      expect(tmuxRunner.matchesPermissionPattern('Do you want to proceed? (y/n)')).toBe(true);
+      expect(tmuxRunner.matchesPermissionPattern('Continue? (y/n)')).toBe(true);
+      // accept-edits
+      expect(tmuxRunner.matchesPermissionPattern('⏵⏵ accept edits on (shift+tab to cycle)')).toBe(true);
+      // menu items
+      expect(tmuxRunner.matchesPermissionPattern('❯ 1. Yes')).toBe(true);
+      expect(tmuxRunner.matchesPermissionPattern('❯ 2. No')).toBe(true);
+      expect(tmuxRunner.matchesPermissionPattern('❯ Allow once')).toBe(true);
+      expect(tmuxRunner.matchesPermissionPattern('❯ Deny')).toBe(true);
+      // standalone y/n
+      expect(tmuxRunner.matchesPermissionPattern('(y/n)')).toBe(true);
+      expect(tmuxRunner.matchesPermissionPattern('y/n')).toBe(true);
+      // do-you-yn
+      expect(tmuxRunner.matchesPermissionPattern('Do you want to allow this? (y/n)')).toBe(true);
+    });
+
+    it('matchesPermissionPattern should NOT match normal content', () => {
+      expect(tmuxRunner.matchesPermissionPattern('The file contains y/n options')).toBe(false);
+      expect(tmuxRunner.matchesPermissionPattern('1. Yes, this is correct')).toBe(false);
+      expect(tmuxRunner.matchesPermissionPattern('Allow me to explain')).toBe(false);
+      expect(tmuxRunner.matchesPermissionPattern('Some normal response text')).toBe(false);
+      expect(tmuxRunner.matchesPermissionPattern('Do you think this is good?')).toBe(false);
+    });
+
     it('should not emit prompt ">" after content (completion signal)', () => {
       const chunks: any[] = [];
       const parser = new tmuxRunner.TmuxOutputParser((c: any) => chunks.push(c));

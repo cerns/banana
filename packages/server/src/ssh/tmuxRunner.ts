@@ -100,10 +100,24 @@ const PERMISSION_PATTERNS: PermissionPattern[] = [
     test: (line) => /^[❯>►]\s+(?:Deny|No)\b/i.test(line),
     keys: 'Up Enter',
   },
+  // Standalone (y/n) — for wrapped permission prompts where "Allow Bash: <long command>"
+  // is on one line and "(y/n)" or "y/n" ends up on a separate line after wrapping.
+  {
+    label: 'standalone-yn',
+    test: (line) => /^\(?\s*y(?:es)?\/n(?:o)?(?:\/a(?:lways)?)?\s*\)?\s*$/.test(line),
+    keys: 'y Enter',
+  },
+  // "Do you want to allow/run/execute...?" with a (y/n) prompt — handles the common
+  // Claude TUI phrasing for complex tool permissions
+  {
+    label: 'do-you-yn',
+    test: (line) => /\bDo you\b.*\?\s*\(?\s*y(?:es)?\/n(?:o)?\s*\)?/i.test(line),
+    keys: 'y Enter',
+  },
 ];
 
 /** Check if a line matches any permission/approval pattern. */
-function matchesPermissionPattern(line: string): boolean {
+export function matchesPermissionPattern(line: string): boolean {
   return PERMISSION_PATTERNS.some(p => p.test(line));
 }
 
@@ -175,6 +189,16 @@ export class TmuxOutputParser {
   /** Whether we've seen response content (not just the initial prompt). */
   hasContent(): boolean {
     return this.responseLines.length > 0;
+  }
+
+  /** Get last auto-approve timestamp (shared with full-screen scan). */
+  getLastAutoApproveAt(): number {
+    return this.lastAutoApproveAt;
+  }
+
+  /** Set last auto-approve timestamp (shared with full-screen scan). */
+  setLastAutoApproveAt(ts: number): void {
+    this.lastAutoApproveAt = ts;
   }
 
   /** Reset for next prompt. */
@@ -829,6 +853,46 @@ export async function streamTmuxOutput(
           newContentThisPoll = true;
           hasContent = true;
           parser.feed(t + '\n');
+        }
+      }
+
+      // ── Full-screen permission scan ─────────────────────────────────
+      // The diff-based check above only sees NEW lines, so it misses:
+      //   - Wrapped permission prompts (e.g. "Allow Bash: <very long cmd>" on one line,
+      //     "(y/n)" on the next — neither alone matches allow-yn via the diff)
+      //   - Prompts that were visible in the previous poll but not yet approved
+      // Scan the bottom of the full screen with its own 3s cooldown.
+      if (config.tmuxAutoApprovePermissions) {
+        const now = Date.now();
+        if (now - parser.getLastAutoApproveAt() > 3000) {
+          // Also try joining adjacent bottom lines to catch multi-line permission prompts
+          const joinedBottom = bottomLines.join(' ');
+          let approved = false;
+          // First: check joined bottom lines (catches wrapped "Allow...?(y/n)")
+          for (const pattern of PERMISSION_PATTERNS) {
+            if (pattern.test(joinedBottom)) {
+              onChunk({ type: 'stderr', text: `[banana-tmux] Auto-approved via screen scan (${pattern.label}): ${joinedBottom.slice(0, 120)}\n` });
+              sendKeysForApprove(pattern.keys);
+              parser.setLastAutoApproveAt(now);
+              approved = true;
+              break;
+            }
+          }
+          // Second: check individual bottom lines (catches menu items like "❯ Yes")
+          if (!approved) {
+            for (const line of bottomLines) {
+              for (const pattern of PERMISSION_PATTERNS) {
+                if (pattern.test(line)) {
+                  onChunk({ type: 'stderr', text: `[banana-tmux] Auto-approved via screen scan (${pattern.label}): ${line}\n` });
+                  sendKeysForApprove(pattern.keys);
+                  parser.setLastAutoApproveAt(now);
+                  approved = true;
+                  break;
+                }
+              }
+              if (approved) break;
+            }
+          }
         }
       }
 
