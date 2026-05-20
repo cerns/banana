@@ -928,6 +928,41 @@ describe('hubRouter', () => {
       expect(r.postedContent).toContain('[SKIP][#WAITING]');
     });
 
+    it('should detect [SKIP][#REASON] embedded mid-line (tmux TUI echo)', () => {
+      const r = runWithReply('Some TUI output here [SKIP][#NOT_RELEVANT] outside my domain');
+      expect(r.dispatchStatus).toBe('skipped');
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP][#NOT_RELEVANT]');
+    });
+
+    it('should detect [SKIP][#reason-with-hyphens] and normalize to underscores', () => {
+      const r = runWithReply('[SKIP][#no-action-needed] Already done.');
+      expect(r.dispatchStatus).toBe('skipped');
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP][#NO_ACTION_NEEDED]');
+    });
+
+    it('should detect [SKIP][#REASON WITH SPACES] and normalize', () => {
+      const r = runWithReply('[SKIP][#OUT OF SCOPE] Not my area.');
+      expect(r.dispatchStatus).toBe('skipped');
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP][#OUT_OF_SCOPE]');
+    });
+
+    it('should detect bare [SKIP] without reason tag', () => {
+      const r = runWithReply('[SKIP]');
+      expect(r.dispatchStatus).toBe('skipped');
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP][#SKIP]');
+    });
+
+    it('should detect bare [SKIP] mixed with other content on same line', () => {
+      const r = runWithReply('After review: [SKIP] nothing to add');
+      expect(r.dispatchStatus).toBe('skipped');
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP][#SKIP]');
+    });
+
     it('should mark double SKIP via assistant snapshot as skipped', () => {
       const r = runWithReply([
         {

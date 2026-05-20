@@ -662,14 +662,20 @@ function parseSkipResponse(text: string): SkipResult | null {
   }
 
   // 1) Structured marker: [SKIP][#REASON] optionally followed by explanation.
-  //    Check each line — in tmux mode, thinking/preamble text may precede the
-  //    SKIP marker (captured by TUI parser before the agent's final output).
+  //    The marker can appear anywhere in a line — in tmux mode, TUI text,
+  //    thinking preamble, or prompt echoes may surround it. Also match
+  //    bare [SKIP] without a reason tag.
   for (const line of trimmed.split('\n')) {
-    const structuredMatch = line.trim().match(/^\[SKIP\]\[#([A-Z0-9_]+)\]\s*(.*)/i);
+    // [SKIP][#REASON] — reason may contain A-Z, 0-9, underscore, hyphen, space
+    const structuredMatch = line.match(/\[SKIP\]\[#([A-Za-z0-9_ -]+)\]\s*(.*)/);
     if (structuredMatch) {
-      const reason = structuredMatch[1].toUpperCase();
+      const reason = structuredMatch[1].trim().toUpperCase().replace(/[\s-]+/g, '_');
       const explanation = structuredMatch[2]?.trim() ?? '';
       return { skipped: true, reason, displayText: explanation };
+    }
+    // Bare [SKIP] without reason tag
+    if (/\[SKIP\]/.test(line) && !/\[SKIP\]\[#/.test(line)) {
+      return { skipped: true, reason: 'SKIP', displayText: '' };
     }
   }
 
