@@ -1455,9 +1455,13 @@ describe('tmuxRunner', () => {
       expect(tmuxRunner.isResponseLine('∴ Thinking…')).toBe(false);
     });
 
-    it('should reject horizontal rules', () => {
-      expect(tmuxRunner.isResponseLine('─────────────────────')).toBe(false);
-      expect(tmuxRunner.isResponseLine('━━━━━━━━━━━━━━━━━━━━━')).toBe(false);
+    it('should reject full-width TUI horizontal rules but allow table borders', () => {
+      // Full-width TUI separators (120+ chars) → rejected
+      expect(tmuxRunner.isResponseLine('─'.repeat(200))).toBe(false);
+      expect(tmuxRunner.isResponseLine('━'.repeat(150))).toBe(false);
+      // Short table borders → allowed as content
+      expect(tmuxRunner.isResponseLine('─'.repeat(40))).toBe(true);
+      expect(tmuxRunner.isResponseLine('━'.repeat(80))).toBe(true);
     });
 
     it('should reject Claude logo lines', () => {

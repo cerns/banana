@@ -610,8 +610,9 @@ export async function sendPromptViaTmux(
 export function isResponseLine(line: string): boolean {
   const t = line.trim();
   if (!t) return false;
-  // Horizontal rules
-  if (/^[─━═]{5,}$/.test(t)) return false;
+  // Horizontal rules — TUI separators span the full terminal width (200 cols).
+  // Table borders are typically much shorter, so only filter very long runs.
+  if (/^[─━═]{120,}$/.test(t)) return false;
   // Claude logo
   if (/^[▐▛▝▘]/.test(t)) return false;
   // Status bar / footer
@@ -833,14 +834,22 @@ export async function streamTmuxOutput(
       }
 
       // Check for prompt (response complete)
-      // Scan last ~10 non-empty lines: the ❯ prompt can be several lines from
-      // the bottom (above horizontal rule, status bar, auto-update message)
-      // IMPORTANT: Don't trigger if we just received new content this poll — the
-      // ❯ prompt is part of the TUI layout and visible at the bottom even while
-      // Claude is between tool executions (brief gap with no spinner). Requiring
-      // a stable screen (no new content) prevents premature completion.
+      // The TUI shows a distinctive input box when ready:
+      //   ────────────────────
+      //   ❯ Try "how do I..."
+      //   ? for shortcuts · esc to interrupt
+      //   23385 tokens
+      // Require the prompt to appear WITH a TUI footer line ("? for shortcuts",
+      // "esc to interrupt/cancel", or token count). This is unique to the TUI
+      // "ready" state and won't match tables or other content. Also require
+      // no new content this poll (screen must be stable).
       const hasPrompt = bottomLines.some(isPromptLine);
-      if (hasContent && hasPrompt && !hasSpinner && !newContentThisPoll) {
+      const hasTuiFooter = bottomLines.some(l =>
+        /^\? for shortcuts/.test(l) ||
+        /^esc to (?:interrupt|cancel)/i.test(l) ||
+        /^\d+ tokens?\s*$/.test(l)
+      );
+      if (hasContent && hasPrompt && hasTuiFooter && !hasSpinner && !newContentThisPoll) {
         console.log('[tmux-runner] Prompt detected — response complete');
         parser.flush();
         return { completed: true };
