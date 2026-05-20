@@ -969,6 +969,39 @@ describe('tmuxRunner', () => {
         expect(cmd).toMatch(/^\/bin\/bash -ic /);
       }
     });
+
+    it('should reuse a single SSH connection for setup (cache miss)', async () => {
+      const machine = makeMachine();
+      const cleanupFns: any[] = [];
+
+      mockConnectWithRetry.mockImplementation(async () => {
+        const client = createMockClient();
+        client.exec.mockImplementation((cmd: string, cb: Function) => {
+          const stream = createMockStream();
+          cb(null, stream);
+          if (cmd.includes('capture-pane')) {
+            process.nextTick(() => {
+              stream.emit('data', Buffer.from('>\n'));
+              stream.emit('close', 0);
+            });
+          } else {
+            process.nextTick(() => stream.emit('close', 0));
+          }
+        });
+        const cleanup = vi.fn();
+        cleanupFns.push(cleanup);
+        return { client, cleanup };
+      });
+
+      await tmuxRunner.ensureTmuxSession(machine, 'conn-reuse-id', '/work');
+
+      // Cache miss setup should use exactly 1 SSH connection
+      // (all commands: tmux check, kill stale, rm log, new-session, pipe-pane, send-keys, capture-pane, truncate)
+      expect(mockConnectWithRetry).toHaveBeenCalledTimes(1);
+      // Connection cleanup should have been called exactly once
+      expect(cleanupFns).toHaveLength(1);
+      expect(cleanupFns[0]).toHaveBeenCalledTimes(1);
+    });
   });
 
   // ── sendPromptViaTmux ──────────────────────────────────────────────────────
@@ -1007,6 +1040,45 @@ describe('tmuxRunner', () => {
 
       const enterCmd = executedCmds.find(c => c.includes('send-keys') && c.includes('Enter'));
       expect(enterCmd).toBeDefined();
+    });
+
+    it('should reuse a single SSH connection for all operations', async () => {
+      const machine = makeMachine();
+      const executedCmds: string[] = [];
+      const cleanupFns: any[] = [];
+
+      mockConnectWithRetry.mockImplementation(async () => {
+        const client = createMockClient();
+        client.exec.mockImplementation((cmd: string, cb: Function) => {
+          executedCmds.push(cmd);
+          const stream = createMockStream();
+          cb(null, stream);
+          process.nextTick(() => stream.emit('close', 0));
+        });
+        client.sftp.mockImplementation((cb: Function) => {
+          cb(null, createMockSftp());
+        });
+        const cleanup = vi.fn();
+        cleanupFns.push(cleanup);
+        return { client, cleanup };
+      });
+
+      const session = {
+        tmuxName: 'banana-reuse-test',
+        logPath: '/tmp/banana-tmux-log-reuse-test',
+        ready: true,
+        tailConn: null,
+      };
+
+      await tmuxRunner.sendPromptViaTmux(machine, session as any, 'Hello');
+
+      // Only 1 SSH connection should have been created (reused for all operations)
+      expect(mockConnectWithRetry).toHaveBeenCalledTimes(1);
+      // Connection cleanup should have been called exactly once (in finally block)
+      expect(cleanupFns).toHaveLength(1);
+      expect(cleanupFns[0]).toHaveBeenCalledTimes(1);
+      // Should have multiple exec calls on the same connection
+      expect(executedCmds.length).toBeGreaterThanOrEqual(3); // truncate, load-buffer, send-keys, rm
     });
   });
 
@@ -1097,6 +1169,49 @@ describe('tmuxRunner', () => {
       const machine = makeMachine();
       // Should not throw
       await tmuxRunner.killTmuxSession(machine, 'nonexistent');
+    });
+
+    it('should reuse a single SSH connection for kill + rm', async () => {
+      const machine = makeMachine();
+      const executedCmds: string[] = [];
+      const cleanupFns: any[] = [];
+
+      mockConnectWithRetry.mockImplementation(async () => {
+        const client = createMockClient();
+        client.exec.mockImplementation((cmd: string, cb: Function) => {
+          executedCmds.push(cmd);
+          const stream = createMockStream();
+          cb(null, stream);
+          if (cmd.includes('capture-pane')) {
+            process.nextTick(() => {
+              stream.emit('data', Buffer.from('>\n'));
+              stream.emit('close', 0);
+            });
+          } else {
+            process.nextTick(() => stream.emit('close', 0));
+          }
+        });
+        const cleanup = vi.fn();
+        cleanupFns.push(cleanup);
+        return { client, cleanup };
+      });
+
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      await tmuxRunner.ensureTmuxSession(machine, 'kill-reuse', '/work');
+      const connsBefore = mockConnectWithRetry.mock.calls.length;
+
+      executedCmds.length = 0;
+      await tmuxRunner.killTmuxSession(machine, 'kill-reuse');
+
+      // killTmuxSession should use exactly 1 new SSH connection
+      const connsAfter = mockConnectWithRetry.mock.calls.length;
+      expect(connsAfter - connsBefore).toBe(1);
+      // Should have both kill-session and rm commands
+      const killCmd = executedCmds.find(c => c.includes('kill-session'));
+      expect(killCmd).toBeDefined();
+      const rmCmd = executedCmds.find(c => c.includes('rm -f'));
+      expect(rmCmd).toBeDefined();
+      logSpy.mockRestore();
     });
   });
 
