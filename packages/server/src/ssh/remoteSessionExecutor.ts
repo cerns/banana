@@ -422,14 +422,25 @@ function broadcastError(sessionId: string, jobId: string, error: string): void {
 /** Abort an active SSH execution for a session and clear any pending queues (both channels). */
 export function abortRemoteJob(sessionId: string): boolean {
   // Clear pending queues for both channels — abort means "stop everything for this session"
-  const workQueuedCount = pendingQueue.get(sessionId)?.length ?? 0;
+  // IMPORTANT: Fire completion callbacks for cleared jobs so hub counters (runningHubJobs)
+  // decrement properly. Without this, dispatchToSession's runningHubJobs++ is never
+  // matched by onSessionJobComplete's runningHubJobs-- and the counter grows without bound.
+  const workQueue = pendingQueue.get(sessionId) ?? [];
   const hubKey = `${sessionId}:hub`;
-  const hubQueuedCount = pendingQueue.get(hubKey)?.length ?? 0;
-  const queuedCount = workQueuedCount + hubQueuedCount;
+  const hubQueue = pendingQueue.get(hubKey) ?? [];
+  const clearedJobs = [...workQueue, ...hubQueue];
+  const queuedCount = clearedJobs.length;
   pendingQueue.delete(sessionId);
   pendingQueue.delete(hubKey);
   if (queuedCount > 0) {
     console.log(`[remote-executor] Cleared ${queuedCount} queued job(s) for ${sessionId.slice(0, 8)}`);
+    // Fire completion callbacks for each cleared job — this lets hub's
+    // onSessionJobComplete decrement runningHubJobs and mark dispatches as error/aborted.
+    for (const job of clearedJobs) {
+      sessionStore.errorJob(sessionId, job.jobId, 'Aborted (queue cleared)');
+      fireCompletionCallbacks(sessionId, job.jobId);
+      fireGlobalCallbacks(sessionId, job.jobId);
+    }
   }
 
   // Clear hub message queue (persisted on SessionRecord) and mark dispatches as aborted

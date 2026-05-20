@@ -43,6 +43,16 @@ function compressForDispatch(prompt: string, label: string): string {
 /** Count currently running hub-dispatched jobs. */
 let runningHubJobs = 0;
 
+/** Get the current running hub jobs counter (for diagnostics). */
+export function getRunningHubJobs(): number { return runningHubJobs; }
+
+/** Reset the running hub jobs counter to 0 (emergency fix for stuck counter). */
+export function resetRunningHubJobs(): void {
+  const prev = runningHubJobs;
+  runningHubJobs = 0;
+  if (prev !== 0) console.log(`[hub] Reset runningHubJobs counter: ${prev} → 0`);
+}
+
 export interface PostHubMessageOpts {
   from: string;
   fromName: string;

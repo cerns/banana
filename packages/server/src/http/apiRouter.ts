@@ -71,11 +71,25 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
   // GET /api/health
   if (method === 'GET' && pathname === '/api/health') {
     const sessions = sessionStore.getAll();
+    const { getRunningHubJobs } = await import('../hub/hubRouter.js');
+    const { getActiveSessionIds } = await import('../ssh/remoteSessionExecutor.js');
     json(res, 200, {
       status: 'ok',
       totalSessions: sessions.length,
+      runningHubJobs: getRunningHubJobs(),
+      activeExecutions: getActiveSessionIds().length,
+      hubMaxConcurrentJobs: config.hubMaxConcurrentJobs,
       uptime: process.uptime(),
     });
+    return true;
+  }
+
+  // POST /api/hub/reset-counter — emergency reset for stuck runningHubJobs counter
+  if (method === 'POST' && pathname === '/api/hub/reset-counter') {
+    const { resetRunningHubJobs, drainGlobalQueue } = await import('../hub/hubRouter.js');
+    resetRunningHubJobs();
+    drainGlobalQueue();
+    json(res, 200, { ok: true });
     return true;
   }
 
