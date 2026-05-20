@@ -791,8 +791,10 @@ export async function streamTmuxOutput(
       }
 
       // Check for spinner (agent is still working — thinking, running tools, etc.)
+      // Require … (ellipsis) after the word to avoid false positives from status lines
+      // like "· Claude Max" or "· Organization Policy" on enterprise instances.
       const bottomLines = curLines.filter(l => l).slice(-10);
-      const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+/.test(l));
+      const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+…/.test(l));
 
       // Detect thinking mode (hub channel only): if a spinner is active at the BOTTOM
       // of the screen, text is thinking output. Only check bottom lines — a spinner
@@ -854,6 +856,12 @@ export async function streamTmuxOutput(
         onChunk({ type: 'stderr', text: `[banana-tmux] Idle timeout — response complete\n` });
         parser.flush();
         return { completed: true };
+      }
+
+      // Debug: log screen state periodically when stuck (every 30s after content detected)
+      const stuckMs = Date.now() - lastChangeAt;
+      if (hasContent && stuckMs > 10_000 && stuckMs % 10_000 < pollIntervalMs * 2) {
+        console.warn(`[tmux-runner] Stuck for ${(stuckMs / 1000).toFixed(0)}s — bottom: ${bottomLines.slice(-5).join(' | ')} — hasPrompt=${hasPrompt} hasSpinner=${hasSpinner}`);
       }
     }
   } finally {
