@@ -670,6 +670,8 @@ export function isResponseLine(line: string): boolean {
   if (/^(?:tmux:|focus-events\s)/i.test(t)) return false;
   // Status/effort indicators (e.g. "· /effort high")
   if (/^[·•]\s*\/effort\b/.test(t)) return false;
+  // Paste notification from TUI (appears when prompt is pasted via tmux paste-buffer)
+  if (/^\[Pasted text\b/.test(t)) return false;
   return true;
 }
 

@@ -1638,5 +1638,11 @@ describe('tmuxRunner', () => {
       expect(tmuxRunner.isResponseLine('')).toBe(false);
       expect(tmuxRunner.isResponseLine('   ')).toBe(false);
     });
+
+    it('should reject paste notification from TUI', () => {
+      expect(tmuxRunner.isResponseLine('[Pasted text #1 +3 lines]')).toBe(false);
+      expect(tmuxRunner.isResponseLine('[Pasted text #2 +15 lines]')).toBe(false);
+      expect(tmuxRunner.isResponseLine('[Pasted text #1]')).toBe(false);
+    });
   });
 });
