@@ -745,9 +745,11 @@ export async function streamTmuxOutput(
   // Capture the initial screen as our baseline — everything here is "old".
   // We store the full line array (with positions) so we can diff properly.
   let prevLines: string[] = [];
+  let prevScreen = '';
   try {
     const initial = await capturePane();
-    prevLines = stripAnsi(initial).split('\n').map(l => l.trim());
+    prevScreen = stripAnsi(initial);
+    prevLines = prevScreen.split('\n').map(l => l.trim());
   } catch { /* start from empty */ }
 
   // Build a multiset (line → count) from a line array for diff comparison.
@@ -774,6 +776,12 @@ export async function streamTmuxOutput(
         console.warn(`[tmux-runner] capture-pane failed: ${(e as Error).message}`);
         continue;
       }
+
+      // Track raw screen changes — the multiset diff skips blank lines, so
+      // whitespace-only changes (e.g. blank lines after "A few observations:")
+      // are invisible to the content diff. Raw comparison catches those.
+      const screenChanged = screen !== prevScreen;
+      prevScreen = screen;
 
       const curLines = screen.split('\n').map(l => l.trim());
 
@@ -827,9 +835,9 @@ export async function streamTmuxOutput(
       // Update baseline for next poll
       prevLines = curLines;
 
-      if (newContentThisPoll || hasSpinner) {
-        // Reset idle timer when there's new content OR an active spinner.
-        // Spinner means agent is thinking/working even if no new text passes the filter.
+      if (newContentThisPoll || hasSpinner || screenChanged) {
+        // Reset idle timer when there's new content, an active spinner, or any screen change.
+        // screenChanged catches whitespace-only changes invisible to the multiset diff.
         lastChangeAt = Date.now();
       }
 
@@ -849,7 +857,7 @@ export async function streamTmuxOutput(
         /^esc to (?:interrupt|cancel)/i.test(l) ||
         /^\d+ tokens?\s*$/.test(l)
       );
-      if (hasContent && hasPrompt && hasTuiFooter && !hasSpinner && !newContentThisPoll) {
+      if (hasContent && hasPrompt && hasTuiFooter && !hasSpinner && !newContentThisPoll && !screenChanged) {
         console.log('[tmux-runner] Prompt detected — response complete');
         parser.flush();
         return { completed: true };
@@ -874,7 +882,7 @@ export async function streamTmuxOutput(
       // Debug: log screen state periodically when stuck (every 30s after content detected)
       const stuckMs = Date.now() - lastChangeAt;
       if (hasContent && stuckMs > 10_000 && stuckMs % 10_000 < pollIntervalMs * 2) {
-        console.warn(`[tmux-runner] Stuck for ${(stuckMs / 1000).toFixed(0)}s — bottom: ${bottomLines.slice(-5).join(' | ')} — hasPrompt=${hasPrompt} hasSpinner=${hasSpinner}`);
+        console.warn(`[tmux-runner] Stuck for ${(stuckMs / 1000).toFixed(0)}s — bottom: ${bottomLines.slice(-5).join(' | ')} — hasPrompt=${hasPrompt} hasSpinner=${hasSpinner} screenChanged=${screenChanged}`);
       }
     }
   } finally {
