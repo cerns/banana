@@ -1639,10 +1639,13 @@ describe('tmuxRunner', () => {
       expect(tmuxRunner.isResponseLine('   ')).toBe(false);
     });
 
-    it('should reject paste notification from TUI', () => {
+    it('should reject paste notification from TUI (with or without prompt prefix)', () => {
       expect(tmuxRunner.isResponseLine('[Pasted text #1 +3 lines]')).toBe(false);
       expect(tmuxRunner.isResponseLine('[Pasted text #2 +15 lines]')).toBe(false);
       expect(tmuxRunner.isResponseLine('[Pasted text #1]')).toBe(false);
+      // With prompt prefix (TUI shows paste notification after cursor)
+      expect(tmuxRunner.isResponseLine('❯ [Pasted text #1 +5 lines]')).toBe(false);
+      expect(tmuxRunner.isResponseLine('> [Pasted text #3 +10 lines]')).toBe(false);
     });
   });
 });
