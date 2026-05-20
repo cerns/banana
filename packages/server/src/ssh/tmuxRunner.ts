@@ -687,11 +687,15 @@ export async function streamTmuxOutput(
       }
     }
 
-    // Detect thinking mode (hub channel only): if a thinking/spinner symbol is on screen,
-    // text is thinking output. Tags text lines as thinking_delta (ignored by extractTextFromChunks).
+    // Check for spinner (agent is still working — thinking, running tools, etc.)
+    const bottomLines = curLines.filter(l => l).slice(-10);
+    const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+/.test(l));
+
+    // Detect thinking mode (hub channel only): if a spinner is active at the BOTTOM
+    // of the screen, text is thinking output. Only check bottom lines — a spinner
+    // scrolled up from a previous thinking phase must NOT keep thinking mode on.
     if (filterThinking) {
-      const screenHasThinking = curLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+/.test(l));
-      parser.setThinking(screenHasThinking);
+      parser.setThinking(hasSpinner);
     }
 
     // Emit new response content lines (noise-filtered, prompt-echo-filtered)
@@ -716,10 +720,6 @@ export async function streamTmuxOutput(
 
     // Update baseline for next poll
     prevLines = curLines;
-
-    // Check for spinner (agent is still working — thinking, running tools, etc.)
-    const bottomLines = curLines.filter(l => l).slice(-10);
-    const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+/.test(l));
 
     if (newContentThisPoll || hasSpinner) {
       // Reset idle timer when there's new content OR an active spinner.

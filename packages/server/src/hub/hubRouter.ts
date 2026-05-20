@@ -668,7 +668,8 @@ function dispatchToSession(
   engagement: EngagementLevel,
 ): void {
   // Build prompt with role context
-  const roleLine = session.role ? `[ROLE: ${session.role}]` : '';
+  const screenName = session.screenName ?? session.name ?? session.sessionId.slice(0, 8);
+  const roleLine = session.role ? `[ROLE: ${session.role}]` : `[AGENT: ${screenName}]`;
   const rolePromptLine = session.rolePrompt ? `${session.rolePrompt}\n\n` : '';
   const channelName = hubStore.getChannel(hubMessage.channelId)?.name ?? hubMessage.channelId;
 
@@ -707,6 +708,8 @@ function dispatchToSession(
   ].filter(Boolean).join('\n');
 
   const prompt = compressForDispatch(rawPrompt, `dispatch ${session.sessionId.slice(0, 8)}`);
+
+  console.log(`[hub] dispatchToSession: ${screenName} (${session.sessionId.slice(0, 8)}) role=${session.role ?? 'none'} engagement=${engagement} promptLen=${prompt.length}`);
 
   // Create job with source tag for the jobs modal
   const jobSource = isSelfTrigger ? 'self-trigger' as const
