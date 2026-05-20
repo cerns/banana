@@ -863,6 +863,21 @@ describe('hubRouter', () => {
       expect(r.postedContent).toContain('[SKIP]');
     });
 
+    it('should detect [SKIP][#WAITING] preceded by thinking/preamble text (tmux mode)', () => {
+      const r = runWithReply('Looking at the situation...\n[SKIP][#WAITING] Blocked on deploy.');
+      expect(r.dispatchStatus).toBe('skipped');
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP][#WAITING]');
+      expect(r.postedContent).toContain('Blocked on deploy.');
+    });
+
+    it('should detect [SKIP][#WAITING] with multiple preamble lines', () => {
+      const r = runWithReply('Analyzing the request.\nChecking context.\n[SKIP][#WAITING]');
+      expect(r.dispatchStatus).toBe('skipped');
+      expect(r.replyPosted).toBe(true);
+      expect(r.postedContent).toContain('[SKIP][#WAITING]');
+    });
+
     it('should mark double SKIP via assistant snapshot as skipped', () => {
       const r = runWithReply([
         {
