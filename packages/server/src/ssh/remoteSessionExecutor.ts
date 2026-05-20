@@ -432,6 +432,12 @@ export function abortRemoteJob(sessionId: string): boolean {
     console.log(`[remote-executor] Cleared ${queuedCount} queued job(s) for ${sessionId.slice(0, 8)}`);
   }
 
+  // Clear hub message queue (persisted on SessionRecord) and mark dispatches as aborted
+  try {
+    const { clearSessionQueue } = require('../hub/hubRouter.js');
+    clearSessionQueue(sessionId);
+  } catch { /* hub module may not be loaded yet */ }
+
   // Abort work channel
   const workController = activeExecutions.get(sessionId);
   // Abort hub channel

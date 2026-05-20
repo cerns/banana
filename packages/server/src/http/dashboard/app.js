@@ -29,6 +29,7 @@ const outputDiv = document.getElementById('output');
 const promptInput = document.getElementById('prompt-input');
 const sendBtn = document.getElementById('send-btn');
 const killBtn = document.getElementById('kill-btn');
+const clearQueueBtn = document.getElementById('clear-queue-btn');
 const stopBtn = document.getElementById('stop-btn');
 
 // ── localStorage output cache ─────────────────────────────────────────────────
@@ -614,6 +615,9 @@ async function selectSession(id) {
   const s = sessions[id];
   contentTitle.textContent = buildContentTitle(s, id);
   killBtn.style.display = 'inline-block';
+  // Show Clear Queue button if session has queued hub messages
+  const hasQueue = s && Array.isArray(s.hubQueue) && s.hubQueue.length > 0;
+  clearQueueBtn.style.display = hasQueue ? 'inline-block' : 'none';
   renderSidebar();
   updateInputState();
   renderOutput();
@@ -838,8 +842,22 @@ killBtn.addEventListener('click', async () => {
   localStorage.removeItem('banana_active_session');
   contentTitle.textContent = 'Select a session';
   killBtn.style.display = 'none';
+  clearQueueBtn.style.display = 'none';
   renderSidebar();
   outputDiv.innerHTML = '<div class="empty-state"><div class="big">🍌</div><div>Select a session</div></div>';
+});
+
+clearQueueBtn.addEventListener('click', async () => {
+  if (!activeSessionId) return;
+  clearQueueBtn.disabled = true;
+  clearQueueBtn.textContent = 'Clearing…';
+  const r = await apiFetch(`/api/sessions/${activeSessionId}/clear-queue`, { method: 'POST' });
+  const data = await r.json();
+  clearQueueBtn.disabled = false;
+  clearQueueBtn.textContent = 'Clear Queue';
+  if (data.cleared > 0) {
+    clearQueueBtn.style.display = 'none';
+  }
 });
 
 // ── Utils ─────────────────────────────────────────────────────────────────────
@@ -1691,7 +1709,7 @@ function renderHubMessages() {
   container.innerHTML = msgs.map(m => {
     const indent = Math.min(m.depth, 5) * 16;
     const dispatches = m.dispatches ?? [];
-    const colors = { queued: 'var(--muted)', running: 'var(--blue)', acted: 'var(--green)', skipped: 'var(--muted)', error: 'var(--red)' };
+    const colors = { queued: 'var(--muted)', running: 'var(--blue)', acted: 'var(--green)', skipped: 'var(--muted)', error: 'var(--red)', aborted: 'var(--yellow, orange)' };
     const dispBadges = dispatches.map(d =>
       `<span class="hub-dispatch-badge" style="color:${colors[d.status] || 'var(--muted)'}" title="${esc(d.sessionId)}">${esc(labelFor(d.sessionId))}:${d.status}</span>`
     ).join(' ');
@@ -1888,7 +1906,7 @@ function openRetryPicker(messageId, anchorEl) {
   // Build candidate list: prefer sessions that previously dispatched on this message
   // (errored/timed-out first), then fall back to all remote sessions.
   const dispatches = msg.dispatches ?? [];
-  const statusOrder = { error: 0, running: 1, queued: 2, acted: 3, skipped: 4 };
+  const statusOrder = { error: 0, running: 1, queued: 2, aborted: 3, acted: 4, skipped: 5 };
   const dispatchedSessions = dispatches
     .map(d => ({ d, s: sessions[d.sessionId] }))
     .filter(x => x.s && x.s.type === 'remote' && x.s.machineId)

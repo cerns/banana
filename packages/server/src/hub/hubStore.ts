@@ -35,7 +35,7 @@ export interface ChannelCompaction {
 export interface HubDispatch {
   sessionId: string;
   jobId: string;
-  status: 'queued' | 'running' | 'skipped' | 'acted' | 'error';
+  status: 'queued' | 'running' | 'skipped' | 'acted' | 'error' | 'aborted';
   startedAt?: string;
   finishedAt?: string;
 }

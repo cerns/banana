@@ -247,7 +247,7 @@ function broadcastDispatchUpdate(messageId: string): void {
 function checkMessageComplete(messageId: string): void {
   const msg = hubStore.getMessage(messageId);
   if (!msg) return;
-  const allDone = msg.dispatches.every(d => ['acted', 'skipped', 'error'].includes(d.status));
+  const allDone = msg.dispatches.every(d => ['acted', 'skipped', 'error', 'aborted'].includes(d.status));
   if (allDone) {
     hubStore.updateStatus(messageId, 'complete');
   }
@@ -1115,6 +1115,32 @@ export function processQueue(sessionId: string): void {
     console.log(`[hub]   ${sessionId.slice(0, 8)} DRAIN → ${engagement}`);
     dispatchToSession(freshSession, msg, engagement);
   }
+}
+
+/**
+ * Clear a session's hub queue and mark all queued dispatches as 'aborted'.
+ * Called from abortRemoteJob() and the manual clear-queue API endpoint.
+ * Returns the number of queued items that were cleared.
+ */
+export function clearSessionQueue(sessionId: string): number {
+  const session = sessionStore.get(sessionId);
+  if (!session) return 0;
+  const queue = session.hubQueue ?? [];
+  if (queue.length === 0) return 0;
+
+  // Mark each queued dispatch as aborted in hubStore
+  for (const item of queue) {
+    hubStore.updateDispatch(item.hubMessageId, sessionId, {
+      status: 'aborted',
+      finishedAt: new Date().toISOString(),
+    });
+    broadcastDispatchUpdate(item.hubMessageId);
+  }
+
+  const count = queue.length;
+  sessionStore.updateMeta(sessionId, { hubQueue: [] });
+  console.log(`[hub] Cleared ${count} queued hub message(s) for ${sessionId.slice(0, 8)}`);
+  return count;
 }
 
 /**

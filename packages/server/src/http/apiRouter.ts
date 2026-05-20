@@ -439,6 +439,19 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     return true;
   }
 
+  // POST /api/sessions/:id/clear-queue — clear hub message queue without aborting active job
+  const clearQueueMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/clear-queue$/);
+  if (clearQueueMatch && method === 'POST') {
+    const prefix = clearQueueMatch[1];
+    const sessionId = resolveSessionId(prefix);
+    if (!sessionId) { json(res, 404, { error: 'Session not found' }); return true; }
+
+    const { clearSessionQueue } = await import('../hub/hubRouter.js');
+    const cleared = clearSessionQueue(sessionId);
+    json(res, 200, { ok: true, cleared });
+    return true;
+  }
+
   // POST /api/sessions/:id/send
   const sendMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/send$/);
   if (sendMatch && method === 'POST') {
