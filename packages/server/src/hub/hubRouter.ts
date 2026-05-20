@@ -156,17 +156,22 @@ export function postHubMessage(opts: PostHubMessageOpts): HubMessage {
 
     // Dispatch rules:
     //   1. @mentioned or @all + subscribed → always dispatched (any depth)
-    //   2. expert + subscribed + (depth=0 or fanOut) → dispatched
-    //   3. listen (no tag match, not mentioned) → NEVER auto-dispatched
-    //      They see messages in the dashboard; @mention them if needed.
-    //   4. depth>0 without fanOut → only @mentions (prevents chain explosions)
+    //   2. fanOut + subscribed → dispatched (work results reach everyone)
+    //   3. expert + subscribed + depth=0 → dispatched
+    //   4. listen + depth=0 → NOT dispatched (saves tokens, @mention if needed)
+    //   5. depth>0 without fanOut → only @mentions (prevents chain explosions)
     let matched = false;
     if (isMentioned) {
       matched = true;
     } else if (mentionAll && isSubscribed) {
       matched = true;
       engagement = 'mentioned';  // @all treats everyone as mentioned
-    } else if (shouldFanOut && isSubscribed && engagement === 'expert') {
+    } else if (fanOut && isSubscribed) {
+      // Work results ([BEGIN_WORK] completions) fan out to ALL subscribers
+      // regardless of interest overlap — the whole channel should see them.
+      matched = true;
+      if (engagement === 'listen') engagement = 'expert';
+    } else if (depth === 0 && isSubscribed && engagement === 'expert') {
       matched = true;
     }
 
