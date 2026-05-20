@@ -303,6 +303,40 @@ async function tmuxExec(
   });
 }
 
+/**
+ * Run a command on an existing SSH connection (no new handshake).
+ * Used by the hot polling loop in streamTmuxOutput to avoid
+ * opening a new SSH connection per capture-pane call.
+ */
+async function execOnConn(
+  conn: TunneledConnection,
+  machine: MachineRecord,
+  command: string,
+  signal?: AbortSignal,
+  timeoutMs = 10_000,
+): Promise<string> {
+  if (signal?.aborted) throw new Error('Aborted');
+  return new Promise<string>((resolve, reject) => {
+    const timer = setTimeout(() => { reject(new Error(`SSH exec timed out (${timeoutMs}ms)`)); }, timeoutMs);
+    const shell = machine.localShell || '/bin/bash';
+    conn.client.exec(`${shell} -ic ${shellEscape(PATH_PREFIX + ' && ' + command)}`, (err, stream) => {
+      if (err) { clearTimeout(timer); reject(err); return; }
+      let out = '';
+      let stderr = '';
+      stream.on('data', (d: Buffer) => { out += d.toString(); });
+      stream.stderr.on('data', (d: Buffer) => { stderr += d.toString(); });
+      stream.on('close', (code: number | null) => {
+        clearTimeout(timer);
+        if (code !== 0 && code !== null) {
+          reject(new Error(`Command exited ${code}: ${stderr.trim() || out.trim()}`));
+        } else {
+          resolve(out);
+        }
+      });
+    });
+  });
+}
+
 /** Send tmux keys via exec (local or SSH). */
 async function tmuxSendKeys(
   machine: MachineRecord,
@@ -566,6 +600,10 @@ export function isResponseLine(line: string): boolean {
   // latestVersion / auto-update lines
   if (/^latestVersion:/.test(t)) return false;
   if (/Auto-update failed/.test(t)) return false;
+  // tmux config warnings (e.g. "focus-events off. add 'set -g focus-events on'")
+  if (/^(?:tmux:|focus-events\s)/i.test(t)) return false;
+  // Status/effort indicators (e.g. "· /effort high")
+  if (/^[·•]\s*\/effort\b/.test(t)) return false;
   return true;
 }
 
@@ -602,7 +640,7 @@ export async function streamTmuxOutput(
 ): Promise<{ completed: boolean }> {
   if (signal?.aborted) throw new Error('Aborted');
 
-  const pollIntervalMs = 500;
+  const pollIntervalMs = 250;
   let hasContent = false;
   let lastChangeAt = Date.now();
 
@@ -629,16 +667,44 @@ export async function streamTmuxOutput(
 
   const parser = new TmuxOutputParser(onChunk, sendKeysForApprove);
 
+  // Open a persistent SSH connection for the polling loop (avoids re-handshake per poll).
+  // For local machines, pollConn stays null and we fall back to tmuxExec.
+  let pollConn: TunneledConnection | null = null;
+  if (!isLocalMachine(machine)) {
+    try {
+      pollConn = await connectWithRetry(machine, signal);
+    } catch (e) {
+      console.warn(`[tmux-runner] Failed to open persistent poll connection: ${(e as Error).message}`);
+      // Fall back to per-call connections (slow but functional)
+    }
+  }
+
+  /** Run capture-pane using persistent connection when available, else fallback to tmuxExec. */
+  const capturePane = async (): Promise<string> => {
+    const cmd = `tmux capture-pane -t ${shellEscape(session.tmuxName)} -p`;
+    if (pollConn) {
+      try {
+        return await execOnConn(pollConn, machine, cmd, signal, 10_000);
+      } catch (e) {
+        // Connection may have died — try reconnecting once
+        console.warn(`[tmux-runner] Poll connection lost, reconnecting: ${(e as Error).message}`);
+        try { pollConn.cleanup(); } catch { /* ignore */ }
+        try {
+          pollConn = await connectWithRetry(machine, signal);
+          return await execOnConn(pollConn, machine, cmd, signal, 10_000);
+        } catch {
+          pollConn = null; // give up on persistent, fall back to tmuxExec
+        }
+      }
+    }
+    return tmuxExec(machine, cmd, signal, 10_000);
+  };
+
   // Capture the initial screen as our baseline — everything here is "old".
   // We store the full line array (with positions) so we can diff properly.
   let prevLines: string[] = [];
   try {
-    const initial = await tmuxExec(
-      machine,
-      `tmux capture-pane -t ${shellEscape(session.tmuxName)} -p`,
-      signal,
-      10_000,
-    );
+    const initial = await capturePane();
     prevLines = stripAnsi(initial).split('\n').map(l => l.trim());
   } catch { /* start from empty */ }
 
@@ -652,105 +718,107 @@ export async function streamTmuxOutput(
     return m;
   }
 
-  while (true) {
-    if (signal?.aborted) throw new Error('Aborted');
-    await new Promise(r => setTimeout(r, pollIntervalMs));
-    if (signal?.aborted) throw new Error('Aborted');
+  try {
+    while (true) {
+      if (signal?.aborted) throw new Error('Aborted');
+      await new Promise(r => setTimeout(r, pollIntervalMs));
+      if (signal?.aborted) throw new Error('Aborted');
 
-    let screen: string;
-    try {
-      const raw = await tmuxExec(
-        machine,
-        `tmux capture-pane -t ${shellEscape(session.tmuxName)} -p`,
-        signal,
-        10_000,
-      );
-      screen = stripAnsi(raw);
-    } catch (e) {
-      console.warn(`[tmux-runner] capture-pane failed: ${(e as Error).message}`);
-      continue;
-    }
-
-    const curLines = screen.split('\n').map(l => l.trim());
-
-    // Diff: find lines in curLines that are new compared to prevLines.
-    // Uses multiset subtraction — handles duplicate lines correctly.
-    const prevSet = buildLineMultiset(prevLines);
-    const newLines: string[] = [];
-    for (const t of curLines) {
-      if (!t) continue;
-      const prevCount = prevSet.get(t) ?? 0;
-      if (prevCount > 0) {
-        prevSet.set(t, prevCount - 1); // consume one occurrence
-      } else {
-        newLines.push(t);
-      }
-    }
-
-    // Check for spinner (agent is still working — thinking, running tools, etc.)
-    const bottomLines = curLines.filter(l => l).slice(-10);
-    const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+/.test(l));
-
-    // Detect thinking mode (hub channel only): if a spinner is active at the BOTTOM
-    // of the screen, text is thinking output. Only check bottom lines — a spinner
-    // scrolled up from a previous thinking phase must NOT keep thinking mode on.
-    if (filterThinking) {
-      parser.setThinking(hasSpinner);
-    }
-
-    // Emit new response content lines (noise-filtered, prompt-echo-filtered)
-    let newContentThisPoll = false;
-    for (const t of newLines) {
-      // Skip echoed prompt text (pasted prompt appears on screen before processing)
-      if (promptLines.size > 0 && promptLines.has(t)) continue;
-
-      // Permission-matching always gets processed (auto-approve)
-      if (matchesPermissionPattern(t)) {
-        parser.feed(t + '\n');
-        newContentThisPoll = true;
-        hasContent = true;
+      let screen: string;
+      try {
+        const raw = await capturePane();
+        screen = stripAnsi(raw);
+      } catch (e) {
+        console.warn(`[tmux-runner] capture-pane failed: ${(e as Error).message}`);
         continue;
       }
-      if (isResponseLine(t)) {
-        newContentThisPoll = true;
-        hasContent = true;
-        parser.feed(t + '\n');
+
+      const curLines = screen.split('\n').map(l => l.trim());
+
+      // Diff: find lines in curLines that are new compared to prevLines.
+      // Uses multiset subtraction — handles duplicate lines correctly.
+      const prevSet = buildLineMultiset(prevLines);
+      const newLines: string[] = [];
+      for (const t of curLines) {
+        if (!t) continue;
+        const prevCount = prevSet.get(t) ?? 0;
+        if (prevCount > 0) {
+          prevSet.set(t, prevCount - 1); // consume one occurrence
+        } else {
+          newLines.push(t);
+        }
+      }
+
+      // Check for spinner (agent is still working — thinking, running tools, etc.)
+      const bottomLines = curLines.filter(l => l).slice(-10);
+      const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+/.test(l));
+
+      // Detect thinking mode (hub channel only): if a spinner is active at the BOTTOM
+      // of the screen, text is thinking output. Only check bottom lines — a spinner
+      // scrolled up from a previous thinking phase must NOT keep thinking mode on.
+      if (filterThinking) {
+        parser.setThinking(hasSpinner);
+      }
+
+      // Emit new response content lines (noise-filtered, prompt-echo-filtered)
+      let newContentThisPoll = false;
+      for (const t of newLines) {
+        // Skip echoed prompt text (pasted prompt appears on screen before processing)
+        if (promptLines.size > 0 && promptLines.has(t)) continue;
+
+        // Permission-matching always gets processed (auto-approve)
+        if (matchesPermissionPattern(t)) {
+          parser.feed(t + '\n');
+          newContentThisPoll = true;
+          hasContent = true;
+          continue;
+        }
+        if (isResponseLine(t)) {
+          newContentThisPoll = true;
+          hasContent = true;
+          parser.feed(t + '\n');
+        }
+      }
+
+      // Update baseline for next poll
+      prevLines = curLines;
+
+      if (newContentThisPoll || hasSpinner) {
+        // Reset idle timer when there's new content OR an active spinner.
+        // Spinner means agent is thinking/working even if no new text passes the filter.
+        lastChangeAt = Date.now();
+      }
+
+      // Check for prompt (response complete)
+      // Scan last ~10 non-empty lines: the ❯ prompt can be several lines from
+      // the bottom (above horizontal rule, status bar, auto-update message)
+      const hasPrompt = bottomLines.some(isPromptLine);
+      if (hasContent && hasPrompt && !hasSpinner) {
+        console.log('[tmux-runner] Prompt detected — response complete');
+        parser.flush();
+        return { completed: true };
+      }
+
+      // Check for shell prompt (claude exited)
+      if (hasContent && bottomLines.some(l => /\$\s*$/.test(l) && !/\\\$/.test(l))) {
+        console.warn('[tmux-runner] Shell prompt detected — claude may have exited');
+        parser.flush();
+        onChunk({ type: 'stderr', text: '[banana-tmux] Claude process exited\n' });
+        return { completed: true };
+      }
+
+      // Idle timeout — no new content for tmuxIdleCompletionMs → done
+      if (hasContent && Date.now() - lastChangeAt > config.tmuxIdleCompletionMs) {
+        console.log(`[tmux-runner] Idle timeout (${config.tmuxIdleCompletionMs}ms) — response complete`);
+        onChunk({ type: 'stderr', text: `[banana-tmux] Idle timeout — response complete\n` });
+        parser.flush();
+        return { completed: true };
       }
     }
-
-    // Update baseline for next poll
-    prevLines = curLines;
-
-    if (newContentThisPoll || hasSpinner) {
-      // Reset idle timer when there's new content OR an active spinner.
-      // Spinner means agent is thinking/working even if no new text passes the filter.
-      lastChangeAt = Date.now();
-    }
-
-    // Check for prompt (response complete)
-    // Scan last ~10 non-empty lines: the ❯ prompt can be several lines from
-    // the bottom (above horizontal rule, status bar, auto-update message)
-    const hasPrompt = bottomLines.some(isPromptLine);
-    if (hasContent && hasPrompt && !hasSpinner) {
-      console.log('[tmux-runner] Prompt detected — response complete');
-      parser.flush();
-      return { completed: true };
-    }
-
-    // Check for shell prompt (claude exited)
-    if (hasContent && bottomLines.some(l => /\$\s*$/.test(l) && !/\\\$/.test(l))) {
-      console.warn('[tmux-runner] Shell prompt detected — claude may have exited');
-      parser.flush();
-      onChunk({ type: 'stderr', text: '[banana-tmux] Claude process exited\n' });
-      return { completed: true };
-    }
-
-    // Idle timeout — no new content for tmuxIdleCompletionMs → done
-    if (hasContent && Date.now() - lastChangeAt > config.tmuxIdleCompletionMs) {
-      console.log(`[tmux-runner] Idle timeout (${config.tmuxIdleCompletionMs}ms) — response complete`);
-      onChunk({ type: 'stderr', text: `[banana-tmux] Idle timeout — response complete\n` });
-      parser.flush();
-      return { completed: true };
+  } finally {
+    // Clean up the persistent poll connection
+    if (pollConn) {
+      try { pollConn.cleanup(); } catch { /* ignore */ }
     }
   }
 }
