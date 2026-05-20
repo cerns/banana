@@ -835,8 +835,12 @@ export async function streamTmuxOutput(
       // Check for prompt (response complete)
       // Scan last ~10 non-empty lines: the ❯ prompt can be several lines from
       // the bottom (above horizontal rule, status bar, auto-update message)
+      // IMPORTANT: Don't trigger if we just received new content this poll — the
+      // ❯ prompt is part of the TUI layout and visible at the bottom even while
+      // Claude is between tool executions (brief gap with no spinner). Requiring
+      // a stable screen (no new content) prevents premature completion.
       const hasPrompt = bottomLines.some(isPromptLine);
-      if (hasContent && hasPrompt && !hasSpinner) {
+      if (hasContent && hasPrompt && !hasSpinner && !newContentThisPoll) {
         console.log('[tmux-runner] Prompt detected — response complete');
         parser.flush();
         return { completed: true };
