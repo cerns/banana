@@ -62,6 +62,8 @@ export interface PostHubMessageOpts {
   mentions?: string[];
   parentId?: string;
   depth?: number;
+  /** Force fan-out to all subscribers even at depth > 0 (e.g. work reports). */
+  fanOut?: boolean;
 }
 
 /**
@@ -72,6 +74,7 @@ export function postHubMessage(opts: PostHubMessageOpts): HubMessage {
   const {
     from, fromName, content, channelIds,
     tags = [], mentions = [], parentId, depth = 0,
+    fanOut = false,
   } = opts;
 
   // Ensure channels exist
@@ -107,23 +110,29 @@ export function postHubMessage(opts: PostHubMessageOpts): HubMessage {
   });
 
   // Resolve @mentions → find sessions by screenName
+  // Special: @all mentions every subscribed session (like old war-room mode).
+  const mentionAll = mentions.some(m => m.toLowerCase() === 'all');
   const mentionedSessionIds = new Set<string>();
   for (const name of mentions) {
+    if (name.toLowerCase() === 'all') continue;
     const sid = resolveScreenName(name);
     if (sid) mentionedSessionIds.add(sid);
   }
 
   // Find matching sessions.
-  //   - User-originated messages (depth=0) fan out to everyone subscribed (war-room).
-  //   - Agent replies (depth>0) do NOT fan out — only sessions explicitly
-  //     @mentioned in the reply get dispatched. This prevents chain explosions
-  //     where every agent reply re-triggers every other agent.
+  //   - User-originated messages (depth=0) and fanOut messages fan out to
+  //     subscribed sessions with expert/mentioned engagement (not listen).
+  //   - Agent replies (depth>0 without fanOut) only dispatch to @mentions.
+  //   - Listen-engagement sessions are NEVER auto-dispatched — they see
+  //     messages in the dashboard but don't burn tokens unless @mentioned.
+  //     This prevents the "complete graph" problem where every agent reads
+  //     every message and most just SKIP.
   const allSessions = sessionStore.getAll();
   const matchingSessions: Array<{ session: SessionRecord; engagement: EngagementLevel }> = [];
-  const replyFanOutSuppressed = depth > 0;
+  const shouldFanOut = depth === 0 || fanOut;
 
-  console.log(`[hub] postHubMessage → channels=${JSON.stringify(channelIds)} depth=${depth} tags=${JSON.stringify(tags)} mentions=${JSON.stringify(mentions)} from=${from}`);
-  console.log(`[hub] scanning ${allSessions.length} sessions for matches${replyFanOutSuppressed ? ' (reply — mentions only)' : ''}`);
+  console.log(`[hub] postHubMessage → channels=${JSON.stringify(channelIds)} depth=${depth} tags=${JSON.stringify(tags)} mentions=${JSON.stringify(mentions)} from=${from} fanOut=${fanOut}`);
+  console.log(`[hub] scanning ${allSessions.length} sessions for matches${shouldFanOut ? '' : ' (reply — mentions only)'}`);
 
   for (const session of allSessions) {
     const sid = session.sessionId.slice(0, 8);
@@ -141,20 +150,30 @@ export function postHubMessage(opts: PostHubMessageOpts): HubMessage {
     const isMentioned = mentionedSessionIds.has(session.sessionId);
     const hasInterestOverlap = session.interests?.some(i => tags.includes(i)) ?? false;
 
-    // Replies only dispatch to explicit @mentions to prevent chain explosions.
-    // Originals (depth=0) fan out to everyone subscribed.
-    const matched = replyFanOutSuppressed
-      ? isMentioned
-      : (isSubscribed || isMentioned);
-
     let engagement: EngagementLevel = 'listen';
     if (isMentioned) engagement = 'mentioned';
     else if (hasInterestOverlap || tags.length === 0) engagement = 'expert';
 
+    // Dispatch rules:
+    //   1. @mentioned or @all + subscribed → always dispatched (any depth)
+    //   2. expert + subscribed + (depth=0 or fanOut) → dispatched
+    //   3. listen (no tag match, not mentioned) → NEVER auto-dispatched
+    //      They see messages in the dashboard; @mention them if needed.
+    //   4. depth>0 without fanOut → only @mentions (prevents chain explosions)
+    let matched = false;
+    if (isMentioned) {
+      matched = true;
+    } else if (mentionAll && isSubscribed) {
+      matched = true;
+      engagement = 'mentioned';  // @all treats everyone as mentioned
+    } else if (shouldFanOut && isSubscribed && engagement === 'expert') {
+      matched = true;
+    }
+
     console.log(
       `[hub]   ${sid} name=${session.name ?? '-'} channels=${JSON.stringify(session.channels ?? [])} ` +
       `subscribed=${isSubscribed} mentioned=${isMentioned} interestOverlap=${hasInterestOverlap} ` +
-      `→ ${matched ? `MATCH(${engagement})` : 'no-match'}`
+      `→ ${matched ? `MATCH(${engagement})` : `no-match(${engagement})`}`
     );
 
     if (matched) {
@@ -848,6 +867,9 @@ function onSessionJobComplete(
     // agent's work results. Previously, the depth check prevented posting
     // entirely, so the agent did work but the result vanished.
     if (compactedContent.trim()) {
+      // Triggered job completions ([BEGIN_WORK] or manual trigger) fan out
+      // to expert subscribers so everyone sees the work result.
+      const isTriggeredResult = engagement === 'triggered';
       const postedReply = postHubMessage({
         from: sessionId,
         fromName: screenName,
@@ -857,6 +879,7 @@ function onSessionJobComplete(
         mentions: replyMentions,
         parentId: hubMessage.id,
         depth: hubMessage.depth + 1,
+        fanOut: isTriggeredResult,
       });
 
       // At depth limit, immediately mark the posted reply as complete to

@@ -252,7 +252,7 @@ describe('hubRouter', () => {
       );
     });
 
-    it('should still dispatch to subscribed sessions without interest overlap (war-room)', () => {
+    it('should NOT dispatch to listen-engagement sessions (no interest overlap)', () => {
       createSession({
         sessionId: 'qa-1',
         channels: ['project'],
@@ -268,12 +268,62 @@ describe('hubRouter', () => {
         tags: ['backend'],
       });
 
-      // War-room: subscribed sessions always receive, even without interest overlap
+      // Listen sessions are not auto-dispatched — saves tokens
+      const calls = mockExecuteRemoteJob.mock.calls;
+      const qaCall = calls.find((c: any) => c[0] === 'qa-1');
+      expect(qaCall).toBeUndefined();
+    });
+
+    it('should dispatch to listen-engagement sessions when @mentioned', () => {
+      createSession({
+        sessionId: 'qa-1',
+        channels: ['project'],
+        interests: ['testing'],
+        role: 'QA',
+        screenName: 'qa-bot',
+      });
+
+      hubRouter.postHubMessage({
+        from: 'user',
+        fromName: 'User',
+        content: 'Build JWT auth @qa-bot what do you think?',
+        channelIds: ['project'],
+        tags: ['backend'],
+        mentions: ['qa-bot'],
+      });
+
       const calls = mockExecuteRemoteJob.mock.calls;
       const qaCall = calls.find((c: any) => c[0] === 'qa-1');
       expect(qaCall).toBeDefined();
-      // Off-area sessions get the listen-mode guidance
-      expect(qaCall![2]).toContain('LISTEN MODE');
+    });
+
+    it('should dispatch to ALL subscribers when @all is used', () => {
+      createSession({
+        sessionId: 'qa-1',
+        channels: ['project'],
+        interests: ['testing'],
+        role: 'QA',
+      });
+      createSession({
+        sessionId: 'dev-1',
+        channels: ['project'],
+        interests: ['backend'],
+        role: 'Dev',
+      });
+
+      hubRouter.postHubMessage({
+        from: 'user',
+        fromName: 'User',
+        content: 'Everyone please review @all',
+        channelIds: ['project'],
+        tags: ['review'],
+        mentions: ['all'],
+      });
+
+      const calls = mockExecuteRemoteJob.mock.calls;
+      // Both sessions should be dispatched — @all overrides listen filter
+      expect(calls.find((c: any) => c[0] === 'qa-1')).toBeDefined();
+      expect(calls.find((c: any) => c[0] === 'dev-1')).toBeDefined();
     });
 
     it('should give expert-level guidance to sessions with matching interests', () => {
