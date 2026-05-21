@@ -24,6 +24,15 @@ import type { MachineRecord } from '../machines/machineStore.js';
 /** Track last dispatch time per session for cooldown. */
 const sessionCooldowns = new Map<string, number>();
 
+/** Pending wave2 dispatches keyed by hubMessage.id — A2 staggered dispatch. */
+interface PendingWave2 {
+  sessions: Array<{ session: SessionRecord; engagement: EngagementLevel }>;
+  completedWave1: number;
+  totalWave1: number;
+  claimed: boolean;  // true if any wave1 session did [BEGIN_WORK]
+}
+const pendingWave2 = new Map<string, PendingWave2>();
+
 /**
  * Apply heuristic compression to a prompt before sending to claude.
  * Logs the savings so operators can see token reduction in real time.
@@ -128,7 +137,7 @@ export function postHubMessage(opts: PostHubMessageOpts): HubMessage {
   //     This prevents the "complete graph" problem where every agent reads
   //     every message and most just SKIP.
   const allSessions = sessionStore.getAll();
-  const matchingSessions: Array<{ session: SessionRecord; engagement: EngagementLevel }> = [];
+  const matchingSessions: Array<{ session: SessionRecord; engagement: EngagementLevel; interestOverlap: number }> = [];
   const shouldFanOut = depth === 0 || fanOut;
 
   console.log(`[hub] postHubMessage → channels=${JSON.stringify(channelIds)} depth=${depth} tags=${JSON.stringify(tags)} mentions=${JSON.stringify(mentions)} from=${from} fanOut=${fanOut}`);
@@ -148,7 +157,8 @@ export function postHubMessage(opts: PostHubMessageOpts): HubMessage {
 
     const isSubscribed = session.channels?.some(ch => channelIds.includes(ch)) ?? false;
     const isMentioned = mentionedSessionIds.has(session.sessionId);
-    const hasInterestOverlap = session.interests?.some(i => tags.includes(i)) ?? false;
+    const interestOverlap = (session.interests ?? []).filter(i => tags.includes(i)).length;
+    const hasInterestOverlap = interestOverlap > 0;
 
     let engagement: EngagementLevel = 'listen';
     if (isMentioned) engagement = 'mentioned';
@@ -182,15 +192,48 @@ export function postHubMessage(opts: PostHubMessageOpts): HubMessage {
     );
 
     if (matched) {
-      matchingSessions.push({ session, engagement });
+      matchingSessions.push({ session, engagement, interestOverlap });
     }
   }
 
   console.log(`[hub] matched ${matchingSessions.length} sessions`);
 
-  // Dispatch to matching sessions
-  for (const entry of matchingSessions) {
-    dispatchOrQueue(entry.session, msg, entry.engagement);
+  // A2: Staggered dispatch — split into wave1 (best match) and wave2 (rest).
+  // Wave2 only fires after wave1 completes, and only if nobody did [BEGIN_WORK].
+  // Mentions always go in wave1. Non-depth-0 messages skip staggering.
+  const waveSize = config.hubWaveSize;
+  const shouldStagger = depth === 0 && !fanOut && matchingSessions.length > waveSize;
+
+  if (shouldStagger) {
+    // Sort: mentioned first, then by interest overlap (descending)
+    const sorted = [...matchingSessions].sort((a, b) => {
+      if (a.engagement === 'mentioned' && b.engagement !== 'mentioned') return -1;
+      if (b.engagement === 'mentioned' && a.engagement !== 'mentioned') return 1;
+      return b.interestOverlap - a.interestOverlap;
+    });
+
+    const wave1 = sorted.slice(0, waveSize);
+    const wave2 = sorted.slice(waveSize);
+
+    console.log(`[hub] staggered dispatch: wave1=${wave1.length} wave2=${wave2.length}`);
+
+    // Store wave2 for later dispatch
+    pendingWave2.set(msg.id, {
+      sessions: wave2,
+      completedWave1: 0,
+      totalWave1: wave1.length,
+      claimed: false,
+    });
+
+    // Dispatch wave1 immediately
+    for (const entry of wave1) {
+      dispatchOrQueue(entry.session, msg, entry.engagement);
+    }
+  } else {
+    // No staggering — dispatch all immediately
+    for (const entry of matchingSessions) {
+      dispatchOrQueue(entry.session, msg, entry.engagement);
+    }
   }
 
   // No dispatches → message is immediately complete (nobody to process it)
@@ -284,6 +327,54 @@ function checkMessageComplete(messageId: string): void {
   const allDone = msg.dispatches.every(d => ['acted', 'skipped', 'error', 'aborted'].includes(d.status));
   if (allDone) {
     hubStore.updateStatus(messageId, 'complete');
+  }
+}
+
+/**
+ * A3: Cancel other pending/queued dispatches for a message when someone
+ * claims [BEGIN_WORK]. Running dispatches can't be aborted mid-SSH, but
+ * queued ones are marked 'aborted' and removed from session hub queues.
+ * Also cancels wave2 dispatches if staggered dispatch is active.
+ */
+function cancelOtherDispatches(messageId: string, claimingSessionId: string): void {
+  const msg = hubStore.getMessage(messageId);
+  if (!msg) return;
+
+  let cancelled = 0;
+  for (const d of msg.dispatches) {
+    if (d.sessionId === claimingSessionId) continue;
+    if (d.status === 'queued' || d.status === 'running') {
+      // Mark queued dispatches as aborted
+      if (d.status === 'queued') {
+        hubStore.updateDispatch(messageId, d.sessionId, {
+          status: 'aborted',
+          finishedAt: new Date().toISOString(),
+        }, d.jobId);
+
+        // Remove from session's hub queue
+        const session = sessionStore.get(d.sessionId);
+        if (session) {
+          const queue = (session.hubQueue ?? []).filter(q => q.hubMessageId !== messageId);
+          sessionStore.updateMeta(d.sessionId, { hubQueue: queue });
+        }
+        cancelled++;
+      }
+      // Running dispatches: can't abort mid-SSH, but their results will be
+      // less impactful since the task is already claimed.
+    }
+  }
+
+  // Cancel pending wave2 for this message (if staggered dispatch is active)
+  const wave2 = pendingWave2.get(messageId);
+  if (wave2) {
+    cancelled += wave2.sessions.length;
+    pendingWave2.delete(messageId);
+    console.log(`[hub] cancelOtherDispatches: cancelled wave2 for ${messageId.slice(0, 8)}`);
+  }
+
+  if (cancelled > 0) {
+    console.log(`[hub] cancelOtherDispatches: cancelled ${cancelled} dispatch(es) for msg ${messageId.slice(0, 8)} — claimed by ${claimingSessionId.slice(0, 8)}`);
+    broadcastDispatchUpdate(messageId);
   }
 }
 
@@ -480,39 +571,11 @@ anything where you should hear from another agent before continuing.
 /** Hint added to non-triggered prompts so agents know they can self-trigger. */
 const SELF_TRIGGER_HINT = `
 
-────────────────────────────────────────
-⚠️ THIS IS A CHAT CHANNEL — TEXT ONLY
-────────────────────────────────────────
-You are in a hub chat. No tool use. No file edits. No commands.
-Reply with SHORT text only (2-5 sentences). Be direct and opinionated.
+⚠️ CHAT CHANNEL — TEXT ONLY. No tool use. Reply in 2-5 sentences.
 
-────────────────────────────────────────
-[BEGIN_WORK] — ONLY when YOU will execute
-────────────────────────────────────────
-If this task is clearly YOUR job and no one else is handling it,
-add [BEGIN_WORK] at the END of your reply. The system will run
-the work in your separate WORK session with full tool access.
-
-BEFORE [BEGIN_WORK], include a brief PDCA:
-  ## Background — 1-2 sentences: what and why
-  ## Plan — numbered steps with acceptance criteria
-  ## Check — how to verify success
-  ## Act — follow-up / reporting
-
-⚠️ DO NOT USE [BEGIN_WORK] if:
-- Another agent is better suited for this task
-- Someone else already volunteered or is running
-- You are unsure whether you should be the executor
-- You just want to give advice (just reply with text instead)
-
-When only giving opinions/advice, do NOT write PDCA format.
-Just reply in plain sentences.
-
-────────────────────────────────────────
-[CHANNEL_REPLY] — for work results
-────────────────────────────────────────
-After action mode, wrap your summary in [CHANNEL_REPLY]...[/CHANNEL_REPLY].
-Only text inside this marker appears in the channel.
+[BEGIN_WORK] — add at END of your reply ONLY when YOU will execute the task.
+Include a brief plan before the marker. Do NOT use if another agent is better
+suited or already handling it. Your work output is auto-posted to the channel.
 `;
 
 function buildGuidance(engagement: EngagementLevel): string {
@@ -537,19 +600,8 @@ function buildGuidance(engagement: EngagementLevel): string {
     'agent is clearly the right executor, respond with [SKIP][#reason] only.',
   ].join('\n');
 
-  const skipInstruction = [
-    '',
-    '## SKIP PROTOCOL',
-    'If the message is not actionable for you or you have nothing to add,',
-    'respond with ONLY a SKIP marker and nothing else:',
-    '  [SKIP][#REASON]',
-    'Valid reasons: OUT_OF_DOMAIN, NO_ACTION_NEEDED, DUPLICATE, WAITING.',
-    'You may add at most ONE sentence of explanation after the marker.',
-    'A SKIP response must contain ONLY the marker and optionally one sentence.',
-    'Do NOT wrap SKIP in paragraphs, status updates, or commentary.',
-    'Example: [SKIP][#NO_ACTION_NEEDED]',
-    'Example: [SKIP][#WAITING] Blocked on deploy completing.',
-  ].join('\n');
+  // Short SKIP instruction — banana's parseSkipResponse() handles all variations.
+  const skipInstruction = '\nIf not relevant: reply SKIP or [SKIP][#reason].';
 
   switch (engagement) {
     case 'triggered':
@@ -608,6 +660,30 @@ function buildGuidance(engagement: EngagementLevel): string {
         skipInstruction,
       ].join('\n') + SELF_TRIGGER_HINT;
   }
+}
+
+/**
+ * B1/B3: Build the system prompt for hub chat dispatches. This gets written to
+ * a temp file and passed via --append-system-prompt, so it benefits from API
+ * prompt caching (static content). The user message stays minimal (dynamic).
+ *
+ * Listen agents get a minimal prompt (B3).
+ */
+function buildSystemPrompt(session: SessionRecord, engagement: EngagementLevel): string {
+  const screenName = session.screenName ?? session.name ?? session.sessionId.slice(0, 8);
+
+  // B3: Slim listen prompt — listen agents almost always SKIP
+  if (engagement === 'listen') {
+    return `You are ${screenName}. LISTEN mode. SKIP unless blocking concern.\nReply: SKIP or [SKIP][#reason], or one sentence if blocking.`;
+  }
+
+  const parts: string[] = [];
+  parts.push(`You are ${screenName}${session.role ? `, ${session.role}` : ''}.`);
+  if (session.rolePrompt) parts.push(session.rolePrompt);
+  parts.push('');
+  parts.push(buildGuidance(engagement));
+
+  return parts.join('\n');
 }
 
 /** Detect [BEGIN_WORK] / [SELF_TRIGGER] / [ACT_NOW] markers in agent reply. */
@@ -736,20 +812,31 @@ function dispatchToSession(
       ? `[YOU WERE TRIGGERED TO ACT ON THIS MESSAGE in ${channelName} from ${hubMessage.fromName}]`
       : `[HUB ${channelName} from ${hubMessage.fromName}]`;
 
-  // Tell the agent where its reply will be posted (explicit routing metadata)
-  const replyToLine = `[REPLY_TO_CHANNEL][#${hubMessage.channelId}][%${hubMessage.id}]`;
-
-  const rawPrompt = [
-    roleLine,
-    rolePromptLine,
-    contextBlock,
-    sourceHeader,
-    hubMessage.content,
-    '',
-    replyToLine,
-    '---',
-    guidance,
-  ].filter(Boolean).join('\n');
+  // Triggered work prompts are simplified — routing is programmatic (C2/C3).
+  // No [REPLY_TO_CHANNEL] tags; banana handles reply-back automatically.
+  let rawPrompt: string;
+  if (engagement === 'triggered') {
+    rawPrompt = [
+      rolePromptLine,
+      `Task from #${channelName} (${hubMessage.fromName}):`,
+      hubMessage.content,
+      '',
+      'Do the work. Your output will be automatically posted back to the channel.',
+      '---',
+      guidance,
+    ].filter(Boolean).join('\n');
+  } else {
+    rawPrompt = [
+      roleLine,
+      rolePromptLine,
+      contextBlock,
+      sourceHeader,
+      hubMessage.content,
+      '',
+      '---',
+      guidance,
+    ].filter(Boolean).join('\n');
+  }
 
   const prompt = compressForDispatch(rawPrompt, `dispatch ${session.sessionId.slice(0, 8)}`);
 
@@ -760,6 +847,13 @@ function dispatchToSession(
     : engagement === 'triggered' ? 'trigger' as const
     : 'hub' as const;
   const job = createJob(session.sessionId, prompt, jobSource);
+
+  // Store hub routing metadata on the job itself (programmatic routing — C2)
+  sessionStore.updateJob(session.sessionId, job.jobId, {
+    hubChannelId: hubMessage.channelId,
+    hubMessageId: hubMessage.id,
+    hubEngagement: engagement,
+  });
 
   // Update dispatch
   hubStore.addDispatch(hubMessage.id, {
@@ -783,7 +877,18 @@ function dispatchToSession(
     onSessionJobComplete(session.sessionId, job.jobId, hubMessage, engagement);
   });
 
-  executeRemoteJob(session.sessionId, job.jobId, prompt, undefined, execChannel);
+  // B2: Hub chat dispatches use --bare (skip CLAUDE.md, hooks, MCP).
+  // Triggered work dispatches keep CLAUDE.md (need project context).
+  // B4: Hub chat gets low max-turns (text-only); work gets higher cap.
+  const sshOpts = engagement !== 'triggered' ? {
+    bare: true,
+    maxTurns: config.hubChatMaxTurns,
+    systemPrompt: buildSystemPrompt(session, engagement),
+  } : {
+    maxTurns: config.sshMaxTurns,
+  };
+
+  executeRemoteJob(session.sessionId, job.jobId, prompt, undefined, execChannel, sshOpts);
 }
 
 function onSessionJobComplete(
@@ -814,7 +919,12 @@ function onSessionJobComplete(
   // Skipped responses ARE posted to the channel (so humans see who skipped
   // and why) but don't trigger chain propagation, self-triggers, or talking
   // continuation.
-  const skipResult = parseSkipResponse(rawOutput);
+  let didBeginWork = false; // A2: track for wave2 dispatch decision
+  // C1: Triggered jobs should never be classified as SKIP for empty output —
+  // they always produce a result (even if it's a fallback placeholder).
+  const skipResult = (engagement === 'triggered' && rawOutput.trim() === '')
+    ? null
+    : parseSkipResponse(rawOutput);
   if (skipResult) {
     hubStore.updateDispatch(hubMessage.id, sessionId, {
       status: 'skipped',
@@ -843,6 +953,7 @@ function onSessionJobComplete(
   } else {
     // Detect markers BEFORE stripping them
     const wantsSelfTrigger = detectSelfTrigger(rawOutput) && engagement !== 'triggered';
+    if (wantsSelfTrigger) didBeginWork = true;
     // Talking continuation is only valid in chat mode (not while triggered)
     // and never together with [BEGIN_WORK] — self-trigger takes precedence.
     const wantsTalking = !wantsSelfTrigger
@@ -860,7 +971,7 @@ function onSessionJobComplete(
     // If the agent wrapped its reply in [CHANNEL_REPLY]...[/CHANNEL_REPLY],
     // use ONLY that content for the channel post (cleaner than all narration).
     // Otherwise fall back to cleanedText (all extracted text, markers stripped).
-    const compactedContent = actions.channelReply ?? actions.cleanedText;
+    let compactedContent = actions.channelReply ?? actions.cleanedText;
 
     const atDepthLimit = hubMessage.depth >= config.hubMaxChainDepth;
     console.log(`[hub] onSessionJobComplete: session=${sessionId.slice(0, 8)} job=${jobId.slice(0, 8)} channel=${hubMessage.channelId} depth=${hubMessage.depth} hasChannelReply=${!!actions.channelReply} contentLen=${compactedContent.length} atDepthLimit=${atDepthLimit}`);
@@ -872,25 +983,51 @@ function onSessionJobComplete(
     // Extract @mentions from the agent's reply so humans can be pulled in.
     const replyMentions = extractMentions(compactedContent);
 
+    // Programmatic hook: triggered jobs ALWAYS post a result to the channel.
+    // If extractTextFromChunks returned empty (e.g. mostly tool use in tmux),
+    // fall back to raw chunks or a placeholder.
+    const isTriggeredResult = engagement === 'triggered';
+    if (isTriggeredResult && !compactedContent.trim()) {
+      const fallback = extractTextFromChunks(job?.chunks ?? [], { skipToolOutput: false });
+      const lastLines = fallback.trim().split('\n').slice(-20).join('\n');
+      compactedContent = lastLines || '[Work completed — check session logs for details]';
+    }
+
     // Always post the message if there's content — even at the chain depth
     // limit. The depth limit prevents CHAIN PROPAGATION (self-triggers,
     // talking, recursive dispatches) but should never silently drop an
     // agent's work results. Previously, the depth check prevented posting
     // entirely, so the agent did work but the result vanished.
     if (compactedContent.trim()) {
-      // Triggered job completions ([BEGIN_WORK] or manual trigger) fan out
-      // to expert subscribers so everyone sees the work result.
-      const isTriggeredResult = engagement === 'triggered';
+      // A1: Tree-structure reporting — work results go to the requester,
+      // not everyone. Auto-mention the original requester and anyone the
+      // original message explicitly @mentioned (they had context).
+      // For self-triggers, hubMessage IS the agent's own reply — the actual
+      // requester is the PARENT message's author.
+      const resultMentions = [...replyMentions];
+      if (isTriggeredResult) {
+        const isSelfTrig = hubMessage.from === sessionId;
+        const sourceMsg = isSelfTrig && hubMessage.parentId
+          ? hubStore.getMessage(hubMessage.parentId) ?? hubMessage
+          : hubMessage;
+        if (sourceMsg.fromName && !resultMentions.includes(sourceMsg.fromName)) {
+          resultMentions.push(sourceMsg.fromName);
+        }
+        for (const m of sourceMsg.mentions ?? []) {
+          if (!resultMentions.includes(m)) resultMentions.push(m);
+        }
+      }
+
       const postedReply = postHubMessage({
         from: sessionId,
         fromName: screenName,
         content: compactedContent,
         channelIds: [hubMessage.channelId],
         tags: newTags,
-        mentions: replyMentions,
+        mentions: resultMentions,
         parentId: hubMessage.id,
         depth: hubMessage.depth + 1,
-        fanOut: isTriggeredResult,
+        fanOut: false,  // A1: no fanOut — tree-structure, not broadcast
       });
 
       // At depth limit, immediately mark the posted reply as complete to
@@ -903,6 +1040,8 @@ function onSessionJobComplete(
       if (!atDepthLimit) {
         if (wantsSelfTrigger) {
           console.log(`[hub]   ${sessionId.slice(0, 8)} SELF-TRIGGER detected in reply`);
+          // A3: Cancel other dispatches for this message — someone claimed it
+          cancelOtherDispatches(hubMessage.id, sessionId);
           setImmediate(() => {
             triggerSessionOnMessage(sessionId, postedReply.id);
           });
@@ -930,10 +1069,41 @@ function onSessionJobComplete(
 
   checkMessageComplete(hubMessage.id);
 
+  // A2: Track wave1 completions — dispatch wave2 if needed
+  checkWave2Dispatch(hubMessage.id, didBeginWork);
+
   // Queue drain is handled by the global onAnyJobComplete callback registered
   // in index.ts. That callback fires AFTER activeExecutions.delete (session is
   // free), so processQueue/drainGlobalQueue can actually dispatch work. The old
   // calls here were no-ops because the session was still marked busy.
+}
+
+/**
+ * A2: Check if wave1 for a message is complete and dispatch wave2 if nobody claimed.
+ */
+function checkWave2Dispatch(messageId: string, claimed: boolean): void {
+  const wave2 = pendingWave2.get(messageId);
+  if (!wave2) return;
+
+  if (claimed) wave2.claimed = true;
+  wave2.completedWave1++;
+
+  if (wave2.completedWave1 < wave2.totalWave1) return; // still waiting for wave1
+
+  pendingWave2.delete(messageId);
+
+  if (wave2.claimed) {
+    console.log(`[hub] wave2 skipped for ${messageId.slice(0, 8)} — wave1 claimed with [BEGIN_WORK]`);
+    return;
+  }
+
+  const msg = hubStore.getMessage(messageId);
+  if (!msg) return;
+
+  console.log(`[hub] wave2 dispatching ${wave2.sessions.length} sessions for ${messageId.slice(0, 8)}`);
+  for (const entry of wave2.sessions) {
+    dispatchOrQueue(entry.session, msg, entry.engagement);
+  }
 }
 
 /**
@@ -993,15 +1163,12 @@ function continueTalking(
     'beat without the marker. Reply with [SKIP][#NO_ACTION_NEEDED] to drop out entirely.',
   ].join('\n');
 
-  const replyToLine = `[REPLY_TO_CHANNEL][#${originalMessage.channelId}][%${originalMessage.id}]`;
-
   const rawPrompt = [
     roleLine,
     rolePromptLine,
     contextBlock,
     sourceHeader,
     '',
-    replyToLine,
     '---',
     guidance,
   ].filter(Boolean).join('\n');

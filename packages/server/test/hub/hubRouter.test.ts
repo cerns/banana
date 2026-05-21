@@ -14,6 +14,10 @@ vi.mock('../../src/config.js', () => ({
     taskContextMax: 8,
     docContextMax: 5,
     docRevisionMax: 20,
+    sshMaxTurns: 25,
+    hubChatMaxTurns: 3,
+    hubWaveSize: 2,
+    promptCompressEnabled: false,
   },
 }));
 
@@ -249,6 +253,7 @@ describe('hubRouter', () => {
         expect.stringContaining('Build JWT auth'),
         undefined,
         'hub',
+        expect.anything(),
       );
     });
 
@@ -370,6 +375,7 @@ describe('hubRouter', () => {
         expect.stringContaining('Stand-up time'),
         undefined,
         'hub',
+        expect.anything(),
       );
     });
   });
@@ -413,6 +419,7 @@ describe('hubRouter', () => {
         expect.any(String),
         undefined,
         'hub',
+        expect.anything(),
       );
     });
   });
@@ -578,14 +585,13 @@ describe('hubRouter', () => {
         expect.stringContaining('Backend Dev'),
         undefined,
         'hub',
+        expect.anything(),
       );
 
       const prompt = mockExecuteRemoteJob.mock.calls[0][2];
       expect(prompt).toContain('You are a backend developer.');
       expect(prompt).toContain('Build something');
       expect(prompt).toContain('SKIP');
-      // Regular dispatches also include REPLY_TO_CHANNEL metadata
-      expect(prompt).toContain('[REPLY_TO_CHANNEL][#ch1]');
     });
   });
 
@@ -618,7 +624,7 @@ describe('hubRouter', () => {
       expect(prompt).not.toContain('respond with exactly');
     });
 
-    it('should include REPLY_TO_CHANNEL metadata in the dispatch prompt', () => {
+    it('should store hub routing metadata on job (programmatic routing — C2)', () => {
       createSession({ sessionId: 'reply-to-sess', channels: ['ch1'] });
       const msg = hubRouter.postHubMessage({
         from: 'user', fromName: 'User', content: 'Do stuff', channelIds: ['ch1'],
@@ -629,12 +635,14 @@ describe('hubRouter', () => {
 
       const calls = mockExecuteRemoteJob.mock.calls.filter((c: any) => c[0] === 'reply-to-sess');
       expect(calls).toHaveLength(1);
-      const prompt = calls[0][2];
-      expect(prompt).toContain('[REPLY_TO_CHANNEL][#ch1]');
-      expect(prompt).toContain(`[%${msg.id}]`);
+      // Routing is now programmatic (C2) — stored on JobRecord, not in prompt
+      const sess = sessionStore.sessionStore.get('reply-to-sess');
+      // Find the triggered job (postHubMessage may have also created an expert dispatch)
+      const job = sess?.jobs.find(j => j.hubChannelId === 'ch1' && j.hubMessageId === msg.id && j.hubEngagement === 'triggered');
+      expect(job).toBeDefined();
     });
 
-    it('should include CHANNEL_REPLY guidance in triggered prompt', () => {
+    it('should include auto-post guidance in triggered prompt (C3)', () => {
       createSession({ sessionId: 'cr-hint-sess', channels: ['ch1'] });
       const msg = hubRouter.postHubMessage({
         from: 'user', fromName: 'User', content: 'Work on it', channelIds: ['ch1'],
@@ -644,7 +652,7 @@ describe('hubRouter', () => {
       hubRouter.triggerSessionOnMessage('cr-hint-sess', msg.id);
 
       const prompt = mockExecuteRemoteJob.mock.calls.find((c: any) => c[0] === 'cr-hint-sess')![2];
-      expect(prompt).toContain('[CHANNEL_REPLY]');
+      expect(prompt).toContain('automatically posted back to the channel');
     });
 
     it('should queue the trigger when the session is busy', () => {

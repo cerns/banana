@@ -50,6 +50,12 @@ export interface JobRecord {
   chunks: unknown[];
   error?: string;
   source?: JobSource;
+  /** Hub channel this job replies to (programmatic routing — never in prompt). */
+  hubChannelId?: string;
+  /** Hub message this job is a reply to (programmatic routing). */
+  hubMessageId?: string;
+  /** Hub engagement level for this dispatch. */
+  hubEngagement?: string;
 }
 
 // Debounce window: coalesce many writes (e.g. streaming chunks) into one
@@ -102,6 +108,15 @@ class SessionStore {
     job.exitCode = exitCode;
     job.durationMs = durationMs;
     job.finishedAt = new Date().toISOString();
+    this.persist();
+  }
+
+  updateJob(sessionId: string, jobId: string, fields: Partial<Pick<JobRecord, 'hubChannelId' | 'hubMessageId' | 'hubEngagement'>>): void {
+    const session = this.sessions.get(sessionId);
+    if (!session) return;
+    const job = session.jobs.find(j => j.jobId === jobId);
+    if (!job) return;
+    Object.assign(job, fields);
     this.persist();
   }
 

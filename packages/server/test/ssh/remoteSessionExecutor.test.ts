@@ -284,6 +284,7 @@ describe('remoteSessionExecutor', () => {
           undefined,  // no claudeSessionId
           expect.anything(),
           undefined,  // no model
+          undefined,  // no sshOpts
         );
       });
     });
@@ -305,6 +306,7 @@ describe('remoteSessionExecutor', () => {
           'prev-session',  // resumeId
           expect.anything(),
           undefined,  // no model
+          undefined,  // no sshOpts
         );
       });
     });
@@ -326,6 +328,7 @@ describe('remoteSessionExecutor', () => {
           undefined,
           expect.anything(),
           'sonnet',
+          undefined,  // no sshOpts
         );
       });
     });
@@ -1019,6 +1022,7 @@ describe('remoteSessionExecutor', () => {
         undefined,
         expect.anything(),
         'opus',
+        undefined,  // no sshOpts
       );
       // Second call = session B → machine-2, /proj-b, sonnet
       expect(mockRunClaudeOverSsh).toHaveBeenCalledWith(
@@ -1029,6 +1033,7 @@ describe('remoteSessionExecutor', () => {
         undefined,
         expect.anything(),
         'sonnet',
+        undefined,  // no sshOpts
       );
     });
 
@@ -1111,13 +1116,13 @@ describe('remoteSessionExecutor', () => {
         expect.objectContaining({ id: 'machine-1' }),
         'review the roadmap',
         '/home/root/cernsio',
-        expect.any(Function), undefined, expect.anything(), undefined,
+        expect.any(Function), undefined, expect.anything(), undefined, undefined,
       );
       expect(mockRunClaudeOverSsh).toHaveBeenCalledWith(
         expect.objectContaining({ id: 'machine-1' }),
         'run lighthouse',
         '/home/root/cernsio-qa',
-        expect.any(Function), undefined, expect.anything(), undefined,
+        expect.any(Function), undefined, expect.anything(), undefined, undefined,
       );
 
       deferreds[0].resolve({ exitCode: 0, durationMs: 100 });

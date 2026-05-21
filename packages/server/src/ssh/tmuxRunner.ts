@@ -114,6 +114,18 @@ const PERMISSION_PATTERNS: PermissionPattern[] = [
     test: (line) => /\bDo you\b.*\?\s*\(?\s*y(?:es)?\/n(?:o)?\s*\)?/i.test(line),
     keys: 'y Enter',
   },
+  // Trust this folder/directory/project prompts — Claude CLI workspace trust
+  {
+    label: 'trust-folder',
+    test: (line) => /\b[Tt]rust\b.*(?:folder|directory|project|workspace)\b/i.test(line),
+    keys: 'y Enter',
+  },
+  // "dangerously skip permissions" / dangerous permissions prompt — auto-approve
+  {
+    label: 'dangerous-permissions',
+    test: (line) => /\bdangerous(?:ly)?\b/i.test(line),
+    keys: 'y Enter',
+  },
 ];
 
 /** Check if a line matches any permission/approval pattern. */
@@ -524,6 +536,8 @@ export async function ensureTmuxSession(
 
     // Build the claude command — interactive mode (no --print)
     const claudeArgs = ['--verbose'];
+    // B2: Hub tmux sessions run with --bare (skip CLAUDE.md, hooks, skills, MCP)
+    if (suffix === '-hub') claudeArgs.push('--bare');
     if (model) claudeArgs.push('--model', shellEscape(model));
 
     const fullCmd = `${cdPart}${PATH_PREFIX} && ${claudeBin} ${claudeArgs.join(' ')}`;

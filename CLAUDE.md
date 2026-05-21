@@ -106,6 +106,32 @@ banana machines rm <id>      # remove machine
 banana machines test <id>    # test SSH connection
 ```
 
+## Hub Channel Communication Model
+
+Hub channels are professional email threads, NOT meeting rooms.
+
+- **Report to requester**: Work results go to the person who asked, not everyone
+- **@mention for cross-team**: Only @mention specific agents when they need to act
+- **Silence is professional**: Don't acknowledge, don't restate, SKIP if nothing to add
+- **Tree-structure**: Agents report upward to the requester, not sideways to peers
+- **Banana handles routing**: Reply-back, mention resolution, and dispatch are programmatic — agents just do their work and produce output
+
+### Programmatic Hooks (agents don't need to know these)
+- Work result reply-back: automatic (banana posts result to originating channel)
+- Mention routing: banana auto-mentions the requester when work completes
+- SKIP classification: banana detects short/empty responses without exact syntax
+- Dispatch cancellation: banana cancels redundant dispatches when someone claims [BEGIN_WORK]
+- Staggered dispatch: wave 1 (best-match experts) dispatched first; wave 2 only if nobody claims
+- Routing metadata: stored on JobRecord (hubChannelId/hubMessageId/hubEngagement), not in prompt
+
+### Architecture Diagrams
+See `FLOW.md` for comprehensive Mermaid diagrams covering:
+- Full hub message lifecycle (ingress → dispatch → response)
+- Programmatic routing (C2) sequence diagram
+- [BEGIN_WORK] flow with dispatch cancellation (A3)
+- Staggered dispatch waves (A2)
+- Token savings: before vs after
+
 ## Key Details
 - Hello timeout: 5s for dashboard WS auth
 - Claude invoked over SSH via `remoteSessionExecutor.ts` → `sshRunner.ts`

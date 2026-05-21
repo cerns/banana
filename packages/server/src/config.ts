@@ -56,6 +56,13 @@ export const config = {
   // Default 10000 — triggers compact early to keep context lean.
   compactTokenThreshold: parseInt(process.env.BANANA_COMPACT_TOKEN_THRESHOLD ?? '10000', 10),
   jumpHostPersistPath: process.env.BANANA_JUMPHOSTS_PATH ?? path.join(os.homedir(), '.banana', 'jumphosts.json'),
+  // ── Hub dispatch tuning ──────────────────────────────────────────────────
+  // Max agentic turns for work sessions (--max-turns).
+  sshMaxTurns: parseInt(process.env.BANANA_SSH_MAX_TURNS ?? '25', 10),
+  // Max agentic turns for hub chat dispatches (text-only, low).
+  hubChatMaxTurns: parseInt(process.env.BANANA_HUB_CHAT_MAX_TURNS ?? '3', 10),
+  // Max sessions in wave1 of staggered dispatch (A2).
+  hubWaveSize: parseInt(process.env.BANANA_HUB_WAVE_SIZE ?? '2', 10),
   // ── Persistent tmux mode ─────────────────────────────────────────────────
   // How long to wait for claude to start inside tmux before giving up.
   tmuxStartupTimeoutMs: parseInt(process.env.BANANA_TMUX_STARTUP_TIMEOUT ?? '60000', 10),

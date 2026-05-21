@@ -685,6 +685,19 @@ async function runClaudeLocally(
   });
 }
 
+/** Extended options for runClaudeOverSsh. */
+export interface SshRunOptions {
+  resumeId?: string;
+  signal?: AbortSignal;
+  model?: string;
+  /** When true, adds --bare (skips CLAUDE.md, hooks, skills, MCP). For hub chat. */
+  bare?: boolean;
+  /** System prompt written to a temp file and passed via --append-system-prompt-file. */
+  systemPrompt?: string;
+  /** Max agentic turns (--max-turns). */
+  maxTurns?: number;
+}
+
 /** Run Claude CLI over SSH, streaming output chunks. Supports abort via AbortSignal.
  *  For local machines (empty IP), spawns claude locally via child_process. */
 export async function runClaudeOverSsh(
@@ -695,11 +708,20 @@ export async function runClaudeOverSsh(
   resumeId?: string,
   signal?: AbortSignal,
   model?: string,
+  opts?: SshRunOptions,
 ): Promise<SshRunResult> {
-  if (signal?.aborted) throw new Error('Aborted');
+  // Merge legacy positional args with opts
+  const _resumeId = opts?.resumeId ?? resumeId;
+  const _signal = opts?.signal ?? signal;
+  const _model = opts?.model ?? model;
+  const _bare = opts?.bare ?? false;
+  const _systemPrompt = opts?.systemPrompt;
+  const _maxTurns = opts?.maxTurns;
+
+  if (_signal?.aborted) throw new Error('Aborted');
 
   if (isLocalMachine(machine)) {
-    return runClaudeLocally(machine, prompt, workdir, onChunk, resumeId, signal, model);
+    return runClaudeLocally(machine, prompt, workdir, onChunk, _resumeId, _signal, _model);
   }
 
   const startedAt = Date.now();
@@ -711,6 +733,9 @@ export async function runClaudeOverSsh(
     '--verbose',
     '--include-partial-messages',
   ];
+  if (_bare) {
+    args.push('--bare');
+  }
   if (machine.skipPermissions === false) {
     // Enterprise mode: use dontAsk + settings.json allow rules (no prompts)
     args.push('--permission-mode', 'dontAsk');
@@ -718,12 +743,16 @@ export async function runClaudeOverSsh(
     args.push('--dangerously-skip-permissions');
   }
 
-  if (model) {
-    args.push('--model', shellEscape(model));
+  if (_model) {
+    args.push('--model', shellEscape(_model));
   }
 
-  if (resumeId) {
-    args.push('--resume', shellEscape(resumeId));
+  if (_resumeId) {
+    args.push('--resume', shellEscape(_resumeId));
+  }
+
+  if (_maxTurns !== undefined) {
+    args.push('--max-turns', String(_maxTurns));
   }
 
   // Prompt is written to a temp file on the remote via SFTP, then piped
@@ -733,21 +762,10 @@ export async function runClaudeOverSsh(
   // bytes over SFTP with zero shell interpretation.
   const tmpFile = `/tmp/banana-prompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-  // `trap '' HUP` makes the shell (and child processes) ignore SIGHUP.
-  // This is critical because PTY mode sends SIGHUP on SSH disconnections,
-  // which would otherwise kill claude mid-tool-call during transient
-  // network blips. SIGTERM (used by abort) still works normally.
-  const pathPrefix = "trap '' HUP; export PATH=\"$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$PATH\"";
-  const cmdParts = [pathPrefix];
-  if (workdir) cmdParts.push(`cd ${shellEscape(workdir)}`);
-  cmdParts.push(`${claudeBin} ${args.join(' ')} < ${shellEscape(tmpFile)}`);
-  // Clean up temp file (best-effort, runs even if claude exits with error)
-  const command = cmdParts.join(' && ') + `; rm -f ${shellEscape(tmpFile)}`;
-
   console.log(`[ssh-runner] Connecting to ${machine.username}@${machine.ip}:${machine.port}`);
-  console.log(`[ssh-runner] Command: ${claudeBin}${model ? ` --model ${model}` : ''}${resumeId ? ' --resume' : ''} (prompt ${prompt.length} chars via SFTP temp file)`);
+  console.log(`[ssh-runner] Command: ${claudeBin}${_model ? ` --model ${_model}` : ''}${_resumeId ? ' --resume' : ''}${_bare ? ' --bare' : ''} (prompt ${prompt.length} chars via SFTP temp file)`);
 
-  const { client: conn, cleanup } = await connectWithRetry(machine, signal);
+  const { client: conn, cleanup } = await connectWithRetry(machine, _signal);
 
   // Provision .claude/settings.json for enterprise plans
   if (needsPermissionSettings(machine) && workdir) {
@@ -763,6 +781,34 @@ export async function runClaudeOverSsh(
       ws.end(Buffer.from(prompt, 'utf8'), () => { sftp.end(); resolve(); });
     });
   });
+
+  // B1: Write system prompt to a temp file and pass via --append-system-prompt
+  let sysPromptFile: string | undefined;
+  if (_systemPrompt) {
+    sysPromptFile = `/tmp/banana-sysprompt-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    await new Promise<void>((resolve, reject) => {
+      conn.sftp((err, sftp) => {
+        if (err) { reject(err); return; }
+        const ws = sftp.createWriteStream(sysPromptFile!, { mode: 0o600 });
+        ws.on('error', (e: Error) => { sftp.end(); reject(e); });
+        ws.end(Buffer.from(_systemPrompt!, 'utf8'), () => { sftp.end(); resolve(); });
+      });
+    });
+    args.push('--append-system-prompt', shellEscape(sysPromptFile));
+  }
+
+  // Build command AFTER SFTP writes (args may have been modified by system prompt)
+  // `trap '' HUP` makes the shell (and child processes) ignore SIGHUP.
+  // This is critical because PTY mode sends SIGHUP on SSH disconnections,
+  // which would otherwise kill claude mid-tool-call during transient
+  // network blips. SIGTERM (used by abort) still works normally.
+  const pathPrefix = "trap '' HUP; export PATH=\"$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$PATH\"";
+  const cmdParts = [pathPrefix];
+  if (workdir) cmdParts.push(`cd ${shellEscape(workdir)}`);
+  cmdParts.push(`${claudeBin} ${args.join(' ')} < ${shellEscape(tmpFile)}`);
+  // Clean up temp files (best-effort, runs even if claude exits with error)
+  const cleanupFiles = [tmpFile, ...(sysPromptFile ? [sysPromptFile] : [])].map(f => shellEscape(f)).join(' ');
+  const command = cmdParts.join(' && ') + `; rm -f ${cleanupFiles}`;
 
   return new Promise((resolve, reject) => {
     let settled = false;
