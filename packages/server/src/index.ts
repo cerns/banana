@@ -13,6 +13,9 @@ import { processQueue, drainGlobalQueue, extractTextFromChunks, postHubMessage }
 import { parseReplyToChannel, stripReplyToChannel, extractArtifactActions, parseReplyRouting, extractChannelReply } from './hub/channelArtifactExtractor.js';
 import { broadcastToDashboards } from './ws/dashboardBroadcast.js';
 import { jumpHostStore } from './ssh/jumpHostStore.js';
+import { closeJumpTunnelCache } from './ssh/sshRunner.js';
+import { closeTmuxConnections } from './ssh/tmuxRunner.js';
+import { abortRemoteJob, getActiveSessionIds } from './ssh/remoteSessionExecutor.js';
 
 sessionStore.load();
 machineStore.load();
@@ -149,7 +152,7 @@ onAnyJobComplete((sessionId, jobId) => {
 });
 
 const httpServer = createHttpServer();
-createWsServer(httpServer);
+const wss = createWsServer(httpServer);
 
 httpServer.listen(config.port, () => {
   console.log(`[banana] Server running on http://localhost:${config.port}`);
@@ -169,3 +172,52 @@ httpServer.on('error', (err) => {
   console.error('[banana] Server error:', err);
   process.exit(1);
 });
+
+// ── Graceful shutdown ────────────────────────────────────────────────────────
+
+let shuttingDown = false;
+
+async function shutdown(signal: string): Promise<void> {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log(`\n[banana] ${signal} received — shutting down...`);
+
+  // Force exit after 5s if cleanup hangs
+  const forceTimer = setTimeout(() => {
+    console.error('[banana] Shutdown timed out — forcing exit');
+    process.exit(1);
+  }, 5000);
+  forceTimer.unref();
+
+  try {
+    // 1. Stop accepting new connections
+    httpServer.close();
+    wss.close();
+
+    // 2. Abort all active SSH jobs
+    for (const id of getActiveSessionIds()) {
+      try { abortRemoteJob(id); } catch { /* ignore */ }
+    }
+
+    // 3. Close SSH connections
+    closeTmuxConnections();
+    closeJumpTunnelCache();
+
+    // 4. Flush all pending writes
+    await Promise.all([
+      sessionStore.persistNow(),
+      hubStore.persistNow(),
+      taskStore.persistNow(),
+      docStore.persistNow(),
+    ]);
+
+    console.log('[banana] Shutdown complete');
+  } catch (err) {
+    console.error('[banana] Shutdown error:', err);
+  }
+
+  process.exit(0);
+}
+
+process.on('SIGINT', () => shutdown('SIGINT'));
+process.on('SIGTERM', () => shutdown('SIGTERM'));

@@ -289,6 +289,11 @@ class JumpTunnelCache {
 
 const jumpTunnelCache = new JumpTunnelCache();
 
+/** Close the global jump host tunnel cache (for graceful shutdown). */
+export function closeJumpTunnelCache(): void {
+  jumpTunnelCache.close();
+}
+
 /** Connect to the target machine through a persistent jump host tunnel.
  *  The tunnel is shared — target-side failures do NOT destroy it. */
 export async function connectThroughJumpHosts(

@@ -1045,7 +1045,7 @@ describe('tmuxRunner', () => {
 
       // All exec commands should be wrapped in the interactive shell
       for (const cmd of executedCmds) {
-        expect(cmd).toMatch(/^\/bin\/zsh -ic /);
+        expect(cmd).toMatch(/^\/bin\/zsh -c /);
       }
     });
 
@@ -1074,7 +1074,7 @@ describe('tmuxRunner', () => {
       await tmuxRunner.ensureTmuxSession(machine, 'bash-default-id', '/work');
 
       for (const cmd of executedCmds) {
-        expect(cmd).toMatch(/^\/bin\/bash -ic /);
+        expect(cmd).toMatch(/^\/bin\/bash -c /);
       }
     });
 

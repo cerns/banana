@@ -1,8 +1,22 @@
 import * as fs from 'fs';
+import { execFile } from 'child_process';
 import type { MachineRecord } from '../machines/machineStore.js';
 import type { SshRunResult, SshChunkCallback, TunneledConnection } from './sshRunner.js';
 import { connectWithRetry, shellEscape, isLocalMachine, execLocal, getLocalShell } from './sshRunner.js';
 import { config } from '../config.js';
+
+/**
+ * Run tmux directly via execFile (no shell) for local machines.
+ * Avoids spawning bash every 250ms which causes terminal title flicker.
+ */
+function execTmuxLocal(args: string[], timeoutMs = 10_000): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile('tmux', args, { timeout: timeoutMs }, (err, stdout) => {
+      if (err) reject(err);
+      else resolve(stdout);
+    });
+  });
+}
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -52,6 +66,44 @@ interface PermissionPattern {
 }
 
 const PERMISSION_PATTERNS: PermissionPattern[] = [
+  // ── Menu patterns (most specific — check FIRST) ──────────────────────
+  // These detect the TUI selection menu cursor. Must be checked before
+  // text-based y/n patterns, because the screen may contain BOTH
+  // "Allow...? (y/n)" text AND a "❯ Allow once" menu below it.
+  // Sending "y Enter" to a menu does nothing; sending "Enter" works.
+
+  // Numbered menu: "❯ 1. Yes" or "❯ 1. Allow"
+  {
+    label: 'menu-number-yes',
+    test: (line) => /^[❯>►]\s*1\.\s*(?:Yes|Allow)\b/i.test(line),
+    keys: 'Enter',
+  },
+  // Numbered menu cursor on No: "❯ 2. No" or "❯ 2. Deny" — navigate up
+  {
+    label: 'menu-number-no',
+    test: (line) => /^[❯>►]\s*2\.\s*(?:No|Deny)\b/i.test(line),
+    keys: 'Up Enter',
+  },
+  // Menu: cursor on Allow/Yes → Enter
+  {
+    label: 'menu-allow',
+    test: (line) => /^[❯>►]\s+(?:Allow|Yes)\b/i.test(line),
+    keys: 'Enter',
+  },
+  // Menu: cursor on Deny/No → navigate up (to Allow) and Enter
+  {
+    label: 'menu-deny',
+    test: (line) => /^[❯>►]\s+(?:Deny|No)\b/i.test(line),
+    keys: 'Up Enter',
+  },
+  // Accept edits: "⏵⏵ accept edits on" / "accept all" → Enter
+  {
+    label: 'accept-edits',
+    test: (line) => /^[⏵►>]{1,2}\s*accept\b/i.test(line),
+    keys: 'Enter',
+  },
+
+  // ── Text-based y/n/a patterns ────────────────────────────────────────
   // y/n/a — prefer "always" to reduce future prompts
   {
     label: 'allow-always',
@@ -64,63 +116,33 @@ const PERMISSION_PATTERNS: PermissionPattern[] = [
     test: (line) => /\bAllow\b.*\?\s*\(?\s*y(?:es)?\/n(?:o)?\s*\)?/i.test(line),
     keys: 'y Enter',
   },
-  // General confirmations with (y/n): Proceed? Continue? Do you want to...?
+  // General confirmations: Proceed? Continue? Do you want to...?
   {
     label: 'confirm-yn',
     test: (line) => /(?:Proceed|Continue|Do you (?:want|wish) to)\b.*\?\s*\(?\s*y(?:es)?\/n(?:o)?\s*\)?/i.test(line),
     keys: 'y Enter',
   },
-  // Accept edits prompt: "⏵⏵ accept edits on" / "accept all" — press Enter to accept
-  {
-    label: 'accept-edits',
-    test: (line) => /^[⏵►>]{1,2}\s*accept\b/i.test(line),
-    keys: 'Enter',
-  },
-  // Numbered menu with cursor: "❯ 1. Yes" or "❯ 1. Allow" — only when cursor is present
-  {
-    label: 'menu-number-yes',
-    test: (line) => /^[❯>►]\s*1\.\s*(?:Yes|Allow)\b/i.test(line),
-    keys: 'Enter',
-  },
-  // Numbered menu with cursor on No: "❯ 2. No" or "❯ 2. Deny" — navigate to Yes
-  {
-    label: 'menu-number-no',
-    test: (line) => /^[❯>►]\s*2\.\s*(?:No|Deny)\b/i.test(line),
-    keys: 'Up Enter',
-  },
-  // Menu: cursor on Allow/Yes option → press Enter
-  {
-    label: 'menu-allow',
-    test: (line) => /^[❯>►]\s+(?:Allow|Yes)\b/i.test(line),
-    keys: 'Enter',
-  },
-  // Menu: cursor on Deny/No → navigate up (to Allow) and press Enter
-  {
-    label: 'menu-deny',
-    test: (line) => /^[❯>►]\s+(?:Deny|No)\b/i.test(line),
-    keys: 'Up Enter',
-  },
-  // Standalone (y/n) — for wrapped permission prompts where "Allow Bash: <long command>"
-  // is on one line and "(y/n)" or "y/n" ends up on a separate line after wrapping.
+  // Standalone (y/n) — wrapped prompts where "(y/n)" is on its own line
   {
     label: 'standalone-yn',
     test: (line) => /^\(?\s*y(?:es)?\/n(?:o)?(?:\/a(?:lways)?)?\s*\)?\s*$/.test(line),
     keys: 'y Enter',
   },
-  // "Do you want to allow/run/execute...?" with a (y/n) prompt — handles the common
-  // Claude TUI phrasing for complex tool permissions
+  // "Do you want to...?" with (y/n)
   {
     label: 'do-you-yn',
     test: (line) => /\bDo you\b.*\?\s*\(?\s*y(?:es)?\/n(?:o)?\s*\)?/i.test(line),
     keys: 'y Enter',
   },
-  // Trust this folder/directory/project prompts — Claude CLI workspace trust
+
+  // ── Startup / one-time prompts ───────────────────────────────────────
+  // Trust this folder/directory/project
   {
     label: 'trust-folder',
     test: (line) => /\b[Tt]rust\b.*(?:folder|directory|project|workspace)\b/i.test(line),
     keys: 'y Enter',
   },
-  // "dangerously skip permissions" / dangerous permissions prompt — auto-approve
+  // "dangerously skip permissions" prompt
   {
     label: 'dangerous-permissions',
     test: (line) => /\bdangerous(?:ly)?\b/i.test(line),
@@ -163,6 +185,8 @@ export class TmuxOutputParser {
   private responseLines: string[] = [];
   /** Cooldown: timestamp of last auto-approve to avoid re-firing while same prompt is visible. */
   private lastAutoApproveAt = 0;
+  private lastApprovedText = '';
+  private approveRetryCount = 0;
   /** Whether the screen currently shows a thinking spinner — text emitted as thinking_delta. */
   private _thinking = false;
 
@@ -235,6 +259,14 @@ export class TmuxOutputParser {
     if (this.autoApprove && Date.now() - this.lastAutoApproveAt > 3000) {
       for (const pattern of PERMISSION_PATTERNS) {
         if (pattern.test(trimmed)) {
+          // Same prompt still on screen — count retries, back off after 3
+          if (trimmed === this.lastApprovedText) {
+            this.approveRetryCount++;
+            if (this.approveRetryCount > 3) return; // give up, avoid log spam
+          } else {
+            this.lastApprovedText = trimmed;
+            this.approveRetryCount = 0;
+          }
           this.onChunk({
             type: 'stderr',
             text: `[banana-tmux] Auto-approved (${pattern.label}): ${trimmed}\n`,
@@ -351,7 +383,7 @@ async function tmuxExec(
   return new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => { cleanup(); reject(new Error(`SSH exec timed out (${timeoutMs}ms)`)); }, timeoutMs);
     const shell = machine.localShell || '/bin/bash';
-    sshClient.exec(`${shell} -ic ${shellEscape(PATH_PREFIX + ' && ' + command)}`, (err, stream) => {
+    sshClient.exec(`${shell} -c ${shellEscape(PATH_PREFIX + ' && ' + command)}`, (err, stream) => {
       if (err) { clearTimeout(timer); cleanup(); reject(err); return; }
       let out = '';
       let stderr = '';
@@ -386,7 +418,7 @@ async function execOnConn(
   return new Promise<string>((resolve, reject) => {
     const timer = setTimeout(() => { reject(new Error(`SSH exec timed out (${timeoutMs}ms)`)); }, timeoutMs);
     const shell = machine.localShell || '/bin/bash';
-    conn.client.exec(`${shell} -ic ${shellEscape(PATH_PREFIX + ' && ' + command)}`, (err, stream) => {
+    conn.client.exec(`${shell} -c ${shellEscape(PATH_PREFIX + ' && ' + command)}`, (err, stream) => {
       if (err) { clearTimeout(timer); reject(err); return; }
       let out = '';
       let stderr = '';
@@ -412,6 +444,9 @@ async function tmuxSendKeys(
   signal?: AbortSignal,
   conn?: TunneledConnection,
 ): Promise<void> {
+  // Always use tmuxExec for send-keys — the `keys` string contains shell-quoted
+  // arguments (e.g. 'cd /path && claude --verbose' Enter) that need a shell to
+  // parse correctly. execFile + split(' ') would destroy the quoting and strip spaces.
   await tmuxExec(machine, `tmux send-keys -t ${shellEscape(tmuxName)} ${keys}`, signal, 10_000, conn);
 }
 
@@ -786,7 +821,12 @@ export async function streamTmuxOutput(
   }
 
   /** Run capture-pane using persistent connection when available, else fallback to tmuxExec. */
+  const isLocal = isLocalMachine(machine);
   const capturePane = async (): Promise<string> => {
+    // Local: call tmux directly (no shell spawn) to avoid terminal title flicker
+    if (isLocal) {
+      return execTmuxLocal(['capture-pane', '-t', session.tmuxName, '-p'], 10_000);
+    }
     const cmd = `tmux capture-pane -t ${shellEscape(session.tmuxName)} -p`;
     if (pollConn) {
       try {
@@ -805,6 +845,10 @@ export async function streamTmuxOutput(
     }
     return tmuxExec(machine, cmd, signal, 10_000);
   };
+
+  // Dedup tracking for screen-scan auto-approve (avoid log spam when prompt stays visible)
+  let lastScreenApproveText = '';
+  let screenApproveRetries = 0;
 
   // Capture the initial screen as our baseline — everything here is "old".
   // We store the full line array (with positions) so we can diff properly.
@@ -902,28 +946,28 @@ export async function streamTmuxOutput(
       //     "(y/n)" on the next — neither alone matches allow-yn via the diff)
       //   - Prompts that were visible in the previous poll but not yet approved
       // Scan the bottom of the full screen with its own 3s cooldown.
+      // Dedup: skip if same screen text was already approved (avoid log spam).
       if (config.tmuxAutoApprovePermissions) {
         const now = Date.now();
         if (now - parser.getLastAutoApproveAt() > 3000) {
-          // Also try joining adjacent bottom lines to catch multi-line permission prompts
-          const joinedBottom = bottomLines.join(' ');
-          let approved = false;
-          // First: check joined bottom lines (catches wrapped "Allow...?(y/n)")
-          for (const pattern of PERMISSION_PATTERNS) {
-            if (pattern.test(joinedBottom)) {
-              onChunk({ type: 'stderr', text: `[banana-tmux] Auto-approved via screen scan (${pattern.label}): ${joinedBottom.slice(0, 120)}\n` });
-              sendKeysForApprove(pattern.keys);
-              parser.setLastAutoApproveAt(now);
-              approved = true;
-              break;
-            }
+          // Same screen text still showing — count retries, give up after 3
+          const screenFingerprint = bottomLines.join(' ').slice(-200);
+          if (screenFingerprint === lastScreenApproveText) {
+            screenApproveRetries++;
+          } else {
+            lastScreenApproveText = screenFingerprint;
+            screenApproveRetries = 0;
           }
-          // Second: check individual bottom lines (catches menu items like "❯ Yes")
-          if (!approved) {
+
+          if (screenApproveRetries <= 3) {
+            let approved = false;
+            // Check individual lines FIRST — menu items (❯ Yes, ❯ 1. Allow) are
+            // more specific and need different keys than y/n text prompts. If we
+            // join lines first, "Allow...? (y/n)" matches before "❯ Allow once".
             for (const line of bottomLines) {
               for (const pattern of PERMISSION_PATTERNS) {
                 if (pattern.test(line)) {
-                  onChunk({ type: 'stderr', text: `[banana-tmux] Auto-approved via screen scan (${pattern.label}): ${line}\n` });
+                  onChunk({ type: 'stderr', text: `[banana-tmux] Auto-approved via screen scan (${pattern.label}): ${line.slice(0, 120)}\n` });
                   sendKeysForApprove(pattern.keys);
                   parser.setLastAutoApproveAt(now);
                   approved = true;
@@ -931,6 +975,20 @@ export async function streamTmuxOutput(
                 }
               }
               if (approved) break;
+            }
+            // Fallback: join bottom lines for wrapped prompts (e.g. "Allow Bash: <long>"
+            // on one line, "(y/n)" on the next — neither alone matches)
+            if (!approved) {
+              const joinedBottom = bottomLines.join(' ');
+              for (const pattern of PERMISSION_PATTERNS) {
+                if (pattern.test(joinedBottom)) {
+                  onChunk({ type: 'stderr', text: `[banana-tmux] Auto-approved via screen scan (${pattern.label}): ${joinedBottom.slice(0, 120)}\n` });
+                  sendKeysForApprove(pattern.keys);
+                  parser.setLastAutoApproveAt(now);
+                  approved = true;
+                  break;
+                }
+              }
             }
           }
         }
@@ -1231,4 +1289,12 @@ export async function killAllTmuxSessions(machine: MachineRecord, sessionId: str
 /** Check if a tmux session exists for the given banana sessionId. */
 export function hasTmuxSession(sessionId: string, suffix?: string): boolean {
   return tmuxSessions.has(tmuxKey(sessionId, suffix));
+}
+
+/** Close all cached tmux SSH connections (for graceful shutdown). */
+export function closeTmuxConnections(): void {
+  for (const [key, session] of tmuxSessions) {
+    try { session.tailConn?.cleanup(); } catch { /* ignore */ }
+    session.tailConn = null;
+  }
 }
