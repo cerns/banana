@@ -234,6 +234,11 @@ export class TmuxOutputParser {
     return this.responseLines.length > 0;
   }
 
+  /** Return all emitted response lines (trimmed) for diff reconciliation. */
+  getResponseLines(): string[] {
+    return this.responseLines;
+  }
+
   /** Get last auto-approve timestamp (shared with full-screen scan). */
   getLastAutoApproveAt(): number {
     return this.lastAutoApproveAt;
@@ -504,6 +509,8 @@ export async function ensureTmuxSession(
     // Verify tmux session still exists on remote (1 standalone connection — acceptable)
     try {
       await tmuxExec(machine, `tmux has-session -t ${shellEscape(existing.tmuxName)} 2>/dev/null`, signal, 10_000);
+      // Resize existing session to current desired size (old sessions may have smaller panes)
+      await tmuxExec(machine, `tmux resize-window -t ${shellEscape(existing.tmuxName)} -x 500 -y 500 2>/dev/null || true`, signal, 10_000).catch(() => {});
       return existing;
     } catch {
       // Session died — clean up and recreate
@@ -546,7 +553,7 @@ export async function ensureTmuxSession(
     const cdPart = workdir ? `cd ${shellEscape(workdir)} && ` : '';
     await tmuxExec(
       machine,
-      `tmux new-session -d -s ${shellEscape(tmuxName)} -x 200 -y 50`,
+      `tmux new-session -d -s ${shellEscape(tmuxName)} -x 500 -y 500`,
       signal,
       15_000,
       conn ?? undefined,
@@ -759,6 +766,40 @@ function isPromptLine(line: string): boolean {
     return true;
   }
   return false;
+}
+
+/**
+ * Final sweep before completion: the multiset diff can miss content lines when
+ * old lines scroll off the top of the visible pane and cancel out new lines
+ * with identical trimmed text. Reconcile the current screen against all lines
+ * the parser has already emitted and feed any un-emitted response lines.
+ */
+function sweepMissedLines(
+  curLines: string[],
+  parser: TmuxOutputParser,
+  promptLines: Set<string>,
+): void {
+  const emittedCounts = new Map<string, number>();
+  for (const l of parser.getResponseLines()) {
+    emittedCounts.set(l, (emittedCounts.get(l) ?? 0) + 1);
+  }
+  let swept = 0;
+  for (const t of curLines) {
+    if (!t) continue;
+    if (!isResponseLine(t)) continue;
+    if (isPromptLine(t)) continue;
+    if (promptLines.size > 0 && promptLines.has(t)) continue;
+    const ec = emittedCounts.get(t) ?? 0;
+    if (ec > 0) {
+      emittedCounts.set(t, ec - 1);
+    } else {
+      parser.feed(t + '\n');
+      swept++;
+    }
+  }
+  if (swept > 0) {
+    console.log(`[tmux-runner] Final sweep recovered ${swept} missed line(s)`);
+  }
 }
 
 /**
@@ -1020,6 +1061,7 @@ export async function streamTmuxOutput(
         /^\d+ tokens?\s*$/.test(l)
       );
       if (hasContent && hasPrompt && hasTuiFooter && !hasSpinner && !newContentThisPoll && !screenChanged) {
+        sweepMissedLines(curLines, parser, promptLines);
         console.log('[tmux-runner] Prompt detected — response complete');
         parser.flush();
         return { completed: true };
@@ -1035,6 +1077,7 @@ export async function streamTmuxOutput(
 
       // Idle timeout — no new content for tmuxIdleCompletionMs → done
       if (hasContent && Date.now() - lastChangeAt > config.tmuxIdleCompletionMs) {
+        sweepMissedLines(curLines, parser, promptLines);
         console.log(`[tmux-runner] Idle timeout (${config.tmuxIdleCompletionMs}ms) — response complete`);
         onChunk({ type: 'stderr', text: `[banana-tmux] Idle timeout — response complete\n` });
         parser.flush();

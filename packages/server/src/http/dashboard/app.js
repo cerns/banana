@@ -552,26 +552,25 @@ function _bindSidebarEvents() {
     // Tooltip positioning (fixed, escapes sidebar overflow)
     const tip = el.querySelector('.session-tooltip');
     if (tip) {
-      el.addEventListener('mouseenter', () => {
+      let tipHideTimer = null;
+      const showTip = () => {
+        clearTimeout(tipHideTimer);
         const rect = el.getBoundingClientRect();
         tip.style.left = (rect.right + 4) + 'px';
         tip.style.top = rect.top + 'px';
         tip.style.display = 'block';
         tip.style.pointerEvents = 'auto';
-      });
-      el.addEventListener('mouseleave', (e) => {
-        // Keep tooltip visible if mouse moved onto it
-        const related = e.relatedTarget;
-        if (related && (tip.contains(related) || related === tip)) return;
-        tip.style.display = 'none';
-        tip.style.pointerEvents = 'none';
-      });
-      tip.addEventListener('mouseleave', (e) => {
-        const related = e.relatedTarget;
-        if (related && (el.contains(related) || related === el)) return;
-        tip.style.display = 'none';
-        tip.style.pointerEvents = 'none';
-      });
+      };
+      const hideTip = () => {
+        tipHideTimer = setTimeout(() => {
+          tip.style.display = 'none';
+          tip.style.pointerEvents = 'none';
+        }, 150);
+      };
+      el.addEventListener('mouseenter', showTip);
+      el.addEventListener('mouseleave', hideTip);
+      tip.addEventListener('mouseenter', () => clearTimeout(tipHideTimer));
+      tip.addEventListener('mouseleave', hideTip);
     }
   });
   sessionList.querySelectorAll('.session-edit-btn').forEach(btn => {
@@ -1815,11 +1814,12 @@ function renderHubMessages() {
   container.querySelectorAll('.hub-msg-from').forEach(el => {
     const sessionId = el.dataset.sessionId;
     if (!sessionId) return;
-    el.addEventListener('mouseenter', () => showHubFromTooltip(el, sessionId));
-    el.addEventListener('mouseleave', (e) => {
-      const tip = _hubFromTip;
-      if (tip && e.relatedTarget && (tip.contains(e.relatedTarget) || e.relatedTarget === tip)) return;
-      hideHubFromTooltip();
+    el.addEventListener('mouseenter', () => {
+      clearTimeout(_hubFromHideTimer);
+      showHubFromTooltip(el, sessionId);
+    });
+    el.addEventListener('mouseleave', () => {
+      _hubFromHideTimer = setTimeout(hideHubFromTooltip, 150);
     });
   });
 }
@@ -1827,6 +1827,7 @@ function renderHubMessages() {
 // ── Hub "from" tooltip (floating, shared, with copy buttons) ──────────────
 let _hubFromTip = null;
 let _hubFromAnchor = null;
+let _hubFromHideTimer = null;
 
 function showHubFromTooltip(anchor, sessionId) {
   const s = sessions[sessionId];
@@ -1842,9 +1843,9 @@ function showHubFromTooltip(anchor, sessionId) {
   if (!_hubFromTip) {
     _hubFromTip = document.createElement('div');
     _hubFromTip.className = 'session-tooltip hub-from-tooltip';
-    _hubFromTip.addEventListener('mouseleave', (e) => {
-      if (e.relatedTarget && _hubFromAnchor && (_hubFromAnchor.contains(e.relatedTarget) || e.relatedTarget === _hubFromAnchor)) return;
-      hideHubFromTooltip();
+    _hubFromTip.addEventListener('mouseenter', () => clearTimeout(_hubFromHideTimer));
+    _hubFromTip.addEventListener('mouseleave', () => {
+      _hubFromHideTimer = setTimeout(hideHubFromTooltip, 150);
     });
     document.body.appendChild(_hubFromTip);
   }
