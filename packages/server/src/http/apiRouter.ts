@@ -397,7 +397,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       const body = await readBody(req) as {
         name?: string; role?: string; screenName?: string;
         interests?: string[]; rolePrompt?: string; channels?: string[];
-        remoteWorkdir?: string; model?: string;
+        remoteWorkdir?: string; model?: string; claudeSessionId?: string;
       };
       if (body.name !== undefined) {
         updateSessionName(sessionId, body.name);
@@ -410,6 +410,7 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       if (body.channels !== undefined) metaFields.channels = body.channels;
       if (body.remoteWorkdir !== undefined) metaFields.remoteWorkdir = body.remoteWorkdir;
       if (body.model !== undefined) metaFields.model = body.model;
+      if (body.claudeSessionId !== undefined) metaFields.claudeSessionId = body.claudeSessionId;
       if (Object.keys(metaFields).length > 0) {
         sessionStore.updateMeta(sessionId, metaFields as any);
       }
@@ -507,12 +508,44 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     }
     const existing = hubStore.getChannel(body.id);
     if (existing) {
-      json(res, 409, { error: 'Channel already exists' });
+      json(res, 409, { error: existing.archived ? 'Channel exists but is archived — restore it instead' : 'Channel already exists' });
       return true;
     }
     const channel = hubStore.createChannel(body.id, body.name, 'api', body.description);
     json(res, 201, channel);
     return true;
+  }
+
+  // POST /api/hub/channels/:id/restore
+  const hubRestoreMatch = pathname.match(/^\/api\/hub\/channels\/([^/]+)\/restore$/);
+  if (hubRestoreMatch && method === 'POST') {
+    const channelId = hubRestoreMatch[1];
+    const channel = hubStore.restoreChannel(channelId);
+    if (!channel) { json(res, 404, { error: 'Channel not found or not archived' }); return true; }
+    json(res, 200, channel);
+    return true;
+  }
+
+  // PATCH/DELETE /api/hub/channels/:id — must come after all sub-route matches
+  const hubChannelMatch = pathname.match(/^\/api\/hub\/channels\/([^/]+)$/);
+  if (hubChannelMatch) {
+    const channelId = hubChannelMatch[1];
+
+    if (method === 'PATCH') {
+      const body = await readBody(req) as { name?: string; description?: string };
+      const channel = hubStore.updateChannel(channelId, body);
+      if (!channel) { json(res, 404, { error: 'Channel not found' }); return true; }
+      json(res, 200, channel);
+      return true;
+    }
+
+    if (method === 'DELETE') {
+      const body = await readBody(req).catch(() => ({})) as { by?: string };
+      const channel = hubStore.archiveChannel(channelId, (body as any)?.by ?? 'dashboard');
+      if (!channel) { json(res, 404, { error: 'Channel not found or already archived' }); return true; }
+      json(res, 200, { ok: true, archived: true });
+      return true;
+    }
   }
 
   // GET /api/hub/channels/:id/messages

@@ -974,6 +974,71 @@ describe('apiRouter', () => {
       expect(res._status).toBe(409);
     });
 
+    it('PATCH /api/hub/channels/:id should update name and description', async () => {
+      const hubStore = (await import('../../src/hub/hubStore.js')).hubStore;
+      hubStore.createChannel('edit-ch', '#edit-ch', 'api', 'old desc');
+
+      const req = createReq('PATCH', '/api/hub/channels/edit-ch', { name: '#renamed', description: 'new desc' });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(res._body.name).toBe('#renamed');
+      expect(res._body.description).toBe('new desc');
+      expect(res._body.id).toBe('edit-ch'); // ID unchanged
+    });
+
+    it('PATCH /api/hub/channels/:id should 404 for unknown channel', async () => {
+      const req = createReq('PATCH', '/api/hub/channels/nonexistent', { name: 'x' });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(404);
+    });
+
+    it('DELETE /api/hub/channels/:id should soft-delete (archive)', async () => {
+      const hubStore = (await import('../../src/hub/hubStore.js')).hubStore;
+      hubStore.createChannel('arch-ch', '#arch-ch', 'api');
+
+      const req = createReq('DELETE', '/api/hub/channels/arch-ch');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(res._body.archived).toBe(true);
+
+      const ch = hubStore.getChannel('arch-ch');
+      expect(ch?.archived).toBe(true);
+      expect(ch?.archivedBy).toBe('dashboard');
+    });
+
+    it('DELETE /api/hub/channels/:id should 404 for unknown or already archived', async () => {
+      const req = createReq('DELETE', '/api/hub/channels/nonexistent');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(404);
+    });
+
+    it('POST /api/hub/channels/:id/restore should restore archived channel', async () => {
+      const hubStore = (await import('../../src/hub/hubStore.js')).hubStore;
+      hubStore.createChannel('rest-ch', '#rest-ch', 'api');
+      hubStore.archiveChannel('rest-ch', 'test');
+
+      const req = createReq('POST', '/api/hub/channels/rest-ch/restore');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(res._body.archived).toBeUndefined();
+      expect(res._body.id).toBe('rest-ch');
+    });
+
+    it('POST /api/hub/channels/:id/restore should 404 for non-archived channel', async () => {
+      const hubStore = (await import('../../src/hub/hubStore.js')).hubStore;
+      hubStore.createChannel('active-ch', '#active', 'api');
+
+      const req = createReq('POST', '/api/hub/channels/active-ch/restore');
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(404);
+    });
+
     it('GET /api/hub/channels/:id/messages should return messages', async () => {
       const req = createReq('GET', '/api/hub/channels/general/messages');
       const res = createRes();

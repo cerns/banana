@@ -8,6 +8,9 @@ export interface HubChannel {
   description?: string;
   createdAt: string;
   createdBy: string;
+  archived?: boolean;
+  archivedAt?: string;
+  archivedBy?: string;
   /**
    * Ordered chat-log of past compactions for this channel. Each entry holds
    * a verbatim snapshot of the messages it replaced PLUS the summary text
@@ -93,6 +96,35 @@ class HubStore {
     const existing = this.channels.get(id);
     if (existing) return existing;
     return this.createChannel(id, `#${id}`, createdBy);
+  }
+
+  updateChannel(id: string, fields: { name?: string; description?: string }): HubChannel | undefined {
+    const channel = this.channels.get(id);
+    if (!channel) return undefined;
+    if (fields.name !== undefined) channel.name = fields.name;
+    if (fields.description !== undefined) channel.description = fields.description;
+    this.persist();
+    return channel;
+  }
+
+  archiveChannel(id: string, by: string): HubChannel | undefined {
+    const channel = this.channels.get(id);
+    if (!channel || channel.archived) return undefined;
+    channel.archived = true;
+    channel.archivedAt = new Date().toISOString();
+    channel.archivedBy = by;
+    this.persist();
+    return channel;
+  }
+
+  restoreChannel(id: string): HubChannel | undefined {
+    const channel = this.channels.get(id);
+    if (!channel || !channel.archived) return undefined;
+    delete channel.archived;
+    delete channel.archivedAt;
+    delete channel.archivedBy;
+    this.persist();
+    return channel;
   }
 
   // ── Message CRUD ──────────────────────────────────────────────────────────

@@ -82,6 +82,7 @@
           <button id="hub-new-channel-btn" class="btn btn-sm" title="New channel">+</button>
         </div>
         <div id="hub-channel-list"></div>
+        <label id="hub-show-archived" style="display:flex;align-items:center;gap:4px;padding:6px 12px;font-size:11px;color:var(--muted);cursor:pointer"><input type="checkbox" id="hub-archived-toggle" /> Show archived</label>
       </div>
       <div id="hub-messages-area">
         <div id="hub-messages-header">
@@ -233,6 +234,27 @@
     </div>
   </div>
 
+  <!-- Edit channel modal -->
+  <div id="edit-channel-modal" class="modal" style="display:none">
+    <div class="modal-content">
+      <div class="modal-header">
+        <span>Edit Channel</span>
+        <button class="modal-close" data-close="edit-channel-modal">&times;</button>
+      </div>
+      <div class="modal-body">
+        <input type="hidden" id="ec-id" />
+        <div class="form-row"><label>Channel ID</label><div id="ec-id-display" style="font-size:11px;color:var(--accent);padding:4px 0;user-select:all"></div></div>
+        <div class="form-row"><label>Name</label><input id="ec-name" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Description</label><input id="ec-desc" autocomplete="off" data-1p-ignore /></div>
+        <div style="display:flex;gap:8px;margin-top:12px">
+          <button id="ec-save" class="btn">Save</button>
+          <button id="ec-archive" class="btn" style="background:#a33;color:#fff">Archive Channel</button>
+          <button class="btn modal-close" data-close="edit-channel-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
+        </div>
+      </div>
+    </div>
+  </div>
+
   <!-- Machines modal -->
   <div id="machines-modal" class="modal" style="display:none">
     <div class="modal-content modal-lg">
@@ -326,8 +348,8 @@
         <div class="form-row"><label>Role Prompt</label><textarea id="se-role-prompt" placeholder="System prompt for this role" rows="4" autocomplete="off" data-1p-ignore></textarea></div>
         <div class="form-row"><label>Model</label><select id="se-model"><option value="">default</option><option value="opus">opus</option><option value="sonnet">sonnet</option><option value="haiku">haiku</option><option value="opusplan">opusplan (plan=Opus, exec=Sonnet)</option></select></div>
         <div class="form-row"><label>Working Dir</label><div style="display:flex;gap:4px;flex:1"><input id="se-workdir" placeholder="/path/to/project" disabled style="opacity:0.6;flex:1" autocomplete="off" data-1p-ignore /><button id="se-workdir-lock" type="button" title="Unlock to edit" style="background:var(--surface);border:1px solid var(--border);border-radius:4px;cursor:pointer;font-size:14px;padding:2px 6px">&#128274;</button></div></div>
+        <div class="form-row"><label>Claude Session ID</label><div style="display:flex;gap:4px;flex:1"><input id="se-claude-session" placeholder="(auto-assigned on first job)" disabled style="opacity:0.6;flex:1;font-size:11px" autocomplete="off" data-1p-ignore /><button id="se-claude-lock" type="button" title="Unlock to edit" style="background:var(--surface);border:1px solid var(--border);border-radius:4px;cursor:pointer;font-size:14px;padding:2px 6px">&#128274;</button></div></div>
         <div class="form-row"><label>Machine</label><select id="se-machine" disabled style="opacity:0.6"></select></div>
-        <div id="se-claude-info" style="display:none;font-size:10px;color:var(--muted);margin-top:8px;word-break:break-all"></div>
         <div style="display:flex;gap:8px;margin-top:12px">
           <button id="se-save" class="btn">Save</button>
           <button class="btn modal-close" data-close="session-edit-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>

@@ -902,14 +902,16 @@ async function openSessionEditModal(sessionId) {
   sel.innerHTML = '<option value="">(none)</option>' +
     machines.map(m => `<option value="${m.id}" ${m.id === s.machineId ? 'selected' : ''}>${esc(m.name)} (${esc(m.alias)})</option>`).join('');
 
-  // Show claude session id if available
-  const claudeInfo = document.getElementById('se-claude-info');
-  if (s.claudeSessionId) {
-    claudeInfo.style.display = 'block';
-    claudeInfo.textContent = `Claude session: ${s.claudeSessionId}`;
-  } else {
-    claudeInfo.style.display = 'none';
-  }
+  // Populate claude session id
+  document.getElementById('se-claude-session').value = s.claudeSessionId || '';
+
+  // Reset claude session lock
+  const csInput = document.getElementById('se-claude-session');
+  const csLock = document.getElementById('se-claude-lock');
+  csInput.disabled = true;
+  csInput.style.opacity = '0.6';
+  csLock.innerHTML = '&#128274;';
+  csLock.title = 'Unlock to edit';
 
   // Reset workdir lock
   const wdInput = document.getElementById('se-workdir');
@@ -934,6 +936,17 @@ document.getElementById('se-workdir-lock').addEventListener('click', () => {
   if (locked) wdInput.focus();
 });
 
+document.getElementById('se-claude-lock').addEventListener('click', () => {
+  const csInput = document.getElementById('se-claude-session');
+  const csLock = document.getElementById('se-claude-lock');
+  const locked = csInput.disabled;
+  csInput.disabled = !locked;
+  csInput.style.opacity = locked ? '1' : '0.6';
+  csLock.innerHTML = locked ? '&#128275;' : '&#128274;';
+  csLock.title = locked ? 'Lock to prevent edits' : 'Unlock to edit';
+  if (locked) csInput.focus();
+});
+
 document.getElementById('se-save').addEventListener('click', async () => {
   const sessionId = document.getElementById('se-id').value;
   const name = document.getElementById('se-name').value.trim();
@@ -945,14 +958,15 @@ document.getElementById('se-save').addEventListener('click', async () => {
   const model = document.getElementById('se-model').value;
 
   const remoteWorkdir = document.getElementById('se-workdir').value.trim();
-  const patchBody = { name, role, screenName, interests, channels, rolePrompt, model, remoteWorkdir };
+  const claudeSessionId = document.getElementById('se-claude-session').value.trim();
+  const patchBody = { name, role, screenName, interests, channels, rolePrompt, model, remoteWorkdir, claudeSessionId };
   await apiFetch(`/api/sessions/${sessionId}`, {
     method: 'PATCH',
     body: JSON.stringify(patchBody),
   });
 
   if (sessions[sessionId]) {
-    Object.assign(sessions[sessionId], { name, role, screenName, interests, channels, rolePrompt, model, remoteWorkdir });
+    Object.assign(sessions[sessionId], { name, role, screenName, interests, channels, rolePrompt, model, remoteWorkdir, claudeSessionId });
   }
 
   renderSidebar();
@@ -1663,18 +1677,42 @@ async function loadHubChannels() {
 
 function renderHubChannels() {
   const list = document.getElementById('hub-channel-list');
-  if (hubChannels.length === 0) {
+  const showArchived = document.getElementById('hub-archived-toggle')?.checked;
+  const visible = hubChannels.filter(ch => showArchived ? true : !ch.archived);
+  if (visible.length === 0) {
     list.innerHTML = '<div style="padding:12px;color:var(--muted);font-size:11px;">No channels yet</div>';
     return;
   }
-  list.innerHTML = hubChannels.map(ch => `
-    <div class="hub-channel-item ${ch.id === activeChannelId ? 'active' : ''}" data-channel="${ch.id}">
-      <span class="hub-channel-name">${esc(ch.name)}</span>
+  list.innerHTML = visible.map(ch => `
+    <div class="hub-channel-item ${ch.id === activeChannelId ? 'active' : ''} ${ch.archived ? 'archived' : ''}" data-channel="${esc(ch.id)}">
+      <span class="hub-channel-name" style="${ch.archived ? 'opacity:0.5' : ''}">${esc(ch.name)}${ch.archived ? ' (archived)' : ''}</span>
       ${ch.description ? `<span class="hub-channel-desc">${esc(ch.description)}</span>` : ''}
+      <span class="hub-channel-actions-inline" style="margin-left:auto;display:flex;gap:2px">
+        ${ch.archived
+          ? `<button class="btn btn-sm hub-restore-btn" data-channel="${esc(ch.id)}" title="Restore channel" style="font-size:10px;padding:0 4px">Restore</button>`
+          : `<button class="btn btn-sm hub-edit-ch-btn" data-channel="${esc(ch.id)}" title="Edit channel" style="font-size:10px;padding:0 4px;background:transparent;color:var(--muted)">&#9881;</button>`
+        }
+      </span>
     </div>
   `).join('');
   list.querySelectorAll('.hub-channel-item').forEach(el => {
-    el.addEventListener('click', () => selectHubChannel(el.dataset.channel));
+    el.addEventListener('click', (e) => {
+      if (e.target.closest('.hub-edit-ch-btn') || e.target.closest('.hub-restore-btn')) return;
+      selectHubChannel(el.dataset.channel);
+    });
+  });
+  list.querySelectorAll('.hub-edit-ch-btn').forEach(btn => {
+    btn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      openEditChannelModal(btn.dataset.channel);
+    });
+  });
+  list.querySelectorAll('.hub-restore-btn').forEach(btn => {
+    btn.addEventListener('click', async (e) => {
+      e.stopPropagation();
+      await apiFetch(`/api/hub/channels/${btn.dataset.channel}/restore`, { method: 'POST' });
+      await loadHubChannels();
+    });
   });
 }
 
@@ -2715,6 +2753,46 @@ document.getElementById('nc-create').addEventListener('click', async () => {
   await loadHubChannels();
   selectHubChannel(id);
 });
+
+// ── Edit Channel Modal ────────────────────────────────────────────────────────
+
+function openEditChannelModal(channelId) {
+  const ch = hubChannels.find(c => c.id === channelId);
+  if (!ch) return;
+  document.getElementById('ec-id').value = ch.id;
+  document.getElementById('ec-id-display').textContent = ch.id;
+  document.getElementById('ec-name').value = ch.name;
+  document.getElementById('ec-desc').value = ch.description || '';
+  openModal('edit-channel-modal');
+}
+
+document.getElementById('ec-save').addEventListener('click', async () => {
+  const id = document.getElementById('ec-id').value;
+  const name = document.getElementById('ec-name').value.trim();
+  const description = document.getElementById('ec-desc').value.trim();
+  if (!name) return;
+  await apiFetch(`/api/hub/channels/${id}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ name, description }),
+  });
+  closeModal('edit-channel-modal');
+  await loadHubChannels();
+  if (activeChannelId === id) {
+    document.getElementById('hub-channel-title').textContent = name;
+  }
+});
+
+document.getElementById('ec-archive').addEventListener('click', async () => {
+  const id = document.getElementById('ec-id').value;
+  const ch = hubChannels.find(c => c.id === id);
+  if (!confirm(`Archive channel "${ch?.name || id}"? It can be restored later.`)) return;
+  await apiFetch(`/api/hub/channels/${id}`, { method: 'DELETE' });
+  closeModal('edit-channel-modal');
+  if (activeChannelId === id) activeChannelId = null;
+  await loadHubChannels();
+});
+
+document.getElementById('hub-archived-toggle').addEventListener('change', () => renderHubChannels());
 
 // ── Inline Session Rename ─────────────────────────────────────────────────────
 contentTitle.addEventListener('click', () => {
