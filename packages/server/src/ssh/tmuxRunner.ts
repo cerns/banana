@@ -510,7 +510,7 @@ export async function ensureTmuxSession(
     try {
       await tmuxExec(machine, `tmux has-session -t ${shellEscape(existing.tmuxName)} 2>/dev/null`, signal, 10_000);
       // Resize existing session to current desired size (old sessions may have smaller panes)
-      await tmuxExec(machine, `tmux resize-window -t ${shellEscape(existing.tmuxName)} -x 500 -y 500 2>/dev/null || true`, signal, 10_000).catch(() => {});
+      await tmuxExec(machine, `tmux resize-window -t ${shellEscape(existing.tmuxName)} -x 200 -y 200 2>/dev/null || true`, signal, 10_000).catch(() => {});
       return existing;
     } catch {
       // Session died — clean up and recreate
@@ -553,7 +553,7 @@ export async function ensureTmuxSession(
     const cdPart = workdir ? `cd ${shellEscape(workdir)} && ` : '';
     await tmuxExec(
       machine,
-      `tmux new-session -d -s ${shellEscape(tmuxName)} -x 500 -y 500`,
+      `tmux new-session -d -s ${shellEscape(tmuxName)} -x 200 -y 200`,
       signal,
       15_000,
       conn ?? undefined,
