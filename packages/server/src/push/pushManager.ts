@@ -1,21 +1,45 @@
 import webpush from 'web-push';
+import https from 'https';
 import fs from 'fs';
 import path from 'path';
 import os from 'os';
+import tls from 'tls';
 
 const KEYS_PATH = path.join(os.homedir(), '.banana', 'vapid.json');
 const SUBS_PATH = path.join(os.homedir(), '.banana', 'push-subscriptions.json');
+
+/**
+ * Build an https.Agent that trusts NODE_EXTRA_CA_CERTS (corporate CAs)
+ * on top of the default system CAs. Node's built-in globalAgent doesn't
+ * always propagate this to libraries that create their own requests.
+ */
+function buildAgent(): https.Agent | undefined {
+  const extraCaPath = process.env.NODE_EXTRA_CA_CERTS;
+  if (!extraCaPath) return undefined;
+  try {
+    const extraCa = fs.readFileSync(extraCaPath, 'utf8');
+    return new https.Agent({
+      ca: [...tls.rootCertificates, extraCa],
+      keepAlive: true,
+    });
+  } catch (e) {
+    console.warn('[push] Failed to load NODE_EXTRA_CA_CERTS:', (e as Error).message);
+    return undefined;
+  }
+}
 
 class PushManager {
   private publicKey = '';
   private privateKey = '';
   private subscriptions: webpush.PushSubscription[] = [];
+  private agent: https.Agent | undefined;
 
   init(): void {
     this.loadOrGenerateKeys();
     this.loadSubscriptions();
+    this.agent = buildAgent();
     webpush.setVapidDetails('mailto:banana@localhost', this.publicKey, this.privateKey);
-    console.log('[push] VAPID ready. Subscriptions loaded:', this.subscriptions.length);
+    console.log(`[push] VAPID ready. Subscriptions: ${this.subscriptions.length}${this.agent ? ', custom CA agent' : ''}`);
   }
 
   getPublicKey(): string {
@@ -34,11 +58,13 @@ class PushManager {
     if (this.subscriptions.length === 0) return;
     const payload = JSON.stringify({ title, body });
     const expired: string[] = [];
+    const opts: webpush.RequestOptions = { timeout: 10_000 };
+    if (this.agent) (opts as Record<string, unknown>).agent = this.agent;
 
     await Promise.allSettled(
       this.subscriptions.map(async (sub) => {
         try {
-          await webpush.sendNotification(sub, payload);
+          await webpush.sendNotification(sub, payload, opts);
         } catch (err: unknown) {
           const e = err as { statusCode?: number };
           if (e.statusCode === 410 || e.statusCode === 404) {

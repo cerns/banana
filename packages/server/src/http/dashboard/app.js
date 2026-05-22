@@ -211,7 +211,11 @@ function tryConnect() {
   ws.addEventListener('message', e => {
     let msg;
     try { msg = JSON.parse(e.data); } catch { return; }
-    if (msg.type === 'DASHBOARD_ACK') { showMain(); setStatus('connected'); loadMachines(); loadSessions(); return; }
+    if (msg.type === 'DASHBOARD_ACK') {
+      showMain(); setStatus('connected'); loadMachines(); loadSessions();
+      if (hubVisible && activeChannelId) selectHubChannel(activeChannelId);
+      return;
+    }
     if (msg.type === 'DASHBOARD_REJECT') { alert('Invalid token'); localStorage.removeItem('banana_token'); showAuth(); return; }
     if (msg.type === 'DASHBOARD_EVENT') handleEvent(msg);
     if (msg.type === 'DASHBOARD_EVENT') handleHubEvent(msg);
@@ -1665,7 +1669,10 @@ document.getElementById('hub-btn').addEventListener('click', () => {
   document.getElementById('main').style.display = hubVisible ? 'none' : 'flex';
   document.getElementById('hub-panel').style.display = hubVisible ? 'flex' : 'none';
   document.getElementById('hub-btn').style.background = hubVisible ? 'var(--accent)' : 'var(--blue)';
-  if (hubVisible) loadHubChannels();
+  if (hubVisible) {
+    loadHubChannels();
+    if (activeChannelId) renderHubMessages();
+  }
 });
 
 async function loadHubChannels() {
@@ -2005,7 +2012,7 @@ function handleHubEvent(msg) {
     const m = msg.message;
     if (!hubMessages[m.channelId]) hubMessages[m.channelId] = [];
     hubMessages[m.channelId].push(m);
-    if (m.channelId === activeChannelId && hubVisible) renderHubMessages();
+    if (m.channelId === activeChannelId) renderHubMessages();
     // Auto-add channel if not known
     if (!hubChannels.find(c => c.id === m.channelId)) {
       loadHubChannels();
@@ -2020,7 +2027,7 @@ function handleHubEvent(msg) {
       if (target) {
         target.dispatches = msg.dispatches;
         if (msg.status) target.status = msg.status;
-        if (msg.channelId === activeChannelId && hubVisible) renderHubMessages();
+        if (msg.channelId === activeChannelId) renderHubMessages();
       }
     }
   }
