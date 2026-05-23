@@ -737,9 +737,20 @@ export function isResponseLine(line: string): boolean {
   if (/^cd\s+'.*&&.*export\s+PATH=/.test(t)) return false;
   // Separator lines (MOTD === blocks)
   if (/^={5,}$/.test(t)) return false;
-  // Claude TUI header (version, model name)
+  // Claude TUI header / welcome box
   if (/^Claude Code v[\d.]+/.test(t)) return false;
   if (/^(Opus|Sonnet|Haiku)\s+[\d.]+/.test(t)) return false;
+  if (/^Welcome back\b/.test(t)) return false;
+  if (/^Run \/init to create/.test(t)) return false;
+  if (/^Tips for getting started/.test(t)) return false;
+  if (/^Recent activity/.test(t)) return false;
+  if (/^No recent activity/.test(t)) return false;
+  // TUI box drawing characters (╭╰╮╯│)
+  if (/^[╭╰╮╯│┌└┐┘├┤┬┴┼]/.test(t)) return false;
+  // Claude Max / org / model info lines
+  if (/^·\s+Claude\s/.test(t)) return false;
+  if (/^\w+['']s\s+Organization/.test(t)) return false;
+  if (/^~\//.test(t)) return false;
   // Token count in footer
   if (/^\d+ tokens?\s*$/.test(t)) return false;
   // latestVersion / auto-update lines
@@ -778,17 +789,27 @@ function sweepMissedLines(
   curLines: string[],
   parser: TmuxOutputParser,
   promptLines: Set<string>,
+  initialLineCounts: Map<string, number>,
 ): void {
   const emittedCounts = new Map<string, number>();
   for (const l of parser.getResponseLines()) {
     emittedCounts.set(l, (emittedCounts.get(l) ?? 0) + 1);
   }
+  // Clone initial baseline counts — lines present before the response started
+  // (MOTD, shell commands, Claude welcome screen, etc.) must be excluded.
+  const baselineCounts = new Map(initialLineCounts);
   let swept = 0;
   for (const t of curLines) {
     if (!t) continue;
     if (!isResponseLine(t)) continue;
     if (isPromptLine(t)) continue;
     if (promptLines.size > 0 && promptLines.has(t)) continue;
+    // Skip lines from the initial baseline (before response started)
+    const bc = baselineCounts.get(t) ?? 0;
+    if (bc > 0) {
+      baselineCounts.set(t, bc - 1);
+      continue;
+    }
     const ec = emittedCounts.get(t) ?? 0;
     if (ec > 0) {
       emittedCounts.set(t, ec - 1);
@@ -900,6 +921,11 @@ export async function streamTmuxOutput(
     prevScreen = stripAnsi(initial);
     prevLines = prevScreen.split('\n').map(l => l.trim());
   } catch { /* start from empty */ }
+
+  // Save initial baseline for sweepMissedLines — lines present before the
+  // response started (MOTD, shell commands, Claude welcome screen) must be
+  // excluded from the final sweep to avoid leaking pre-existing content.
+  const initialLineCounts = buildLineMultiset(prevLines);
 
   // Build a multiset (line → count) from a line array for diff comparison.
   function buildLineMultiset(lines: string[]): Map<string, number> {
@@ -1061,7 +1087,7 @@ export async function streamTmuxOutput(
         /^\d+ tokens?\s*$/.test(l)
       );
       if (hasContent && hasPrompt && hasTuiFooter && !hasSpinner && !newContentThisPoll && !screenChanged) {
-        sweepMissedLines(curLines, parser, promptLines);
+        sweepMissedLines(curLines, parser, promptLines, initialLineCounts);
         console.log('[tmux-runner] Prompt detected — response complete');
         parser.flush();
         return { completed: true };
@@ -1077,7 +1103,7 @@ export async function streamTmuxOutput(
 
       // Idle timeout — no new content for tmuxIdleCompletionMs → done
       if (hasContent && Date.now() - lastChangeAt > config.tmuxIdleCompletionMs) {
-        sweepMissedLines(curLines, parser, promptLines);
+        sweepMissedLines(curLines, parser, promptLines, initialLineCounts);
         console.log(`[tmux-runner] Idle timeout (${config.tmuxIdleCompletionMs}ms) — response complete`);
         onChunk({ type: 'stderr', text: `[banana-tmux] Idle timeout — response complete\n` });
         parser.flush();
