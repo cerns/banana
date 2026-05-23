@@ -81,11 +81,14 @@ function showMain() {
       renderOutput();
     }
   }
-  setupPush();
+  setupNotifications();
 }
 
 // ── Notifications ─────────────────────────────────────────────────────────────
+let notifyMode = localStorage.getItem('banana_notify_mode') || 'local';
+
 function notify(title, body) {
+  // Always show in-app toast
   const toast = document.createElement('div');
   toast.className = 'toast';
   toast.innerHTML = `<strong>${esc(title)}</strong><div class="toast-body">${esc(body)}</div>`;
@@ -95,6 +98,11 @@ function notify(title, body) {
     toast.classList.remove('toast-show');
     setTimeout(() => toast.remove(), 300);
   }, 4000);
+
+  // Local browser notification (no external services)
+  if (notifyMode === 'local' && typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+    try { new Notification(title, { body, icon: '🍌' }); } catch {}
+  }
 }
 
 function urlBase64ToUint8Array(base64String) {
@@ -116,15 +124,18 @@ function hidePushBanner() {
   pushBanner.style.display = 'none';
 }
 
-async function setupPush() {
-  console.log('[push] setupPush — serviceWorker:', 'serviceWorker' in navigator, '— PushManager:', 'PushManager' in window, '— Notification:', typeof Notification !== 'undefined' ? Notification.permission : 'unavailable');
+async function setupNotifications() {
+  console.log('[notify] mode:', notifyMode);
+  hidePushBanner();
 
-  if (!('serviceWorker' in navigator)) { console.warn('[push] serviceWorker not supported'); return; }
-  if (!('PushManager' in window))      { console.warn('[push] PushManager not supported'); return; }
-  if (typeof Notification === 'undefined') { console.warn('[push] Notification API not available'); return; }
+  if (notifyMode === 'off') return;
+
+  if (typeof Notification === 'undefined') {
+    console.warn('[notify] Notification API not available');
+    return;
+  }
 
   const permission = Notification.permission;
-  console.log('[push] Current permission:', permission);
 
   if (permission === 'denied') {
     showPushBanner(
@@ -136,16 +147,42 @@ async function setupPush() {
   }
 
   if (permission === 'default') {
-    // Must wait for a user gesture before calling requestPermission in Firefox
     showPushBanner(
-      `<span>🔔 Enable push notifications to get alerted when Claude finishes.</span>
-       <button class="btn btn-sm">Enable notifications</button>`,
-      () => doSubscribe()
+      `<span>🔔 Enable notifications to get alerted when Claude finishes.</span>
+       <button class="btn btn-sm">Enable</button>`,
+      () => requestNotificationPermission()
     );
     return;
   }
 
-  // permission === 'granted' — subscribe silently, no banner needed
+  // permission === 'granted'
+  if (notifyMode === 'push') {
+    await setupWebPush();
+  }
+}
+
+async function requestNotificationPermission() {
+  hidePushBanner();
+  try {
+    const result = await Notification.requestPermission();
+    if (result !== 'granted') {
+      showPushBanner(
+        `<span>🔕 Notifications not granted (${result}). Click the 🔒 icon → Notifications → Allow, then reload.</span>`,
+        null
+      );
+      return;
+    }
+    if (notifyMode === 'push') await setupWebPush();
+  } catch (e) {
+    console.error('[notify] Permission request failed:', e);
+  }
+}
+
+async function setupWebPush() {
+  if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
+    console.warn('[push] Service worker / PushManager not supported — falling back to local');
+    return;
+  }
   await doSubscribe();
 }
 
@@ -1489,6 +1526,7 @@ document.getElementById('settings-btn').addEventListener('click', async () => {
     document.getElementById('set-hub-talk-rounds').value = settings.hubMaxTalkRounds ?? 10;
     document.getElementById('set-hub-chain-depth').value = settings.hubMaxChainDepth ?? 5;
     document.getElementById('set-ssh-idle').value = settings.sshIdleTimeoutMs ?? 1800000;
+    document.getElementById('set-notify-mode').value = notifyMode;
     document.getElementById('set-status').textContent = '';
   } catch (e) {
     document.getElementById('set-status').textContent = 'Failed to load settings';
@@ -1508,6 +1546,13 @@ document.getElementById('settings-btn').addEventListener('click', async () => {
 });
 
 document.getElementById('set-save').addEventListener('click', async () => {
+  // Save client-only notification preference
+  const newMode = document.getElementById('set-notify-mode').value;
+  if (newMode !== notifyMode) {
+    notifyMode = newMode;
+    localStorage.setItem('banana_notify_mode', notifyMode);
+    setupNotifications();
+  }
   const body = {
     compactTokenThreshold: Number(document.getElementById('set-compact-tokens').value),
     hubMaxConcurrentJobs: Number(document.getElementById('set-hub-concurrent').value),

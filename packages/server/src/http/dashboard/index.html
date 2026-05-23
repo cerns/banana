@@ -416,6 +416,13 @@
         <div class="form-row"><label>Hub max talk rounds</label><input id="set-hub-talk-rounds" type="number" min="1" step="1" autocomplete="off" data-1p-ignore /></div>
         <div class="form-row"><label>Hub max chain depth</label><input id="set-hub-chain-depth" type="number" min="1" step="1" autocomplete="off" data-1p-ignore /></div>
         <div class="form-row"><label>SSH idle timeout (ms, 0 = disabled)</label><input id="set-ssh-idle" type="number" min="0" step="60000" autocomplete="off" data-1p-ignore /></div>
+        <div class="form-row"><label>Notifications</label>
+          <select id="set-notify-mode">
+            <option value="local">Local (browser only)</option>
+            <option value="push">Web Push (works when tab closed)</option>
+            <option value="off">Off (toast only)</option>
+          </select>
+        </div>
         <div style="display:flex;gap:8px;margin-top:12px">
           <button id="set-save" class="btn">Save</button>
           <button class="btn modal-close" data-close="settings-modal" style="background:var(--surface);color:var(--text);border:1px solid var(--border)">Cancel</button>
