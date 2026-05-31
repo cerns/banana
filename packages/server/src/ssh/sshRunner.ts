@@ -807,7 +807,7 @@ export async function runClaudeOverSsh(
   // This is critical because PTY mode sends SIGHUP on SSH disconnections,
   // which would otherwise kill claude mid-tool-call during transient
   // network blips. SIGTERM (used by abort) still works normally.
-  const pathPrefix = "trap '' HUP; export PATH=\"$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$PATH\"";
+  const pathPrefix = "trap '' HUP; export PATH=\"$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.asdf/shims:$HOME/.asdf/bin:$PATH\"";
   const cmdParts = [pathPrefix];
   if (workdir) cmdParts.push(`cd ${shellEscape(workdir)}`);
   cmdParts.push(`${claudeBin} ${args.join(' ')} < ${shellEscape(tmpFile)}`);

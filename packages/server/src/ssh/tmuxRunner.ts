@@ -360,7 +360,7 @@ export class TmuxOutputParser {
 
 // ── Exec helpers ────────────────────────────────────────────────────────────
 
-const PATH_PREFIX = 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$PATH"';
+const PATH_PREFIX = 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.asdf/shims:$HOME/.asdf/bin:$PATH"';
 
 /** Execute a command — locally or over SSH depending on machine type.
  *  When `conn` is provided (and not local), reuses that SSH connection instead of opening a new one.
@@ -616,7 +616,7 @@ export async function ensureTmuxSession(
           ready = true;
           break;
         }
-        if (/error|Error|fatal|FATAL/i.test(cleaned) && /\$\s*$/m.test(cleaned)) {
+        if ((/error|Error|fatal|FATAL/i.test(cleaned) || /No executable.*found/i.test(cleaned) || /command not found/i.test(cleaned)) && /\$\s*$/m.test(cleaned)) {
           throw new Error(`Claude failed to start: ${cleaned.slice(-500)}`);
         }
       } catch (e) {
@@ -745,8 +745,9 @@ export function isResponseLine(line: string): boolean {
   if (/^Tips for getting started/.test(t)) return false;
   if (/^Recent activity/.test(t)) return false;
   if (/^No recent activity/.test(t)) return false;
-  // TUI box drawing characters (╭╰╮╯│)
-  if (/^[╭╰╮╯│┌└┐┘├┤┬┴┼]/.test(t)) return false;
+  // TUI box drawing characters (welcome box, separator frames)
+  // NOTE: └ (U+2514) intentionally EXCLUDED — it's used as a tool result prefix by some Claude versions
+  if (/^[╭╰╮╯│┌┐┘├┤┬┴┼]/.test(t)) return false;
   // Claude Max / org / model info lines
   if (/^·\s+Claude\s/.test(t)) return false;
   if (/^\w+['']s\s+Organization/.test(t)) return false;
@@ -780,46 +781,55 @@ function isPromptLine(line: string): boolean {
 }
 
 /**
- * Final sweep before completion: the multiset diff can miss content lines when
- * old lines scroll off the top of the visible pane and cancel out new lines
- * with identical trimmed text. Reconcile the current screen against all lines
- * the parser has already emitted and feed any un-emitted response lines.
+ * Final sweep before completion: recover content lines that the per-poll
+ * multiset diff missed. The diff drops lines whose text matches something
+ * already on screen (e.g. a [CHANNEL_REPLY] summary repeating tool output).
+ *
+ * Strategy: POSITIONAL tail sweep. Find the last emitted line on the current
+ * screen, then feed everything after it (excluding TUI chrome / prompts) to
+ * the parser. This is order-aware and avoids the multiset cancellation bug.
  */
 function sweepMissedLines(
   curLines: string[],
   parser: TmuxOutputParser,
   promptLines: Set<string>,
-  initialLineCounts: Map<string, number>,
+  _initialLineCounts: Map<string, number>,
 ): void {
-  const emittedCounts = new Map<string, number>();
-  for (const l of parser.getResponseLines()) {
-    emittedCounts.set(l, (emittedCounts.get(l) ?? 0) + 1);
+  const emitted = parser.getResponseLines();
+  if (emitted.length === 0) return;
+
+  // Find the position of the last emitted line on the current screen.
+  // Search bottom-up — the most recent content is near the bottom.
+  const lastEmitted = emitted[emitted.length - 1];
+  let anchorPos = -1;
+  for (let i = curLines.length - 1; i >= 0; i--) {
+    if (curLines[i] === lastEmitted) {
+      anchorPos = i;
+      break;
+    }
   }
-  // Clone initial baseline counts — lines present before the response started
-  // (MOTD, shell commands, Claude welcome screen, etc.) must be excluded.
-  const baselineCounts = new Map(initialLineCounts);
+
+  if (anchorPos === -1) {
+    // Last emitted line scrolled off — can't do positional sweep.
+    // Fall back to tail: find the FIRST response-like line from the bottom
+    // that is NOT a prompt/footer, and sweep from there.
+    return;
+  }
+
+  // Feed all response-like lines AFTER the anchor position
   let swept = 0;
-  for (const t of curLines) {
+  for (let i = anchorPos + 1; i < curLines.length; i++) {
+    const t = curLines[i];
     if (!t) continue;
     if (!isResponseLine(t)) continue;
     if (isPromptLine(t)) continue;
     if (promptLines.size > 0 && promptLines.has(t)) continue;
-    // Skip lines from the initial baseline (before response started)
-    const bc = baselineCounts.get(t) ?? 0;
-    if (bc > 0) {
-      baselineCounts.set(t, bc - 1);
-      continue;
-    }
-    const ec = emittedCounts.get(t) ?? 0;
-    if (ec > 0) {
-      emittedCounts.set(t, ec - 1);
-    } else {
-      parser.feed(t + '\n');
-      swept++;
-    }
+    parser.feed(t + '\n');
+    swept++;
   }
+
   if (swept > 0) {
-    console.log(`[tmux-runner] Final sweep recovered ${swept} missed line(s)`);
+    console.log(`[tmux-runner] Tail sweep recovered ${swept} missed line(s) after position ${anchorPos}`);
   }
 }
 

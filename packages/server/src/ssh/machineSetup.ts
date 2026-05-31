@@ -21,7 +21,7 @@ export interface SetupStep {
 
 export type SetupStepCallback = (step: SetupStep) => void;
 
-const PATH_PREFIX = 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$PATH"';
+const PATH_PREFIX = 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.asdf/shims:$HOME/.asdf/bin:$PATH"';
 
 function execCommand(conn: Client, command: string): Promise<{ stdout: string; stderr: string; code: number }> {
   return new Promise((resolve, reject) => {

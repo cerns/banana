@@ -17,7 +17,7 @@ export interface DetectionResult {
   systemInfo: SystemInfo;
 }
 
-const PATH_PREFIX = 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$PATH"';
+const PATH_PREFIX = 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.asdf/shims:$HOME/.asdf/bin:$PATH"';
 
 const DETECT_COMMAND = [
   PATH_PREFIX,
