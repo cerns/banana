@@ -70,6 +70,9 @@ export const config = {
   tmuxIdleCompletionMs: parseInt(process.env.BANANA_TMUX_IDLE_COMPLETION ?? '30000', 10),
   // Auto-approve permission prompts (y/n) detected in TUI output.
   tmuxAutoApprovePermissions: process.env.BANANA_TMUX_AUTO_APPROVE !== '0',
+  // Delay (ms) after tmux new-session before sending the claude command.
+  // Gives the shell time to initialize (oh-my-zsh, MOTD, etc.).
+  tmuxStartupDelayMs: parseInt(process.env.BANANA_TMUX_STARTUP_DELAY ?? '1500', 10),
 };
 
 if (!config.token) {

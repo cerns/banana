@@ -549,11 +549,12 @@ export async function ensureTmuxSession(
       await tmuxExec(machine, `rm -f ${shellEscape(logPath)}`, signal, 10_000, conn ?? undefined);
     } catch { /* ignore */ }
 
-    // Create tmux session in detached mode
-    const cdPart = workdir ? `cd ${shellEscape(workdir)} && ` : '';
+    // Create tmux session in detached mode — use -c to set the starting directory
+    // so the shell initializes in the correct workdir (avoids race with send-keys cd).
+    const startDir = workdir || '$HOME';
     await tmuxExec(
       machine,
-      `tmux new-session -d -s ${shellEscape(tmuxName)} -x 200 -y 200`,
+      `tmux new-session -d -s ${shellEscape(tmuxName)} -x 200 -y 200 -c ${shellEscape(startDir)}`,
       signal,
       15_000,
       conn ?? undefined,
@@ -582,7 +583,15 @@ export async function ensureTmuxSession(
     if (suffix === '-hub') claudeArgs.push('--bare');
     if (model) claudeArgs.push('--model', shellEscape(model));
 
+    // cd is redundant with -c but kept as safety (in case shell init changes cwd)
+    const cdPart = workdir ? `cd ${shellEscape(workdir)} && ` : '';
     const fullCmd = `${cdPart}${PATH_PREFIX} && ${claudeBin} ${claudeArgs.join(' ')}`;
+
+    // Wait for shell to initialize (oh-my-zsh, MOTD, etc.) before sending command.
+    // Without this, send-keys input can be swallowed by shell startup.
+    // Uses tmuxStartupDelayMs (default 1500ms, 0 in tests via config override).
+    const startupDelay = config.tmuxStartupDelayMs ?? 1500;
+    if (startupDelay > 0) await new Promise(r => setTimeout(r, startupDelay));
 
     // Send the command to tmux
     await tmuxSendKeys(machine, tmuxName, `${shellEscape(fullCmd)} Enter`, signal, conn ?? undefined);

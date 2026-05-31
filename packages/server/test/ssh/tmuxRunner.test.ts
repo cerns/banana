@@ -12,6 +12,7 @@ const mockConfig = {
   tmuxStartupTimeoutMs: 5_000, // short for tests
   tmuxIdleCompletionMs: 2_000,
   tmuxAutoApprovePermissions: true,
+  tmuxStartupDelayMs: 0, // no delay in tests
 };
 vi.mock('../../src/config.js', () => ({
   config: mockConfig,
