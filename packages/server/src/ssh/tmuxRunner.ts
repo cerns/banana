@@ -54,7 +54,11 @@ export function stripAnsi(text: string): string {
     // Carriage returns (TUI redraws)
     .replace(/\r/g, '')
     // Bell
-    .replace(/\x07/g, '');
+    .replace(/\x07/g, '')
+    // TUI right-side panel border: │ followed by dots/spaces to end of line.
+    // Claude TUI renders a split layout on wide terminals (>~130 cols).
+    // The right panel shows tips/status filled with middle dots (·).
+    .replace(/\s*│[·\s]{10,}$/gm, '');
 }
 
 // ── Permission pattern registry ──────────────────────────────────────────────
@@ -510,7 +514,7 @@ export async function ensureTmuxSession(
     try {
       await tmuxExec(machine, `tmux has-session -t ${shellEscape(existing.tmuxName)} 2>/dev/null`, signal, 10_000);
       // Resize existing session to current desired size (old sessions may have smaller panes)
-      await tmuxExec(machine, `tmux resize-window -t ${shellEscape(existing.tmuxName)} -x 200 -y 200 2>/dev/null || true`, signal, 10_000).catch(() => {});
+      await tmuxExec(machine, `tmux resize-window -t ${shellEscape(existing.tmuxName)} -x 120 -y 200 2>/dev/null || true`, signal, 10_000).catch(() => {});
       return existing;
     } catch {
       // Session died — clean up and recreate
@@ -554,7 +558,7 @@ export async function ensureTmuxSession(
     const startDir = workdir || '$HOME';
     await tmuxExec(
       machine,
-      `tmux new-session -d -s ${shellEscape(tmuxName)} -x 200 -y 200 -c ${shellEscape(startDir)}`,
+      `tmux new-session -d -s ${shellEscape(tmuxName)} -x 120 -y 200 -c ${shellEscape(startDir)}`,
       signal,
       15_000,
       conn ?? undefined,
@@ -724,7 +728,7 @@ export function isResponseLine(line: string): boolean {
   if (!t) return false;
   // Horizontal rules — TUI separators span the full terminal width (200 cols).
   // Table borders are typically much shorter, so only filter very long runs.
-  if (/^[─━═]{120,}$/.test(t)) return false;
+  if (/^[─━═]{80,}$/.test(t)) return false;
   // Claude logo
   if (/^[▐▛▝▘]/.test(t)) return false;
   // Status bar / footer

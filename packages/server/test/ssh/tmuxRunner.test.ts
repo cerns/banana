@@ -176,6 +176,16 @@ describe('tmuxRunner', () => {
     it('should handle empty string', () => {
       expect(tmuxRunner.stripAnsi('')).toBe('');
     });
+
+    it('should strip TUI right-side panel border', () => {
+      const dots = '·'.repeat(50);
+      // Line with content + border + dots
+      expect(tmuxRunner.stripAnsi(`Hello world                    │${dots}`)).toBe('Hello world');
+      // Line with content + spaces + border + mixed dots/spaces
+      expect(tmuxRunner.stripAnsi(`⏺ some text          │${'· '.repeat(20)}`)).toBe('⏺ some text');
+      // Short │ usage (table border) should NOT be stripped
+      expect(tmuxRunner.stripAnsi('col1 │ col2')).toBe('col1 │ col2');
+    });
   });
 
   // ── TmuxOutputParser ──────────────────────────────────────────────────────
@@ -1565,12 +1575,13 @@ describe('tmuxRunner', () => {
     });
 
     it('should reject full-width TUI horizontal rules but allow table borders', () => {
-      // Full-width TUI separators (120+ chars) → rejected
+      // Full-width TUI separators (80+ chars) → rejected
       expect(tmuxRunner.isResponseLine('─'.repeat(200))).toBe(false);
-      expect(tmuxRunner.isResponseLine('━'.repeat(150))).toBe(false);
+      expect(tmuxRunner.isResponseLine('━'.repeat(120))).toBe(false);
+      expect(tmuxRunner.isResponseLine('━'.repeat(80))).toBe(false);
       // Short table borders → allowed as content
       expect(tmuxRunner.isResponseLine('─'.repeat(40))).toBe(true);
-      expect(tmuxRunner.isResponseLine('━'.repeat(80))).toBe(true);
+      expect(tmuxRunner.isResponseLine('━'.repeat(79))).toBe(true);
     });
 
     it('should reject Claude logo lines', () => {
