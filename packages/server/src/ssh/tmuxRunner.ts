@@ -544,6 +544,39 @@ async function writeTempFile(
   };
 }
 
+// ── Claude session ID detection ─────────────────────────────────────────────
+
+/**
+ * Detect the claude session ID by finding the most recently modified .jsonl
+ * file in ~/.claude/projects/{path-hash}/. Claude Code stores conversation
+ * sessions there as {uuid}.jsonl. We pick the newest one for the workdir.
+ */
+async function detectClaudeSessionId(
+  machine: MachineRecord,
+  workdir: string,
+  signal?: AbortSignal,
+  conn?: TunneledConnection,
+): Promise<string | undefined> {
+  if (!workdir) return undefined;
+  try {
+    // Claude encodes the project path: /Users/foo/bar → -Users-foo-bar
+    const pathHash = workdir.replace(/\//g, '-');
+    const projectDir = `~/.claude/projects/${pathHash}`;
+    // Find most recent .jsonl file (the active session)
+    const cmd = `ls -t ${projectDir}/*.jsonl 2>/dev/null | head -1`;
+    const result = await tmuxExec(machine, cmd, signal, 5_000, conn ?? undefined);
+    const file = result.trim();
+    if (!file) return undefined;
+    // Extract UUID from filename: /home/user/.claude/projects/-path-hash/abc-123.jsonl → abc-123
+    const match = file.match(/([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\.jsonl$/i);
+    if (match) {
+      console.log(`[tmux-runner] Detected claude session ID: ${match[1].slice(0, 8)}`);
+      return match[1];
+    }
+  } catch { /* non-critical */ }
+  return undefined;
+}
+
 // ── Core functions ─────────────────────────────────────────────────────────
 
 /**
@@ -557,6 +590,7 @@ export async function ensureTmuxSession(
   model?: string,
   signal?: AbortSignal,
   suffix?: string,
+  claudeSessionId?: string,
 ): Promise<TmuxSession> {
   const key = tmuxKey(sessionId, suffix);
   const existing = tmuxSessions.get(key);
@@ -696,6 +730,8 @@ export async function ensureTmuxSession(
 
     // Build the claude command — interactive mode (no --print)
     const claudeArgs = ['--verbose'];
+    // Resume existing claude session if we have a session ID
+    if (claudeSessionId) claudeArgs.push('--resume', shellEscape(claudeSessionId));
     // B2: Hub tmux sessions run with --bare (skip CLAUDE.md, hooks, skills, MCP)
     if (suffix === '-hub') claudeArgs.push('--bare');
     if (model) claudeArgs.push('--model', shellEscape(model));
@@ -1375,6 +1411,7 @@ export async function runClaudeViaTmuxForSession(
   signal?: AbortSignal,
   model?: string,
   suffix?: string,
+  claudeSessionId?: string,
 ): Promise<SshRunResult> {
   if (signal?.aborted) throw new Error('Aborted');
   const startedAt = Date.now();
@@ -1383,8 +1420,8 @@ export async function runClaudeViaTmuxForSession(
   const sfx = suffix ?? '';
   console.log(`[tmux-runner] Session ${sid8}${sfx} — prompt ${prompt.length} chars`);
 
-  // Ensure tmux session is running
-  const session = await ensureTmuxSession(machine, sessionId, workdir, model, signal, suffix);
+  // Ensure tmux session is running (pass claudeSessionId for --resume on first creation)
+  const session = await ensureTmuxSession(machine, sessionId, workdir, model, signal, suffix, claudeSessionId);
 
   // Send the prompt
   await sendPromptViaTmux(machine, session, prompt, signal);
@@ -1397,19 +1434,25 @@ export async function runClaudeViaTmuxForSession(
   const durationMs = Date.now() - startedAt;
   console.log(`[tmux-runner] Session ${sid8}${sfx} — done in ${durationMs}ms (completed=${completed})`);
 
-  // Truncate log if too large (keep last 1MB) — reuse 1 connection for stat + truncate
+  // Post-job housekeeping — reuse a single SSH connection for all operations
+  let detectedSessionId: string | undefined;
   try {
     if (!isLocalMachine(machine)) {
-      const logConn = await connectWithRetry(machine, signal);
+      const postConn = await connectWithRetry(machine, signal);
       try {
-        const sizeOutput = await tmuxExec(machine, `stat -c%s ${shellEscape(session.logPath)} 2>/dev/null || echo 0`, signal, 5_000, logConn);
+        // Truncate log if too large (keep last 1MB)
+        const sizeOutput = await tmuxExec(machine, `stat -c%s ${shellEscape(session.logPath)} 2>/dev/null || echo 0`, signal, 5_000, postConn);
         const size = parseInt(sizeOutput.trim(), 10);
         if (size > 1_048_576) {
-          await tmuxExec(machine, `tail -c 1048576 ${shellEscape(session.logPath)} > ${shellEscape(session.logPath)}.tmp && mv ${shellEscape(session.logPath)}.tmp ${shellEscape(session.logPath)}`, signal, 10_000, logConn);
+          await tmuxExec(machine, `tail -c 1048576 ${shellEscape(session.logPath)} > ${shellEscape(session.logPath)}.tmp && mv ${shellEscape(session.logPath)}.tmp ${shellEscape(session.logPath)}`, signal, 10_000, postConn);
           console.log(`[tmux-runner] Truncated log to 1MB (was ${(size / 1_048_576).toFixed(1)}MB)`);
         }
+        // Extract claudeSessionId from most recent session file
+        if (!claudeSessionId) {
+          detectedSessionId = await detectClaudeSessionId(machine, workdir, signal, postConn);
+        }
       } finally {
-        logConn.cleanup();
+        postConn.cleanup();
       }
     } else {
       const sizeOutput = await tmuxExec(machine, `stat -c%s ${shellEscape(session.logPath)} 2>/dev/null || echo 0`, signal, 5_000);
@@ -1418,14 +1461,16 @@ export async function runClaudeViaTmuxForSession(
         await tmuxExec(machine, `tail -c 1048576 ${shellEscape(session.logPath)} > ${shellEscape(session.logPath)}.tmp && mv ${shellEscape(session.logPath)}.tmp ${shellEscape(session.logPath)}`, signal, 10_000);
         console.log(`[tmux-runner] Truncated log to 1MB (was ${(size / 1_048_576).toFixed(1)}MB)`);
       }
+      if (!claudeSessionId) {
+        detectedSessionId = await detectClaudeSessionId(machine, workdir, signal);
+      }
     }
   } catch { /* non-critical */ }
 
   return {
     exitCode: 0,
     durationMs,
-    // No claudeSessionId — tmux session IS the persistent session
-    // No inputTokens — can't extract from TUI output
+    claudeSessionId: claudeSessionId ?? detectedSessionId,
   };
 }
 

@@ -235,11 +235,17 @@ async function runJob(sessionId: string, jobId: string, prompt: string, modelOve
         controller.signal,
         modelOverride || session.model,
         tmuxSuffix(channel),
+        resumeId,
       );
 
       sessionStore.finishJob(sessionId, jobId, result.exitCode, result.durationMs);
 
-      console.log(`[remote-executor] Session ${sid8} job ${jid8} [tmux] done — ${fmtDuration(result.durationMs)}, output ${fmtBytes(outputBytes)}`);
+      // Persist claudeSessionId from tmux detection so --resume works too
+      if (result.claudeSessionId) {
+        updateClaudeSessionId(sessionId, result.claudeSessionId);
+      }
+
+      console.log(`[remote-executor] Session ${sid8} job ${jid8} [tmux] done — ${fmtDuration(result.durationMs)}, output ${fmtBytes(outputBytes)}${result.claudeSessionId ? ` session=${result.claudeSessionId.slice(0, 8)}` : ''}`);
 
       broadcastToDashboards({
         type: 'DASHBOARD_EVENT',
