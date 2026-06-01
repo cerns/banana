@@ -14,7 +14,8 @@ import { parseReplyToChannel, stripReplyToChannel, extractArtifactActions, parse
 import { broadcastToDashboards } from './ws/dashboardBroadcast.js';
 import { jumpHostStore } from './ssh/jumpHostStore.js';
 import { closeJumpTunnelCache } from './ssh/sshRunner.js';
-import { closeTmuxConnections } from './ssh/tmuxRunner.js';
+import { closeTmuxConnections, reconcileSession } from './ssh/tmuxRunner.js';
+import { updateClaudeSessionId } from './sessions/sessionManager.js';
 import { abortRemoteJob, getActiveSessionIds } from './ssh/remoteSessionExecutor.js';
 
 sessionStore.load();
@@ -166,12 +167,56 @@ httpServer.listen(config.port, () => {
     console.log(`[banana] Recovering queued hub dispatches for ${pending} session(s)`);
     drainGlobalQueue();
   }
+
+  // Reconcile tmux sessions — ensure every persistent-mode session has both
+  // a running tmux session and a claudeSessionId. Runs in background.
+  reconcileAllSessions().catch(e => console.warn('[banana] Session reconciliation error:', e));
 });
 
 httpServer.on('error', (err) => {
   console.error('[banana] Server error:', err);
   process.exit(1);
 });
+
+/**
+ * Reconcile all persistent-mode sessions on startup.
+ * Ensures each has a running tmux session + claudeSessionId.
+ */
+async function reconcileAllSessions(): Promise<void> {
+  const allSessions = sessionStore.getAll();
+  const toReconcile = allSessions.filter(s => {
+    if (!s.machineId) return false;
+    const m = machineStore.get(s.machineId);
+    return m?.persistentMode;
+  });
+  if (toReconcile.length === 0) return;
+  console.log(`[banana] Reconciling ${toReconcile.length} persistent session(s)...`);
+
+  // Group by machine to avoid hammering the same host in parallel
+  const byMachine = new Map<string, typeof toReconcile>();
+  for (const s of toReconcile) {
+    const list = byMachine.get(s.machineId!) ?? [];
+    list.push(s);
+    byMachine.set(s.machineId!, list);
+  }
+
+  for (const [machineId, sessions] of byMachine) {
+    const machine = machineStore.get(machineId);
+    if (!machine) continue;
+    for (const s of sessions) {
+      try {
+        const workdir = s.remoteWorkdir ?? machine.defaultWorkdir ?? '';
+        const detected = await reconcileSession(machine, s.sessionId, workdir, s.model, s.claudeSessionId);
+        if (detected) {
+          updateClaudeSessionId(s.sessionId, detected);
+        }
+      } catch (e) {
+        console.warn(`[banana] Reconcile failed for ${s.sessionId.slice(0, 8)}: ${(e as Error).message}`);
+      }
+    }
+  }
+  console.log(`[banana] Reconciliation complete`);
+}
 
 // ── Graceful shutdown ────────────────────────────────────────────────────────
 

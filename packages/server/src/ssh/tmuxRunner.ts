@@ -551,7 +551,7 @@ async function writeTempFile(
  * file in ~/.claude/projects/{path-hash}/. Claude Code stores conversation
  * sessions there as {uuid}.jsonl. We pick the newest one for the workdir.
  */
-async function detectClaudeSessionId(
+export async function detectClaudeSessionId(
   machine: MachineRecord,
   workdir: string,
   signal?: AbortSignal,
@@ -1557,4 +1557,45 @@ export function closeTmuxConnections(): void {
     try { session.tailConn?.cleanup(); } catch { /* ignore */ }
     session.tailConn = null;
   }
+}
+
+/**
+ * Reconcile a single session — ensure it has both a tmux session (if persistent)
+ * and a claudeSessionId. Called on startup for all sessions and when a new
+ * session is created.
+ *
+ * Returns the detected claudeSessionId (if newly found), or undefined.
+ */
+export async function reconcileSession(
+  machine: MachineRecord,
+  sessionId: string,
+  workdir: string,
+  model?: string,
+  claudeSessionId?: string,
+): Promise<string | undefined> {
+  if (!machine.persistentMode) return undefined;
+
+  const sid8 = sessionId.slice(0, 8);
+
+  // 1. Ensure tmux session exists (creates or adopts, passes --resume if claudeSessionId)
+  try {
+    await ensureTmuxSession(machine, sessionId, workdir, model, undefined, undefined, claudeSessionId);
+    console.log(`[tmux-runner] Reconciled tmux session for ${sid8}`);
+  } catch (e) {
+    console.warn(`[tmux-runner] Failed to reconcile tmux for ${sid8}: ${(e as Error).message}`);
+    return undefined;
+  }
+
+  // 2. Detect claudeSessionId if missing
+  if (!claudeSessionId) {
+    try {
+      const detected = await detectClaudeSessionId(machine, workdir);
+      if (detected) {
+        console.log(`[tmux-runner] Reconciled claudeSessionId for ${sid8}: ${detected.slice(0, 8)}`);
+        return detected;
+      }
+    } catch { /* non-critical */ }
+  }
+
+  return undefined;
 }

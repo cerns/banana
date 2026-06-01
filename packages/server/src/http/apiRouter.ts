@@ -2,7 +2,8 @@ import type { IncomingMessage, ServerResponse } from 'http';
 import { config } from '../config.js';
 import { sessionStore } from '../sessions/sessionStore.js';
 import { machineStore } from '../machines/machineStore.js';
-import { createJob, resolveSessionId, createRemoteSession, updateSessionName } from '../sessions/sessionManager.js';
+import { createJob, resolveSessionId, createRemoteSession, updateSessionName, updateClaudeSessionId } from '../sessions/sessionManager.js';
+import { reconcileSession } from '../ssh/tmuxRunner.js';
 import { hubStore } from '../hub/hubStore.js';
 import { taskStore } from '../hub/taskStore.js';
 import type { TaskStatus, TaskPriority, UpdateTaskFields } from '../hub/taskStore.js';
@@ -348,6 +349,14 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
       },
     );
     json(res, 201, session);
+
+    // Fire-and-forget: reconcile tmux + claudeSessionId for persistent machines
+    if (machine.persistentMode) {
+      const workdir = body.workdir ?? machine.defaultWorkdir ?? '';
+      reconcileSession(machine, session.sessionId, workdir, body.model, session.claudeSessionId)
+        .then(detected => { if (detected) updateClaudeSessionId(session.sessionId, detected); })
+        .catch(e => console.warn(`[api] Reconcile failed for new session: ${(e as Error).message}`));
+    }
     return true;
   }
 
