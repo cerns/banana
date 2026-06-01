@@ -672,8 +672,12 @@ export async function sendPromptViaTmux(
   prompt: string,
   signal?: AbortSignal,
 ): Promise<void> {
+  // Resize pane to maximize capture area before each prompt
+  const resizeCmd = `tmux resize-window -t ${shellEscape(session.tmuxName)} -x 750 -y 200 2>/dev/null || true`;
+
   if (isLocalMachine(machine)) {
     // Local path — no SSH connection reuse needed
+    try { await tmuxExec(machine, resizeCmd, signal, 10_000); } catch { /* ignore */ }
     try {
       await tmuxExec(machine, `truncate -s 0 ${shellEscape(session.logPath)}`, signal, 10_000);
     } catch { /* ignore */ }
@@ -692,6 +696,8 @@ export async function sendPromptViaTmux(
   // Remote path — reuse a single SSH connection for all operations
   const conn = await connectWithRetry(machine, signal);
   try {
+    // Resize pane to maximize capture area
+    try { await tmuxExec(machine, resizeCmd, signal, 10_000, conn); } catch { /* ignore */ }
     // Truncate the log file so we only capture output from this prompt
     try {
       await tmuxExec(machine, `truncate -s 0 ${shellEscape(session.logPath)}`, signal, 10_000, conn);
