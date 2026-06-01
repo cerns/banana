@@ -450,15 +450,17 @@ function renderSessionItem(s) {
   const machine = machines.find(m => m.id === s.machineId);
   const isPersistent = !!machine?.persistentMode;
 
-  // Build tooltip commands
+  // Build tooltip commands — show both resume + tmux attach when available
   let tooltipHtml = '';
+  const isLocal = !machine?.ip || machine?.ip === 'localhost' || machine?.ip === '127.0.0.1';
+  const sshPrefix = isLocal ? '' : `ssh ${machine?.username || 'root'}@${machine?.ip} -t `;
   if (s.claudeSessionId) {
-    const resumeCmd = `claude --resume ${s.claudeSessionId}`;
+    const resumeCmd = `${sshPrefix}claude --resume ${s.claudeSessionId}`;
     tooltipHtml += `<div class="session-tooltip-label">Resume session</div>
       <div class="session-tooltip-cmd"><code>${esc(resumeCmd)}</code><button class="session-tooltip-copy" data-copy="${esc(resumeCmd)}" title="Copy">⧉</button></div>`;
   }
   if (isPersistent) {
-    const tmuxCmd = `tmux attach -t banana-${sid8}`;
+    const tmuxCmd = `${sshPrefix}tmux attach -t banana-${sid8}`;
     tooltipHtml += `<div class="session-tooltip-label">Attach tmux</div>
       <div class="session-tooltip-cmd"><code>${esc(tmuxCmd)}</code><button class="session-tooltip-copy" data-copy="${esc(tmuxCmd)}" title="Copy">⧉</button></div>`;
   }
