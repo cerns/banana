@@ -39,6 +39,57 @@ function tmuxKey(sessionId: string, suffix?: string): string {
   return `${sessionId}${suffix ?? ''}`;
 }
 
+// ── Persistence ─────────────────────────────────────────────────────────────
+
+interface PersistedTmuxEntry {
+  key: string;
+  tmuxName: string;
+  logPath: string;
+}
+
+function persistPath(): string {
+  return config.tmuxPersistPath;
+}
+
+function persistTmuxSessions(): void {
+  const entries: PersistedTmuxEntry[] = [];
+  for (const [key, s] of tmuxSessions) {
+    entries.push({ key, tmuxName: s.tmuxName, logPath: s.logPath });
+  }
+  try {
+    const dir = require('path').dirname(persistPath());
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(persistPath(), JSON.stringify(entries), { mode: 0o600 });
+  } catch (e) {
+    console.warn('[tmux-runner] persist error', e);
+  }
+}
+
+function loadPersistedTmuxSessions(): void {
+  try {
+    const raw = fs.readFileSync(persistPath(), 'utf8');
+    const entries: PersistedTmuxEntry[] = JSON.parse(raw);
+    for (const e of entries) {
+      if (!tmuxSessions.has(e.key)) {
+        tmuxSessions.set(e.key, {
+          tmuxName: e.tmuxName,
+          logPath: e.logPath,
+          ready: true,
+          tailConn: null,
+        });
+      }
+    }
+    if (entries.length > 0) {
+      console.log(`[tmux-runner] Loaded ${entries.length} persisted tmux session(s)`);
+    }
+  } catch {
+    // No file or invalid — start fresh
+  }
+}
+
+// Load on module init
+loadPersistedTmuxSessions();
+
 // ── ANSI / TUI cleanup ────────────────────────────────────────────────────
 
 /** Remove ANSI escape sequences, cursor movement codes, and common TUI artifacts. */
@@ -530,6 +581,7 @@ export async function ensureTmuxSession(
     // Session died — clean up and recreate
     console.warn(`[tmux-runner] Session ${existing.tmuxName} died on remote, recreating`);
     tmuxSessions.delete(key);
+    persistTmuxSessions();
     if (existing.tailConn) existing.tailConn.cleanup();
   }
 
@@ -591,6 +643,7 @@ export async function ensureTmuxSession(
         ).catch(() => {});
         const session: TmuxSession = { tmuxName, logPath, ready: true, tailConn: null };
         tmuxSessions.set(key, session);
+        persistTmuxSessions();
         adopted = true;
       } else {
         console.log(`[tmux-runner] Existing tmux session ${tmuxName} has no claude prompt — killing and recreating`);
@@ -715,6 +768,7 @@ export async function ensureTmuxSession(
       tailConn: null,
     };
     tmuxSessions.set(key, session);
+    persistTmuxSessions();
     console.log(`[tmux-runner] Session ${tmuxName} ready on ${machine.alias || machine.ip}`);
     return session;
   } finally {
@@ -1435,6 +1489,7 @@ export async function killTmuxSession(machine: MachineRecord, sessionId: string,
   }
 
   tmuxSessions.delete(key);
+  persistTmuxSessions();
 }
 
 /**

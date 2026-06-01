@@ -73,6 +73,8 @@ export const config = {
   // Delay (ms) after tmux new-session before sending the claude command.
   // Gives the shell time to initialize (oh-my-zsh, MOTD, etc.).
   tmuxStartupDelayMs: parseInt(process.env.BANANA_TMUX_STARTUP_DELAY ?? '1500', 10),
+  // Persist tmux session metadata so sessions survive server restarts.
+  tmuxPersistPath: process.env.BANANA_TMUX_PATH ?? path.join(os.homedir(), '.banana', 'tmux-sessions.json'),
 };
 
 if (!config.token) {
