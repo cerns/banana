@@ -510,18 +510,27 @@ export async function ensureTmuxSession(
   const key = tmuxKey(sessionId, suffix);
   const existing = tmuxSessions.get(key);
   if (existing) {
-    // Verify tmux session still exists on remote (1 standalone connection — acceptable)
-    try {
-      await tmuxExec(machine, `tmux has-session -t ${shellEscape(existing.tmuxName)} 2>/dev/null`, signal, 10_000);
+    // Verify tmux session still exists on remote — retry once for transient SSH errors
+    let verified = false;
+    for (let attempt = 0; attempt < 2 && !verified; attempt++) {
+      try {
+        await tmuxExec(machine, `tmux has-session -t ${shellEscape(existing.tmuxName)} 2>/dev/null`, signal, 10_000);
+        verified = true;
+      } catch {
+        if (attempt === 0) {
+          await new Promise(r => setTimeout(r, 500)); // brief retry delay
+        }
+      }
+    }
+    if (verified) {
       // Resize existing session to current desired size (old sessions may have smaller panes)
       await tmuxExec(machine, `tmux resize-window -t ${shellEscape(existing.tmuxName)} -x 120 -y 200 2>/dev/null || true`, signal, 10_000).catch(() => {});
       return existing;
-    } catch {
-      // Session died — clean up and recreate
-      console.warn(`[tmux-runner] Session ${existing.tmuxName} died on remote, recreating`);
-      tmuxSessions.delete(key);
-      if (existing.tailConn) existing.tailConn.cleanup();
     }
+    // Session died — clean up and recreate
+    console.warn(`[tmux-runner] Session ${existing.tmuxName} died on remote, recreating`);
+    tmuxSessions.delete(key);
+    if (existing.tailConn) existing.tailConn.cleanup();
   }
 
   const sid8 = sessionId.slice(0, 8);
@@ -541,6 +550,57 @@ export async function ensureTmuxSession(
         ? 'Install it with: brew install tmux (macOS) or apt install tmux (Linux)'
         : 'Install it on the remote machine: apt install tmux / yum install tmux';
       throw new Error(`tmux is not installed or not in PATH. ${hint}`);
+    }
+
+    // ── Adopt surviving tmux sessions (e.g. after server restart) ──────
+    // Check if a tmux session with our name already exists. If it does and
+    // claude is running inside (shows a prompt), adopt it — this preserves
+    // conversation context across banana server restarts.
+    let adopted = false;
+    try {
+      await tmuxExec(machine, `tmux has-session -t ${shellEscape(tmuxName)} 2>/dev/null`, signal, 10_000, conn ?? undefined);
+      // Session exists! Check if claude is alive inside
+      const screen = await tmuxExec(
+        machine,
+        `tmux capture-pane -t ${shellEscape(tmuxName)} -p`,
+        signal,
+        10_000,
+        conn ?? undefined,
+      );
+      const cleaned = stripAnsi(screen);
+      const lines = cleaned.split('\n').map(l => l.trim());
+      const hasPrompt = lines.some(l => isPromptLine(l));
+      const hasClaudeTui = lines.some(l =>
+        /^Claude Code v[\d.]+/.test(l) ||
+        /^\? for shortcuts/.test(l) ||
+        /^\d+ tokens?\s*$/.test(l) ||
+        /^esc to (?:interrupt|cancel)/i.test(l)
+      );
+      if (hasPrompt || hasClaudeTui) {
+        // Claude is alive — adopt the session
+        console.log(`[tmux-runner] Adopting existing tmux session ${tmuxName} (claude still running)`);
+        // Resize to desired dimensions
+        await tmuxExec(machine, `tmux resize-window -t ${shellEscape(tmuxName)} -x 120 -y 200 2>/dev/null || true`, signal, 10_000, conn ?? undefined).catch(() => {});
+        // Ensure pipe-pane is set up (may have been lost)
+        await tmuxExec(
+          machine,
+          `tmux pipe-pane -t ${shellEscape(tmuxName)} -o 'cat >> ${shellEscape(logPath)}'`,
+          signal,
+          10_000,
+          conn ?? undefined,
+        ).catch(() => {});
+        const session: TmuxSession = { tmuxName, logPath, ready: true, tailConn: null };
+        tmuxSessions.set(key, session);
+        adopted = true;
+      } else {
+        console.log(`[tmux-runner] Existing tmux session ${tmuxName} has no claude prompt — killing and recreating`);
+      }
+    } catch {
+      // No existing session — will create fresh below
+    }
+
+    if (adopted) {
+      return tmuxSessions.get(key)!;
     }
 
     // Kill any stale session with the same name
@@ -778,8 +838,10 @@ export function isResponseLine(line: string): boolean {
   if (/Auto-update failed/.test(t)) return false;
   // tmux config warnings (e.g. "focus-events off. add 'set -g focus-events on'")
   if (/^(?:tmux:|focus-events\s)/i.test(t)) return false;
-  // Status/effort indicators (e.g. "· /effort high")
+  // Status/effort indicators (e.g. "· /effort high", "● high · /effort")
   if (/^[·•]\s*\/effort\b/.test(t)) return false;
+  if (/^●\s+(?:high|low|off)\b/.test(t)) return false;
+  if (/[·•]\s*\/effort\b/.test(t) && t.length < 40) return false;
   // Paste notification from TUI (appears when prompt is pasted via tmux paste-buffer)
   // May appear bare "[Pasted text ...]" or with prompt prefix "❯ [Pasted text ...]"
   if (/\[Pasted text\b/.test(t)) return false;
