@@ -952,59 +952,6 @@ function isPromptLine(line: string): boolean {
 }
 
 /**
- * Final sweep before completion: recover content lines that the per-poll
- * multiset diff missed. The diff drops lines whose text matches something
- * already on screen (e.g. a [CHANNEL_REPLY] summary repeating tool output).
- *
- * Strategy: POSITIONAL tail sweep. Find the last emitted line on the current
- * screen, then feed everything after it (excluding TUI chrome / prompts) to
- * the parser. This is order-aware and avoids the multiset cancellation bug.
- */
-function sweepMissedLines(
-  curLines: string[],
-  parser: TmuxOutputParser,
-  promptLines: Set<string>,
-  _initialLineCounts: Map<string, number>,
-): void {
-  const emitted = parser.getResponseLines();
-  if (emitted.length === 0) return;
-
-  // Find the position of the last emitted line on the current screen.
-  // Search bottom-up — the most recent content is near the bottom.
-  const lastEmitted = emitted[emitted.length - 1];
-  let anchorPos = -1;
-  for (let i = curLines.length - 1; i >= 0; i--) {
-    if (curLines[i] === lastEmitted) {
-      anchorPos = i;
-      break;
-    }
-  }
-
-  if (anchorPos === -1) {
-    // Last emitted line scrolled off — can't do positional sweep.
-    // Fall back to tail: find the FIRST response-like line from the bottom
-    // that is NOT a prompt/footer, and sweep from there.
-    return;
-  }
-
-  // Feed all response-like lines AFTER the anchor position
-  let swept = 0;
-  for (let i = anchorPos + 1; i < curLines.length; i++) {
-    const t = curLines[i];
-    if (!t) continue;
-    if (!isResponseLine(t)) continue;
-    if (isPromptLine(t)) continue;
-    if (promptLines.size > 0 && promptLines.has(t)) continue;
-    parser.feed(t + '\n');
-    swept++;
-  }
-
-  if (swept > 0) {
-    console.log(`[tmux-runner] Tail sweep recovered ${swept} missed line(s) after position ${anchorPos}`);
-  }
-}
-
-/**
  * Stream output from a tmux session by polling `tmux capture-pane`.
  * TUI apps (like Claude) render full-screen, so pipe-pane/tail-f produces
  * unusable raw terminal data. capture-pane returns the rendered screen.
@@ -1093,30 +1040,19 @@ export async function streamTmuxOutput(
   let lastScreenApproveText = '';
   let screenApproveRetries = 0;
 
-  // Capture the initial screen as our baseline — everything here is "old".
-  // We store the full line array (with positions) so we can diff properly.
-  let prevLines: string[] = [];
+  // Capture the initial screen — everything currently visible is "old".
   let prevScreen = '';
+  let initialLineCount = 0;
   try {
     const initial = await capturePane();
     prevScreen = stripAnsi(initial);
-    prevLines = prevScreen.split('\n').map(l => l.trim());
+    initialLineCount = prevScreen.split('\n').map(l => l.trim()).filter(l => l).length;
   } catch { /* start from empty */ }
 
-  // Save initial baseline for sweepMissedLines — lines present before the
-  // response started (MOTD, shell commands, Claude welcome screen) must be
-  // excluded from the final sweep to avoid leaking pre-existing content.
-  const initialLineCounts = buildLineMultiset(prevLines);
-
-  // Build a multiset (line → count) from a line array for diff comparison.
-  function buildLineMultiset(lines: string[]): Map<string, number> {
-    const m = new Map<string, number>();
-    for (const l of lines) {
-      if (!l) continue;
-      m.set(l, (m.get(l) ?? 0) + 1);
-    }
-    return m;
-  }
+  // Positional tracking — the index (in curLines, non-empty only) of the last
+  // line we emitted. Everything at or before this index is "already seen".
+  // Starts at the initial screen's non-empty line count so we skip pre-existing content.
+  let emitCursor = initialLineCount;
 
   try {
     while (true) {
@@ -1133,58 +1069,64 @@ export async function streamTmuxOutput(
         continue;
       }
 
-      // Track raw screen changes — the multiset diff skips blank lines, so
-      // whitespace-only changes (e.g. blank lines after "A few observations:")
-      // are invisible to the content diff. Raw comparison catches those.
       const screenChanged = screen !== prevScreen;
       prevScreen = screen;
 
       const curLines = screen.split('\n').map(l => l.trim());
-
-      // Diff: find lines in curLines that are new compared to prevLines.
-      // Uses multiset subtraction — handles duplicate lines correctly.
-      const prevSet = buildLineMultiset(prevLines);
-      const newLines: string[] = [];
-      for (const t of curLines) {
-        if (!t) continue;
-        const prevCount = prevSet.get(t) ?? 0;
-        if (prevCount > 0) {
-          prevSet.set(t, prevCount - 1); // consume one occurrence
-        } else {
-          newLines.push(t);
-        }
+      // Non-empty lines with their original indices (for positional tracking)
+      const contentLines: { idx: number; text: string }[] = [];
+      for (let i = 0; i < curLines.length; i++) {
+        if (curLines[i]) contentLines.push({ idx: i, text: curLines[i] });
       }
 
       // Check for spinner (agent is still working — thinking, running tools, etc.)
-      // Require … (ellipsis) after the word to avoid false positives from status lines
-      // like "· Claude Max" or "· Organization Policy" on enterprise instances.
       const bottomLines = curLines.filter(l => l).slice(-10);
       const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+…/.test(l));
 
-      // Detect thinking mode (hub channel only): if a spinner is active at the BOTTOM
-      // of the screen, text is thinking output. Only check bottom lines — a spinner
-      // scrolled up from a previous thinking phase must NOT keep thinking mode on.
       if (filterThinking) {
         parser.setThinking(hasSpinner);
       }
 
-      // Emit new response content lines (noise-filtered, prompt-echo-filtered)
+      // ── Positional diff ─────────────────────────────────────────────
+      // Re-anchor: find the last emitted line on the current screen.
+      // Content may scroll — the emitCursor index may shift. We re-find
+      // our anchor by searching for the last line the parser emitted.
+      const emittedLines = parser.getResponseLines();
+      if (emittedLines.length > 0) {
+        const lastEmitted = emittedLines[emittedLines.length - 1];
+        // Search from the end — most recent content is at the bottom
+        for (let i = contentLines.length - 1; i >= 0; i--) {
+          if (contentLines[i].text === lastEmitted) {
+            emitCursor = i + 1; // next line to emit
+            break;
+          }
+        }
+      }
+
+      // Emit everything from emitCursor onwards
       let newContentThisPoll = false;
-      for (const t of newLines) {
-        // Skip echoed prompt text (pasted prompt appears on screen before processing)
+      for (let i = emitCursor; i < contentLines.length; i++) {
+        const t = contentLines[i].text;
+
+        // Skip echoed prompt text
         if (promptLines.size > 0 && promptLines.has(t)) continue;
+
+        // Skip prompt lines — they're not content
+        if (isPromptLine(t)) continue;
 
         // Permission-matching always gets processed (auto-approve)
         if (matchesPermissionPattern(t)) {
           parser.feed(t + '\n');
           newContentThisPoll = true;
           hasContent = true;
+          emitCursor = i + 1;
           continue;
         }
         if (isResponseLine(t)) {
           newContentThisPoll = true;
           hasContent = true;
           parser.feed(t + '\n');
+          emitCursor = i + 1;
         }
       }
 
@@ -1242,25 +1184,11 @@ export async function streamTmuxOutput(
         }
       }
 
-      // Update baseline for next poll
-      prevLines = curLines;
-
       if (newContentThisPoll || hasSpinner || screenChanged) {
-        // Reset idle timer when there's new content, an active spinner, or any screen change.
-        // screenChanged catches whitespace-only changes invisible to the multiset diff.
         lastChangeAt = Date.now();
       }
 
       // Check for prompt (response complete)
-      // The TUI shows a distinctive input box when ready:
-      //   ────────────────────
-      //   ❯ Try "how do I..."
-      //   ? for shortcuts · esc to interrupt
-      //   23385 tokens
-      // Require the prompt to appear WITH a TUI footer line ("? for shortcuts",
-      // "esc to interrupt/cancel", or token count). This is unique to the TUI
-      // "ready" state and won't match tables or other content. Also require
-      // no new content this poll (screen must be stable).
       const hasPrompt = bottomLines.some(isPromptLine);
       const hasTuiFooter = bottomLines.some(l =>
         /^\? for shortcuts/.test(l) ||
@@ -1268,7 +1196,6 @@ export async function streamTmuxOutput(
         /^\d+ tokens?\s*$/.test(l)
       );
       if (hasContent && hasPrompt && hasTuiFooter && !hasSpinner && !newContentThisPoll && !screenChanged) {
-        sweepMissedLines(curLines, parser, promptLines, initialLineCounts);
         console.log('[tmux-runner] Prompt detected — response complete');
         parser.flush();
         return { completed: true };
@@ -1282,9 +1209,8 @@ export async function streamTmuxOutput(
         return { completed: true };
       }
 
-      // Idle timeout — no new content for tmuxIdleCompletionMs → done
+      // Idle timeout
       if (hasContent && Date.now() - lastChangeAt > config.tmuxIdleCompletionMs) {
-        sweepMissedLines(curLines, parser, promptLines, initialLineCounts);
         console.log(`[tmux-runner] Idle timeout (${config.tmuxIdleCompletionMs}ms) — response complete`);
         onChunk({ type: 'stderr', text: `[banana-tmux] Idle timeout — response complete\n` });
         parser.flush();
