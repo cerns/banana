@@ -1091,13 +1091,15 @@ export async function streamTmuxOutput(
       // Re-anchor: find the last emitted line on the current screen.
       // Content may scroll — the emitCursor index may shift. We re-find
       // our anchor by searching for the last line the parser emitted.
+      // IMPORTANT: only move cursor FORWARD — never backwards, to avoid
+      // re-processing lines (e.g. permission prompts not in responseLines).
       const emittedLines = parser.getResponseLines();
       if (emittedLines.length > 0) {
         const lastEmitted = emittedLines[emittedLines.length - 1];
-        // Search from the end — most recent content is at the bottom
         for (let i = contentLines.length - 1; i >= 0; i--) {
           if (contentLines[i].text === lastEmitted) {
-            emitCursor = i + 1; // next line to emit
+            const newCursor = i + 1;
+            if (newCursor > emitCursor) emitCursor = newCursor;
             break;
           }
         }
