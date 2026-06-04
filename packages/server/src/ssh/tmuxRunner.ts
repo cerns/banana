@@ -1040,19 +1040,27 @@ export async function streamTmuxOutput(
   let lastScreenApproveText = '';
   let screenApproveRetries = 0;
 
-  // Capture the initial screen — everything currently visible is "old".
+  // Capture the initial screen — find the boundary between old content and
+  // the new response. The prompt echo (e.g. "❯ hey.") marks where old content
+  // ends. Everything before/including the prompt echo is "old".
   let prevScreen = '';
-  let initialLineCount = 0;
+  let initialBoundary = 0; // index in curLines where new content starts
   try {
     const initial = await capturePane();
     prevScreen = stripAnsi(initial);
-    initialLineCount = prevScreen.split('\n').map(l => l.trim()).filter(l => l).length;
+    const initLines = prevScreen.split('\n').map(l => l.trim());
+    // Find the last prompt echo line — everything after it is response
+    for (let i = initLines.length - 1; i >= 0; i--) {
+      if (promptLines.has(initLines[i])) {
+        initialBoundary = i + 1;
+        break;
+      }
+    }
+    // If no prompt echo found, skip all initial content
+    if (initialBoundary === 0) initialBoundary = initLines.filter(l => l).length;
   } catch { /* start from empty */ }
-
-  // Positional tracking — the index (in curLines, non-empty only) of the last
-  // line we emitted. Everything at or before this index is "already seen".
-  // Starts at the initial screen's non-empty line count so we skip pre-existing content.
-  let emitCursor = initialLineCount;
+  // Track how many non-empty lines were at/before the boundary
+  let baselineNonEmpty = initialBoundary;
 
   try {
     while (true) {
@@ -1073,13 +1081,6 @@ export async function streamTmuxOutput(
       prevScreen = screen;
 
       const curLines = screen.split('\n').map(l => l.trim());
-      // Non-empty lines with their original indices (for positional tracking)
-      const contentLines: { idx: number; text: string }[] = [];
-      for (let i = 0; i < curLines.length; i++) {
-        if (curLines[i]) contentLines.push({ idx: i, text: curLines[i] });
-      }
-
-      // Check for spinner (agent is still working — thinking, running tools, etc.)
       const bottomLines = curLines.filter(l => l).slice(-10);
       const hasSpinner = bottomLines.some(l => /^[✳✻✽·✢∗☆★✦✧⊹✶∴] \w+…/.test(l));
 
@@ -1087,28 +1088,51 @@ export async function streamTmuxOutput(
         parser.setThinking(hasSpinner);
       }
 
-      // ── Positional diff ─────────────────────────────────────────────
-      // Re-anchor: find the last emitted line on the current screen.
-      // Content may scroll — the emitCursor index may shift. We re-find
-      // our anchor by searching for the last line the parser emitted.
-      // IMPORTANT: only move cursor FORWARD — never backwards, to avoid
-      // re-processing lines (e.g. permission prompts not in responseLines).
+      // ── Hybrid diff ─────────────────────────────────────────────────
+      // Positional: find where to start emitting on the current screen.
+      //
+      // If we have previously emitted lines, find the last one on screen
+      // and emit everything after it (handles scrolling correctly).
+      //
+      // If no emitted lines yet, find the prompt echo boundary — everything
+      // after the last prompt echo line is response content.
       const emittedLines = parser.getResponseLines();
+      let startIdx = curLines.length; // default: nothing to emit
+
       if (emittedLines.length > 0) {
+        // Positional anchor: find last emitted line on screen (bottom-up)
         const lastEmitted = emittedLines[emittedLines.length - 1];
-        for (let i = contentLines.length - 1; i >= 0; i--) {
-          if (contentLines[i].text === lastEmitted) {
-            const newCursor = i + 1;
-            if (newCursor > emitCursor) emitCursor = newCursor;
+        for (let i = curLines.length - 1; i >= 0; i--) {
+          if (curLines[i] === lastEmitted) {
+            startIdx = i + 1;
             break;
           }
         }
+        // If anchor scrolled off, scan from beginning but skip known content
+        if (startIdx === curLines.length && screenChanged) startIdx = 0;
+      } else {
+        // No anchor — find the last prompt echo to locate response start
+        let boundary = -1;
+        for (let i = curLines.length - 1; i >= 0; i--) {
+          if (promptLines.has(curLines[i])) {
+            boundary = i;
+            break;
+          }
+        }
+        if (boundary >= 0) {
+          startIdx = boundary + 1; // start right after the prompt echo
+        } else {
+          // No prompt echo on screen — use initial baseline count
+          // (skip pre-existing content, emit anything new)
+          const nonEmpty = curLines.filter(l => l).length;
+          startIdx = nonEmpty > baselineNonEmpty ? baselineNonEmpty : curLines.length;
+        }
       }
 
-      // Emit everything from emitCursor onwards
       let newContentThisPoll = false;
-      for (let i = emitCursor; i < contentLines.length; i++) {
-        const t = contentLines[i].text;
+      for (let i = startIdx; i < curLines.length; i++) {
+        const t = curLines[i];
+        if (!t) continue;
 
         // Skip echoed prompt text
         if (promptLines.size > 0 && promptLines.has(t)) continue;
@@ -1121,14 +1145,12 @@ export async function streamTmuxOutput(
           parser.feed(t + '\n');
           newContentThisPoll = true;
           hasContent = true;
-          emitCursor = i + 1;
           continue;
         }
         if (isResponseLine(t)) {
           newContentThisPoll = true;
           hasContent = true;
           parser.feed(t + '\n');
-          emitCursor = i + 1;
         }
       }
 

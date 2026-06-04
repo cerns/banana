@@ -203,7 +203,9 @@ async function reconcileAllSessions(): Promise<void> {
   for (const [machineId, sessions] of byMachine) {
     const machine = machineStore.get(machineId);
     if (!machine) continue;
+    let machineReachable = true;
     for (const s of sessions) {
+      if (!machineReachable) break; // skip remaining sessions on unreachable machine
       try {
         const workdir = s.remoteWorkdir ?? machine.defaultWorkdir ?? '';
         const detected = await reconcileSession(machine, s.sessionId, workdir, s.model, s.claudeSessionId);
@@ -211,7 +213,13 @@ async function reconcileAllSessions(): Promise<void> {
           updateClaudeSessionId(s.sessionId, detected);
         }
       } catch (e) {
-        console.warn(`[banana] Reconcile failed for ${s.sessionId.slice(0, 8)}: ${(e as Error).message}`);
+        const msg = (e as Error).message;
+        console.warn(`[banana] Reconcile failed for ${s.sessionId.slice(0, 8)}: ${msg}`);
+        // If SSH connection failed, skip remaining sessions on this machine
+        if (/timed out|ECONNREFUSED|ETIMEDOUT|handshake/i.test(msg)) {
+          console.warn(`[banana] Machine ${machine.alias || machineId.slice(0, 8)} unreachable — skipping remaining sessions`);
+          machineReachable = false;
+        }
       }
     }
   }
