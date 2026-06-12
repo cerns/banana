@@ -778,7 +778,9 @@ export async function ensureTmuxSession(
           ready = true;
           break;
         }
-        if ((/error|Error|fatal|FATAL/i.test(cleaned) || /No executable.*found/i.test(cleaned) || /command not found/i.test(cleaned)) && /\$\s*$/m.test(cleaned)) {
+        if ((/error|Error|fatal|FATAL/i.test(cleaned) || /No executable.*found/i.test(cleaned) || /command not found/i.test(cleaned) || /[Nn]o conversation found/i.test(cleaned)) && /\$\s*$/m.test(cleaned)) {
+          // Don't throw for stale resume — let the !ready block handle retry
+          if (/[Nn]o conversation found/i.test(cleaned)) break;
           throw new Error(`Claude failed to start: ${cleaned.slice(-500)}`);
         }
       } catch (e) {
@@ -789,6 +791,16 @@ export async function ensureTmuxSession(
 
     if (!ready) {
       try { await tmuxExec(machine, `tmux kill-session -t ${shellEscape(tmuxName)} 2>/dev/null || true`, undefined, 10_000, conn ?? undefined); } catch { /* ignore */ }
+
+      // Stale --resume: "No conversation found with session ID: ..."
+      // Retry without --resume and clear the bad claudeSessionId.
+      if (claudeSessionId && /[Nn]o conversation found/i.test(lastScreen)) {
+        console.warn(`[tmux-runner] Stale --resume session ${claudeSessionId.slice(0, 8)} — retrying without --resume`);
+        try { await tmuxExec(machine, `rm -f ${shellEscape(logPath)}`, signal, 10_000, conn ?? undefined); } catch { /* ignore */ }
+        if (conn) conn.cleanup();
+        return ensureTmuxSession(machine, sessionId, workdir, model, signal, suffix, undefined);
+      }
+
       throw new Error(`Claude did not start within ${timeoutMs}ms. Last screen:\n${lastScreen.slice(-1000)}`);
     }
 
