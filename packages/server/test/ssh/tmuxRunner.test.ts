@@ -1542,6 +1542,92 @@ describe('tmuxRunner', () => {
       logSpy.mockRestore();
     });
 
+    it('should complete fast via Stop-hook sentinel without prompt on screen', async () => {
+      const machine = makeMachine();
+      let callCount = 0;
+
+      mockConnectWithRetry.mockImplementation(async () => {
+        const client = createMockClient();
+        client.exec.mockImplementation((cmd: string, cb: Function) => {
+          callCount++;
+          const stream = createMockStream();
+          cb(null, stream);
+          process.nextTick(() => {
+            if (cmd.includes('capture-pane')) {
+              // Screen shows a mid-response state (no prompt, no footer), but the
+              // sentinel section carries the Stop-hook timestamp from poll 2 on.
+              const sentinel = callCount >= 2 ? '1760000000' : '';
+              stream.emit('data', Buffer.from(`Answer text here\n__BANANA_STOP__${sentinel}`));
+            }
+            stream.emit('close', 0);
+          });
+        });
+        return { client, cleanup: vi.fn() };
+      });
+
+      const session = {
+        tmuxName: 'banana-sentinel-test',
+        logPath: '/tmp/banana-tmux-log-sentinel-test',
+        ready: true,
+        tailConn: null,
+      };
+
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const startedAt = Date.now();
+      const result = await tmuxRunner.streamTmuxOutput(machine, session as any, () => {});
+      const elapsed = Date.now() - startedAt;
+
+      expect(result.completed).toBe(true);
+      // Must beat the 2s idle timeout — sentinel completes within ~3 polls
+      expect(elapsed).toBeLessThan(1_500);
+      expect(logSpy.mock.calls.some(args => String(args[0]).includes('Stop hook sentinel detected'))).toBe(true);
+      logSpy.mockRestore();
+    });
+
+    it('should complete via prompt detection with the modern TUI footer', async () => {
+      const machine = makeMachine();
+      let callCount = 0;
+
+      mockConnectWithRetry.mockImplementation(async () => {
+        const client = createMockClient();
+        client.exec.mockImplementation((cmd: string, cb: Function) => {
+          callCount++;
+          const stream = createMockStream();
+          cb(null, stream);
+          process.nextTick(() => {
+            if (cmd.includes('capture-pane')) {
+              if (callCount <= 2) {
+                stream.emit('data', Buffer.from('Working on it...\n'));
+              } else {
+                // Modern footer: token count shares the line with the effort indicator
+                stream.emit('data', Buffer.from('Working on it...\nDone.\n❯\n25505 tokens |            ● high · /effort\n'));
+              }
+            }
+            stream.emit('close', 0);
+          });
+        });
+        return { client, cleanup: vi.fn() };
+      });
+
+      const session = {
+        tmuxName: 'banana-footer-test',
+        logPath: '/tmp/banana-tmux-log-footer-test',
+        ready: true,
+        tailConn: null,
+      };
+
+      const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+      const startedAt = Date.now();
+      const result = await tmuxRunner.streamTmuxOutput(machine, session as any, () => {});
+      const elapsed = Date.now() - startedAt;
+
+      expect(result.completed).toBe(true);
+      // Prompt path fires once the screen stabilizes — well before the 2s idle timeout
+      expect(elapsed).toBeLessThan(1_900);
+      expect(logSpy.mock.calls.some(args => String(args[0]).includes('Prompt detected'))).toBe(true);
+      logSpy.mockRestore();
+    });
+
     it('should reject if signal already aborted', async () => {
       const machine = makeMachine();
       const controller = new AbortController();

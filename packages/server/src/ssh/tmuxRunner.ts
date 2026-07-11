@@ -39,6 +39,19 @@ function tmuxKey(sessionId: string, suffix?: string): string {
   return `${sessionId}${suffix ?? ''}`;
 }
 
+/**
+ * Per-tmux-session sentinel file written by a Claude Code Stop hook.
+ * The hook is injected at launch via `--settings '<json>'` (inline JSON — no
+ * remote settings files are touched) and appends a timestamp every time the
+ * agent finishes a response. The output poller watches this file for a
+ * deterministic "response complete" signal instead of scraping the TUI.
+ * Note: --bare sessions (hub chat) skip hooks entirely — they fall back to
+ * prompt/footer detection + idle timeout.
+ */
+export function stopSentinelPath(tmuxName: string): string {
+  return `/tmp/banana-stop-${tmuxName}`;
+}
+
 // ── Persistence ─────────────────────────────────────────────────────────────
 
 interface PersistedTmuxEntry {
@@ -704,9 +717,9 @@ export async function ensureTmuxSession(
       await tmuxExec(machine, `tmux kill-session -t ${shellEscape(tmuxName)} 2>/dev/null || true`, signal, 10_000, conn ?? undefined);
     } catch { /* ignore */ }
 
-    // Remove stale log file
+    // Remove stale log file + stop-hook sentinel
     try {
-      await tmuxExec(machine, `rm -f ${shellEscape(logPath)}`, signal, 10_000, conn ?? undefined);
+      await tmuxExec(machine, `rm -f ${shellEscape(logPath)} ${shellEscape(stopSentinelPath(tmuxName))}`, signal, 10_000, conn ?? undefined);
     } catch { /* ignore */ }
 
     // Create tmux session in detached mode — use -c to set the starting directory
@@ -744,6 +757,18 @@ export async function ensureTmuxSession(
     // B2: Hub tmux sessions run with --bare (skip CLAUDE.md, hooks, skills, MCP)
     if (suffix === '-hub') claudeArgs.push('--bare');
     if (model) claudeArgs.push('--model', shellEscape(model));
+    // Deterministic completion signal: inject a Stop hook (inline --settings
+    // JSON) that appends a timestamp to the per-session sentinel file every
+    // time the agent finishes a response. The poller watches that file so
+    // completion is detected in one poll interval instead of waiting for the
+    // idle timeout. Harmless under --bare (hooks skipped → scraping fallback).
+    const sentinel = stopSentinelPath(tmuxName);
+    const hookSettings = JSON.stringify({
+      hooks: {
+        Stop: [{ hooks: [{ type: 'command', command: `date +%s >> ${sentinel}`, timeout: 10 }] }],
+      },
+    });
+    claudeArgs.push('--settings', shellEscape(hookSettings));
 
     // cd is redundant with -c but kept as safety (in case shell init changes cwd)
     const cdPart = workdir ? `cd ${shellEscape(workdir)} && ` : '';
@@ -844,11 +869,15 @@ export async function sendPromptViaTmux(
   // Resize pane to maximize capture area before each prompt
   const resizeCmd = `tmux resize-window -t ${shellEscape(session.tmuxName)} -x 750 -y 200 2>/dev/null || true`;
 
+  // Clear the stop-hook sentinel so anything appearing in it afterwards means
+  // "this prompt's response completed" (no clock comparison needed).
+  const clearSentinelCmd = `rm -f ${shellEscape(stopSentinelPath(session.tmuxName))}`;
+
   if (isLocalMachine(machine)) {
     // Local path — no SSH connection reuse needed
     try { await tmuxExec(machine, resizeCmd, signal, 10_000); } catch { /* ignore */ }
     try {
-      await tmuxExec(machine, `truncate -s 0 ${shellEscape(session.logPath)}`, signal, 10_000);
+      await tmuxExec(machine, `truncate -s 0 ${shellEscape(session.logPath)}; ${clearSentinelCmd}`, signal, 10_000);
     } catch { /* ignore */ }
     const tmp = await writeTempFile(machine, prompt + '\n', signal);
     try {
@@ -867,9 +896,10 @@ export async function sendPromptViaTmux(
   try {
     // Resize pane to maximize capture area
     try { await tmuxExec(machine, resizeCmd, signal, 10_000, conn); } catch { /* ignore */ }
-    // Truncate the log file so we only capture output from this prompt
+    // Truncate the log file so we only capture output from this prompt,
+    // and clear the stop-hook sentinel for this prompt's completion signal
     try {
-      await tmuxExec(machine, `truncate -s 0 ${shellEscape(session.logPath)}`, signal, 10_000, conn);
+      await tmuxExec(machine, `truncate -s 0 ${shellEscape(session.logPath)}; ${clearSentinelCmd}`, signal, 10_000, conn);
     } catch { /* ignore */ }
 
     // Write prompt to temp file via SFTP (reuses conn)
@@ -1009,6 +1039,10 @@ export async function streamTmuxOutput(
   let lastChangeAt = Date.now();
   let lastInputRequestAt = 0;
   let lastInputRequestScreen = '';
+  // Stop-hook sentinel: number of consecutive polls the signal has been seen.
+  // We complete on the 2nd poll so the final screen render (which can race the
+  // hook write by a few ms) is captured and parsed before flushing.
+  let stopSignalPolls = 0;
 
   // Build a set of prompt lines to filter out echoed prompt text from capture-pane.
   // When a long prompt is pasted via tmux, it appears on screen before claude processes it.
@@ -1045,30 +1079,46 @@ export async function streamTmuxOutput(
     }
   }
 
-  /** Run capture-pane using persistent connection when available, else fallback to tmuxExec. */
+  /** Run capture-pane using persistent connection when available, else fallback to tmuxExec.
+   *  Also reads the Stop-hook sentinel in the same roundtrip: non-empty sentinel
+   *  content means the agent finished a response since the prompt was sent. */
   const isLocal = isLocalMachine(machine);
-  const capturePane = async (): Promise<string> => {
-    // Local: call tmux directly (no shell spawn) to avoid terminal title flicker
+  const sentinelPath = stopSentinelPath(session.tmuxName);
+  const STOP_MARKER = '\n__BANANA_STOP__';
+  const splitCapture = (raw: string): { screen: string; stopSignal: boolean } => {
+    const idx = raw.lastIndexOf(STOP_MARKER);
+    if (idx < 0) return { screen: raw, stopSignal: false };
+    return {
+      screen: raw.slice(0, idx),
+      stopSignal: raw.slice(idx + STOP_MARKER.length).trim().length > 0,
+    };
+  };
+  const capturePane = async (): Promise<{ screen: string; stopSignal: boolean }> => {
+    // Local: call tmux directly (no shell spawn) to avoid terminal title flicker;
+    // the sentinel lives on this same host, read it via fs.
     if (isLocal) {
-      return execTmuxLocal(['capture-pane', '-t', session.tmuxName, '-p'], 10_000);
+      const screen = await execTmuxLocal(['capture-pane', '-t', session.tmuxName, '-p'], 10_000);
+      let stopSignal = false;
+      try { stopSignal = fs.readFileSync(sentinelPath, 'utf8').trim().length > 0; } catch { /* no sentinel */ }
+      return { screen, stopSignal };
     }
-    const cmd = `tmux capture-pane -t ${shellEscape(session.tmuxName)} -p`;
+    const cmd = `tmux capture-pane -t ${shellEscape(session.tmuxName)} -p; printf '\\n__BANANA_STOP__%s' "$(cat ${shellEscape(sentinelPath)} 2>/dev/null)"`;
     if (pollConn) {
       try {
-        return await execOnConn(pollConn, machine, cmd, signal, 10_000);
+        return splitCapture(await execOnConn(pollConn, machine, cmd, signal, 10_000));
       } catch (e) {
         // Connection may have died — try reconnecting once
         console.warn(`[tmux-runner] Poll connection lost, reconnecting: ${(e as Error).message}`);
         try { pollConn.cleanup(); } catch { /* ignore */ }
         try {
           pollConn = await connectWithRetry(machine, signal);
-          return await execOnConn(pollConn, machine, cmd, signal, 10_000);
+          return splitCapture(await execOnConn(pollConn, machine, cmd, signal, 10_000));
         } catch {
           pollConn = null; // give up on persistent, fall back to tmuxExec
         }
       }
     }
-    return tmuxExec(machine, cmd, signal, 10_000);
+    return splitCapture(await tmuxExec(machine, cmd, signal, 10_000));
   };
 
   // Dedup tracking for screen-scan auto-approve (avoid log spam when prompt stays visible)
@@ -1082,7 +1132,7 @@ export async function streamTmuxOutput(
   let initialBoundary = 0; // index in curLines where new content starts
   try {
     const initial = await capturePane();
-    prevScreen = stripAnsi(initial);
+    prevScreen = stripAnsi(initial.screen);
     const initLines = prevScreen.split('\n').map(l => l.trim());
     // Find the last prompt echo line — everything after it is response
     for (let i = initLines.length - 1; i >= 0; i--) {
@@ -1104,9 +1154,11 @@ export async function streamTmuxOutput(
       if (signal?.aborted) throw new Error('Aborted');
 
       let screen: string;
+      let stopSignal = false;
       try {
         const raw = await capturePane();
-        screen = stripAnsi(raw);
+        screen = stripAnsi(raw.screen);
+        stopSignal = raw.stopSignal;
       } catch (e) {
         console.warn(`[tmux-runner] capture-pane failed: ${(e as Error).message}`);
         continue;
@@ -1288,12 +1340,30 @@ export async function streamTmuxOutput(
         lastInputRequestScreen = '';
       }
 
-      // Check for prompt (response complete)
+      // ── Stop-hook sentinel (deterministic completion) ────────────────
+      // The Stop hook wrote to the sentinel file → the agent finished its
+      // response. Complete on the 2nd consecutive poll so this poll's screen
+      // (parsed above) already contains the final render.
+      if (stopSignal) {
+        stopSignalPolls++;
+        if (stopSignalPolls >= 2) {
+          console.log('[tmux-runner] Stop hook sentinel detected — response complete');
+          parser.flush();
+          return { completed: true };
+        }
+      } else {
+        stopSignalPolls = 0;
+      }
+
+      // Check for prompt (response complete) — screen-scraping fallback for
+      // sessions where hooks don't fire (--bare hub chat, restricted machines).
       const hasPrompt = bottomLines.some(isPromptLine);
       const hasTuiFooter = bottomLines.some(l =>
-        /^\? for shortcuts/.test(l) ||
+        /\? for shortcuts/.test(l) ||
         /^esc to (?:interrupt|cancel)/i.test(l) ||
-        /^\d+ tokens?\s*$/.test(l)
+        /\d+ tokens\b/.test(l) ||          // "25505 tokens | ● high · /effort"
+        /·\s*\/effort\b/.test(l) ||
+        /⏵⏵|bypass permissions|plan mode/i.test(l)
       );
       if (hasContent && hasPrompt && hasTuiFooter && !hasSpinner && !newContentThisPoll && !screenChanged) {
         console.log('[tmux-runner] Prompt detected — response complete');
@@ -1545,15 +1615,16 @@ export async function killTmuxSession(machine: MachineRecord, sessionId: string,
     session.tailConn = null;
   }
 
+  const cleanupCmd = `rm -f ${shellEscape(session.logPath)} ${shellEscape(stopSentinelPath(session.tmuxName))}`;
   if (isLocalMachine(machine)) {
     try { await tmuxExec(machine, `tmux kill-session -t ${shellEscape(session.tmuxName)} 2>/dev/null || true`); } catch { /* ignore */ }
-    try { await tmuxExec(machine, `rm -f ${shellEscape(session.logPath)}`); } catch { /* ignore */ }
+    try { await tmuxExec(machine, cleanupCmd); } catch { /* ignore */ }
   } else {
     // Remote — reuse a single SSH connection for kill + cleanup
     const conn = await connectWithRetry(machine);
     try {
       try { await tmuxExec(machine, `tmux kill-session -t ${shellEscape(session.tmuxName)} 2>/dev/null || true`, undefined, 30_000, conn); } catch { /* ignore */ }
-      try { await tmuxExec(machine, `rm -f ${shellEscape(session.logPath)}`, undefined, 30_000, conn); } catch { /* ignore */ }
+      try { await tmuxExec(machine, cleanupCmd, undefined, 30_000, conn); } catch { /* ignore */ }
     } finally {
       conn.cleanup();
     }
