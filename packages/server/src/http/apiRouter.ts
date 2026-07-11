@@ -450,6 +450,28 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     }
   }
 
+  // POST /api/sessions/:id/keys — send raw tmux keys while Claude awaits interactive input
+  const keysMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/keys$/);
+  if (keysMatch && method === 'POST') {
+    const prefix = keysMatch[1];
+    const sessionId = resolveSessionId(prefix);
+    if (!sessionId) { json(res, 404, { error: 'Session not found' }); return true; }
+    const body = await readBody(req) as { keys?: string };
+    if (!body.keys || typeof body.keys !== 'string') { json(res, 400, { error: 'keys required' }); return true; }
+    const session = sessionStore.get(sessionId);
+    if (!session) { json(res, 404, { error: 'Session not found' }); return true; }
+    const machine = machineStore.get(session.machineId ?? '');
+    if (!machine) { json(res, 400, { error: 'No machine for session' }); return true; }
+    const { sendKeysToTmuxSession } = await import('../ssh/tmuxRunner.js');
+    try {
+      await sendKeysToTmuxSession(machine, sessionId, body.keys);
+      json(res, 200, { ok: true });
+    } catch (e) {
+      json(res, 500, { error: (e as Error).message });
+    }
+    return true;
+  }
+
   // POST /api/sessions/:id/abort
   const abortMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/abort$/);
   if (abortMatch && method === 'POST') {

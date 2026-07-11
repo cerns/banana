@@ -190,6 +190,15 @@ const PERMISSION_PATTERNS: PermissionPattern[] = [
     keys: 'y Enter',
   },
 
+  // ── Blocking bash command hint ───────────────────────────────────────
+  // Claude's TUI shows "(ctrl+b ctrl+b (twice) to run in background)" when a
+  // bash command is blocking. Auto-send C-b C-b so Claude can continue.
+  {
+    label: 'background-blocking-cmd',
+    test: (line) => /ctrl\+b ctrl\+b.*run in background/i.test(line),
+    keys: 'C-b C-b',
+  },
+
   // ── Startup / one-time prompts ───────────────────────────────────────
   // Trust this folder/directory/project
   {
@@ -415,7 +424,7 @@ export class TmuxOutputParser {
 
 // ── Exec helpers ────────────────────────────────────────────────────────────
 
-const PATH_PREFIX = 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.asdf/shims:$HOME/.asdf/bin:$PATH"';
+const PATH_PREFIX = 'export PATH="$HOME/.bun/bin:$HOME/.local/bin:$HOME/.nvm/current/bin:$HOME/.asdf/shims:$HOME/.asdf/bin:$PATH" && export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1';
 
 /** Execute a command — locally or over SSH depending on machine type.
  *  When `conn` is provided (and not local), reuses that SSH connection instead of opening a new one.
@@ -773,15 +782,13 @@ export async function ensureTmuxSession(
         if (summary) {
           console.log(`[tmux-runner] Startup screen (${elapsed}s): ${summary.slice(-200)}`);
         }
-        const hasPrompt = cleaned.split('\n').some(l => isPromptLine(l));
-        if (hasPrompt) {
-          ready = true;
-          break;
-        }
-        if ((/error|Error|fatal|FATAL/i.test(cleaned) || /No executable.*found/i.test(cleaned) || /command not found/i.test(cleaned) || /[Nn]o conversation found/i.test(cleaned)) && /\$\s*$/m.test(cleaned)) {
-          // Don't throw for stale resume — let the !ready block handle retry
-          if (/[Nn]o conversation found/i.test(cleaned)) break;
-          throw new Error(`Claude failed to start: ${cleaned.slice(-500)}`);
+        const cls = classifyStartupScreen(cleaned);
+        if (cls === 'ready') { ready = true; break; }
+        if (cls === 'stale-resume') break;
+        if (cls === 'fatal-error') throw new Error(`Claude failed to start: ${cleaned.slice(-500)}`);
+        if (cls === 'trust-prompt') {
+          console.log(`[tmux-runner] Trust dialog detected — auto-accepting`);
+          await tmuxSendKeys(machine, tmuxName, 'Enter', signal, conn ?? undefined);
         }
       } catch (e) {
         if ((e as Error).message.includes('Claude failed')) throw e;
@@ -951,7 +958,7 @@ export function isResponseLine(line: string): boolean {
 }
 
 /** Check if a line is a Claude prompt indicator (response complete). */
-function isPromptLine(line: string): boolean {
+export function isPromptLine(line: string): boolean {
   const t = line.trim();
   if (/^[>❯]\s*$/.test(t)) return true;
   if (/^❯\s+/.test(t)) {
@@ -961,6 +968,20 @@ function isPromptLine(line: string): boolean {
     return true;
   }
   return false;
+}
+
+export type StartupScreenClass = 'ready' | 'stale-resume' | 'fatal-error' | 'trust-prompt' | 'pending';
+
+/**
+ * Classify a tmux startup-screen snapshot to decide what the startup loop should do.
+ * Extracted so the regex logic can be unit-tested independently of the SSH plumbing.
+ */
+export function classifyStartupScreen(cleaned: string): StartupScreenClass {
+  if (cleaned.split('\n').some(l => isPromptLine(l))) return 'ready';
+  if (/[Nn]o conversation found/i.test(cleaned)) return 'stale-resume';
+  if ((/error|Error|fatal|FATAL/.test(cleaned) || /No executable.*found/i.test(cleaned) || /command not found/i.test(cleaned)) && /[$#]\s*$/m.test(cleaned)) return 'fatal-error';
+  if (/Yes.*trust.*folder|trust.*folder.*Yes|Enter to confirm.*Esc to cancel/i.test(cleaned)) return 'trust-prompt';
+  return 'pending';
 }
 
 /**
@@ -986,6 +1007,8 @@ export async function streamTmuxOutput(
   const pollIntervalMs = 250;
   let hasContent = false;
   let lastChangeAt = Date.now();
+  let lastInputRequestAt = 0;
+  let lastInputRequestScreen = '';
 
   // Build a set of prompt lines to filter out echoed prompt text from capture-pane.
   // When a long prompt is pasted via tmux, it appears on screen before claude processes it.
@@ -1221,6 +1244,52 @@ export async function streamTmuxOutput(
       }
 
       if (newContentThisPoll || hasSpinner || screenChanged) {
+        lastChangeAt = Date.now();
+      }
+
+      // ── Interactive choice/input detection ─────────────────────────────
+      // Detect Claude's numbered-choice menus.
+      // Pattern: "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"
+      if (/Enter to select\s*·\s*Tab|Arrow keys to navigate/i.test(screen)) {
+        const screenFingerprint = screen.slice(-400);
+        const now = Date.now();
+        if (screenFingerprint !== lastInputRequestScreen && now - lastInputRequestAt > 2000) {
+          lastInputRequestScreen = screenFingerprint;
+          lastInputRequestAt = now;
+
+          // Parse numbered choices from the bottom of the screen
+          const choices: Array<{ n: string; label: string }> = [];
+          for (const line of curLines) {
+            const m = line.match(/^(\d+)[.)]\s+(.+)/);
+            if (m) choices.push({ n: m[1], label: m[2].trim() });
+          }
+
+          // Dismiss the menu with Escape so Claude falls back to free-text conversation.
+          // "Esc to cancel" is shown in the nav hint — this is the safest neutral action.
+          // If Escape doesn't work on this Claude version, fall back to auto-selecting
+          // "Chat about this" or "other".
+          const chatChoice =
+            choices.find(c => /chat about/i.test(c.label)) ??
+            choices.find(c => /other/i.test(c.label));
+
+          console.log(`[tmux-runner] Choice menu detected — sending Escape to dismiss`);
+          onChunk({ type: 'stderr', text: `[banana-tmux] Choice menu dismissed (Esc)${chatChoice ? ` — fallback: ${chatChoice.n}. ${chatChoice.label}` : ''}\n` });
+          sendKeysForApprove('Escape');
+
+          // If Escape doesn't dismiss within ~1s, the next poll will re-detect and
+          // the dedup fingerprint will still match so we won't re-fire immediately.
+          // Clear the fingerprint after a delay so a fallback can fire if needed.
+          if (chatChoice) {
+            setTimeout(() => {
+              if (lastInputRequestScreen === screenFingerprint) {
+                console.log(`[tmux-runner] Escape didn't dismiss — auto-selecting "${chatChoice.label}"`);
+                sendKeysForApprove(`${chatChoice.n} Enter`);
+                lastInputRequestScreen = '';
+              }
+            }, 2000);
+          }
+        }
+        // Keep job alive while waiting for user or auto-response to take effect
         lastChangeAt = Date.now();
       }
 
@@ -1511,6 +1580,22 @@ export async function killAllTmuxSessions(machine: MachineRecord, sessionId: str
 /** Check if a tmux session exists for the given banana sessionId. */
 export function hasTmuxSession(sessionId: string, suffix?: string): boolean {
   return tmuxSessions.has(tmuxKey(sessionId, suffix));
+}
+
+/**
+ * Send raw tmux keys to an active work session (e.g. user responding to an
+ * interactive Claude prompt). Keys follow tmux send-keys syntax: printable
+ * characters plus named keys like Enter, Escape, Up, Down, Tab.
+ */
+export async function sendKeysToTmuxSession(
+  machine: MachineRecord,
+  sessionId: string,
+  keys: string,
+  suffix?: string,
+): Promise<void> {
+  const session = tmuxSessions.get(tmuxKey(sessionId, suffix));
+  if (!session) throw new Error(`No active tmux session for ${sessionId}`);
+  await tmuxSendKeys(machine, session.tmuxName, keys);
 }
 
 /** Close all cached tmux SSH connections (for graceful shutdown). */

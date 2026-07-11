@@ -263,9 +263,10 @@ function dispatchOrQueue(
     return;
   }
 
-  // Check if session's hub channel is busy
-  if (isSessionBusy(session.sessionId, 'hub')) {
-    console.log(`[hub]   ${sid} QUEUE: session hub channel is busy`);
+  // Check if the relevant channel is busy
+  const preCheckChannel: ExecChannel = engagement === 'triggered' ? `hub-channel:${hubMessage.channelId}` : 'hub';
+  if (isSessionBusy(session.sessionId, preCheckChannel)) {
+    console.log(`[hub]   ${sid} QUEUE: session ${preCheckChannel} channel is busy`);
     queueForSession(session.sessionId, hubMessage.id, engagement);
     return;
   }
@@ -867,11 +868,11 @@ function dispatchToSession(
   runningHubJobs++;
   sessionCooldowns.set(session.sessionId, Date.now());
 
-  // Register completion callback and execute.
-  // Triggered dispatches ([BEGIN_WORK] self-trigger or manual trigger button)
-  // route to the WORK channel so the agent executes with tools in its work
-  // tmux session. Non-triggered dispatches (chat/discussion) stay in hub.
-  const execChannel: ExecChannel = engagement === 'triggered' ? 'work' : 'hub';
+  // Three separate tmux channels keep session types isolated:
+  //   hub-channel — triggered work (BEGIN_WORK / manual trigger), tmux -hub-ch
+  //   hub         — hub chat/discussion (listen/engage), tmux -hub
+  //   work        — direct API sends only (session chat)
+  const execChannel: ExecChannel = engagement === 'triggered' ? `hub-channel:${hubMessage.channelId}` : 'hub';
 
   onJobComplete(job.jobId, () => {
     onSessionJobComplete(session.sessionId, job.jobId, hubMessage, engagement);

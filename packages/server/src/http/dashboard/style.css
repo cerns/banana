@@ -257,8 +257,9 @@ header h1 { font-size: 16px; color: var(--accent); }
   font-size: 13px;
   border-radius: 4px;
   resize: none;
-  overflow: hidden;
+  overflow-y: auto;
   line-height: 1.4;
+  max-height: 150px;
 }
 
 #prompt-input:focus {
@@ -291,7 +292,21 @@ header h1 { font-size: 16px; color: var(--accent); }
 }
 
 .output-header .job-id { color: var(--blue); }
-.output-header .job-prompt { color: var(--text); flex: 1; white-space: pre-wrap; word-break: break-word; }
+.output-header .job-prompt { color: var(--text); flex: 1; white-space: pre-wrap; word-break: break-word; max-height: 80px; overflow-y: auto; }
+.job-archive-btn, .job-restore-btn {
+  flex-shrink: 0;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  color: var(--muted);
+  font-size: 11px;
+  padding: 0 2px;
+  opacity: 0;
+  transition: opacity 0.15s;
+}
+.output-header:hover .job-archive-btn,
+.output-header:hover .job-restore-btn { opacity: 1; }
+.job-restore-btn { color: var(--accent); }
 
 .output-body {
   padding: 8px 10px;
@@ -309,6 +324,89 @@ header h1 { font-size: 16px; color: var(--accent); }
 .chunk-result { color: var(--muted); font-size: 11px; }
 .chunk-stderr { color: var(--red); display: block; font-size: 11px; white-space: pre-wrap; }
 .chunk-raw { color: var(--muted); display: block; font-size: 10px; white-space: pre-wrap; opacity: 0.6; }
+.chunk-truncated { color: var(--muted); font-size: 10px; padding: 2px 0 4px; border-bottom: 1px dashed var(--border); margin-bottom: 4px; }
+
+.input-request {
+  border: 1px solid var(--accent);
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 8px 0;
+  background: color-mix(in srgb, var(--accent) 8%, var(--bg));
+}
+.input-req-label {
+  font-size: 11px;
+  color: var(--accent);
+  font-weight: 600;
+  margin-bottom: 8px;
+}
+.input-req-choices { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
+.input-req-choice {
+  text-align: left;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 10px;
+  font-size: 12px;
+  font-family: var(--font-mono);
+  color: var(--text);
+  cursor: pointer;
+}
+.input-req-choice:hover { border-color: var(--accent); color: var(--accent); }
+.input-req-freetext { display: flex; gap: 6px; }
+.input-req-text {
+  flex: 1;
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  color: var(--text);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  padding: 4px 8px;
+}
+.input-req-text:focus { outline: none; border-color: var(--accent); }
+.input-req-send {
+  background: var(--accent);
+  border: none;
+  border-radius: 4px;
+  color: #fff;
+  font-size: 12px;
+  padding: 4px 10px;
+  cursor: pointer;
+}
+
+.archived-job-item {
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+.archived-job-header {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--bg);
+  font-size: 11px;
+}
+.archived-job-prompt {
+  flex: 1;
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 60px;
+  overflow-y: auto;
+}
+.archived-job-preview {
+  padding: 6px 10px;
+  font-size: 11px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 80px;
+  overflow-y: auto;
+  border-top: 1px solid var(--border);
+  font-family: var(--font-mono);
+}
 
 .empty-state {
   display: flex;
@@ -1092,7 +1190,8 @@ header h1 { font-size: 16px; color: var(--accent); }
   flex-shrink: 0;
 }
 
-#hub-post-bar input {
+#hub-post-bar input,
+#hub-post-bar textarea {
   background: var(--bg);
   border: 1px solid var(--border);
   color: var(--text);
@@ -1101,10 +1200,19 @@ header h1 { font-size: 16px; color: var(--accent); }
   font-size: 12px;
   border-radius: 4px;
 }
-#hub-content-input { flex: 1; }
-#hub-post-bar input:focus { outline: none; border-color: var(--accent); }
+#hub-content-input { flex: 1; resize: none; max-height: 100px; overflow-y: auto; line-height: 1.4; }
+#hub-post-bar input:focus, #hub-post-bar textarea:focus { outline: none; border-color: var(--accent); }
 
 /* ── Hub messages ──────────────────────────────────────────────────────────── */
+.hub-older-notice {
+  font-size: 11px;
+  color: var(--muted);
+  text-align: center;
+  padding: 6px 12px;
+  border-bottom: 1px dashed var(--border);
+  margin-bottom: 8px;
+}
+
 .hub-msg {
   padding: 8px 10px;
   border: 1px solid var(--border);

@@ -1660,4 +1660,168 @@ describe('tmuxRunner', () => {
       expect(tmuxRunner.isResponseLine('> [Pasted text #3 +10 lines]')).toBe(false);
     });
   });
+
+  // ── isPromptLine ──────────────────────────────────────────────────────────
+  describe('isPromptLine', () => {
+    it('should match bare > prompt', () => {
+      expect(tmuxRunner.isPromptLine('>')).toBe(true);
+      expect(tmuxRunner.isPromptLine('>  ')).toBe(true);
+      expect(tmuxRunner.isPromptLine('  >  ')).toBe(true);
+    });
+
+    it('should match bare ❯ prompt', () => {
+      expect(tmuxRunner.isPromptLine('❯')).toBe(true);
+      expect(tmuxRunner.isPromptLine('❯  ')).toBe(true);
+      expect(tmuxRunner.isPromptLine('  ❯  ')).toBe(true);
+    });
+
+    it('should match ❯ with text (Claude ready for input)', () => {
+      expect(tmuxRunner.isPromptLine('❯ How can I help you today?')).toBe(true);
+      expect(tmuxRunner.isPromptLine('❯ Type a message...')).toBe(true);
+    });
+
+    it('should reject permission menu items (Allow/Deny/Yes/No)', () => {
+      expect(tmuxRunner.isPromptLine('❯ Allow')).toBe(false);
+      expect(tmuxRunner.isPromptLine('❯ Deny')).toBe(false);
+      expect(tmuxRunner.isPromptLine('❯ Yes')).toBe(false);
+      expect(tmuxRunner.isPromptLine('❯ No')).toBe(false);
+      // Case-insensitive
+      expect(tmuxRunner.isPromptLine('❯ allow')).toBe(false);
+      expect(tmuxRunner.isPromptLine('❯ YES')).toBe(false);
+    });
+
+    it('should reject numbered permission menu items', () => {
+      expect(tmuxRunner.isPromptLine('❯ 1. Yes')).toBe(false);
+      expect(tmuxRunner.isPromptLine('❯ 2. No')).toBe(false);
+      expect(tmuxRunner.isPromptLine('❯ 1. Allow')).toBe(false);
+      expect(tmuxRunner.isPromptLine('❯ 2. Deny')).toBe(false);
+    });
+
+    it('should reject non-prompt lines', () => {
+      expect(tmuxRunner.isPromptLine('regular content line')).toBe(false);
+      expect(tmuxRunner.isPromptLine('No conversation found with session ID: abc')).toBe(false);
+      expect(tmuxRunner.isPromptLine('➜  jira_master')).toBe(false);   // zsh shell prompt
+      expect(tmuxRunner.isPromptLine('user@host:~$')).toBe(false);      // bash shell prompt
+      expect(tmuxRunner.isPromptLine('')).toBe(false);
+    });
+  });
+
+  // ── classifyStartupScreen ─────────────────────────────────────────────────
+  describe('classifyStartupScreen', () => {
+    it('returns ready for bare > prompt line', () => {
+      expect(tmuxRunner.classifyStartupScreen('>')).toBe('ready');
+    });
+
+    it('returns ready for bare ❯ prompt line', () => {
+      expect(tmuxRunner.classifyStartupScreen('❯')).toBe('ready');
+    });
+
+    it('returns ready when Claude prompt appears after output', () => {
+      const screen = 'Claude Code v2.1.63\nWelcome back!\n❯';
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('ready');
+    });
+
+    // ── stale-resume: real log scenarios ─────────────────────────────────
+    it('returns stale-resume for "No conversation found" without shell prompt — log bf7f9423 at 2s', () => {
+      // Error appears immediately before the shell prompt renders
+      const screen = [
+        "export CLAUDE_CODE_DISABLE_ALTERNATE_SCREEN=1 && claude --verbose --resume '473bc451-78e7-41de-8d93-a7278309d409' --model 'opus'",
+        'No conversation found with session ID: 473bc451-78e7-41de-8d93-a7278309d409',
+      ].join('\n');
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('stale-resume');
+    });
+
+    it('returns stale-resume for "No conversation found" WITH zsh ➜ prompt — log bf7f9423 at 4s', () => {
+      // This is the key regression: old code required \$ shell prompt which never matched ➜,
+      // causing a 60s stall. Stale-resume must be detected independently of shell prompt style.
+      const screen = [
+        "claude --verbose --resume '473bc451-78e7-41de-8d93-a7278309d409' --model 'opus'",
+        'No conversation found with session ID: 473bc451-78e7-41de-8d93-a7278309d409',
+        '➜  jira_master',
+      ].join('\n');
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('stale-resume');
+    });
+
+    it('returns stale-resume for "No conversation found" WITH zsh ➜ prompt — log 744ba507', () => {
+      const screen = [
+        "claude --verbose --resume 'f0e01650-edb3-4022-af79-7d46bdc4afb7' --model 'opus'",
+        'No conversation found with session ID: f0e01650-edb3-4022-af79-7d46bdc4afb7',
+        '➜  workspaces',
+      ].join('\n');
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('stale-resume');
+    });
+
+    it('returns stale-resume for "No conversation found" WITH bash $ prompt', () => {
+      const screen = [
+        "claude --verbose --resume 'abc123' --model 'opus'",
+        'No conversation found with session ID: abc123',
+        'user@host:~/workdir$',
+      ].join('\n');
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('stale-resume');
+    });
+
+    // ── fatal-error ───────────────────────────────────────────────────────
+    it('returns fatal-error for "command not found" with bash $ prompt', () => {
+      const screen = 'claude: command not found\nuser@host:~$';
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('fatal-error');
+    });
+
+    it('returns fatal-error for Error with bash $ prompt', () => {
+      const screen = 'Error: some startup failure\nuser@host:~$';
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('fatal-error');
+    });
+
+    it('returns fatal-error for FATAL with root # prompt', () => {
+      const screen = 'FATAL: config file not found\nroot@host:~#';
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('fatal-error');
+    });
+
+    it('returns fatal-error for "No executable found" with bash $ prompt', () => {
+      const screen = 'No executable claude found in PATH\nuser@host:~$';
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('fatal-error');
+    });
+
+    // ── ready takes priority over fatal-error ─────────────────────────────
+    it('returns ready (not fatal-error) when Claude prompt is present despite "error" in content', () => {
+      const screen = 'There was an error in your code on line 5\n❯';
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('ready');
+    });
+
+    // ── pending ───────────────────────────────────────────────────────────
+    it('returns pending for startup with token count visible but no prompt', () => {
+      // Real Claude TUI startup screen: token counter in footer, no ❯ yet
+      const screen = '                                                25505 tokens |                                       ● high · /effort';
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('pending');
+    });
+
+    it('returns pending for empty screen', () => {
+      expect(tmuxRunner.classifyStartupScreen('')).toBe('pending');
+      expect(tmuxRunner.classifyStartupScreen('   \n   \n   ')).toBe('pending');
+    });
+
+    it('returns pending for SSH MOTD / welcome banner', () => {
+      const screen = '==============================\nWelcome to Ubuntu 22.04 LTS\n==============================';
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('pending');
+    });
+
+    // ── trust-prompt ──────────────────────────────────────────────────────
+    it('returns trust-prompt for the exact trust dialog seen in logs', () => {
+      const screen = ' ❯ 1. Yes, I trust this folder |    2. No, exit |  Enter to confirm · Esc to cancel';
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('trust-prompt');
+    });
+
+    it('returns trust-prompt when trust dialog appears mid-screen', () => {
+      const screen = [
+        'Claude Code v2.1.63',
+        '',
+        ' ❯ 1. Yes, I trust this folder |    2. No, exit |  Enter to confirm · Esc to cancel',
+      ].join('\n');
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('trust-prompt');
+    });
+
+    it('returns trust-prompt for "Yes, trust this directory" variant', () => {
+      const screen = '❯ 1. Yes, I trust this directory |  2. No, exit |  Enter to confirm · Esc to cancel';
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('trust-prompt');
+    });
+  });
 });

@@ -7,21 +7,38 @@ import { runClaudeOverSsh, getRemoteContextTokens, type SshRunOptions } from './
 import { runClaudeViaTmuxForSession, abortTmuxJob, clearTmuxSession } from './tmuxRunner.js';
 import { config } from '../config.js';
 
-/** Execution channel — 'work' for direct sends, 'hub' for hub dispatches. */
-export type ExecChannel = 'work' | 'hub';
+/**
+ * Execution channel:
+ *   'work'                    — direct sends (dashboard chat, CLI banana send)
+ *   'hub'                     — hub chat dispatches (listen/chat/engage engagement)
+ *   `hub-channel:${channelId}` — triggered work from a specific hub channel
+ *                               Each channel gets its own tmux session so one agent
+ *                               can handle triggered work from multiple channels in parallel.
+ */
+export type ExecChannel = 'work' | 'hub' | `hub-channel:${string}`;
+
+/** Extract the channel ID slug from a hub-channel ExecChannel string. */
+function hubChSlug(channel: ExecChannel): string {
+  return channel.slice('hub-channel:'.length);
+}
 
 /**
  * Build the execution key for activeExecutions/pendingQueue Maps.
  * Persistent tmux sessions get separate channels; non-persistent share one process.
  */
 function execKey(sessionId: string, channel: ExecChannel, persistentMode?: boolean): string {
-  if (persistentMode && channel === 'hub') return `${sessionId}:hub`;
+  if (persistentMode) {
+    if (channel === 'hub') return `${sessionId}:hub`;
+    if (channel.startsWith('hub-channel:')) return `${sessionId}:hub-ch-${hubChSlug(channel)}`;
+  }
   return sessionId;
 }
 
-/** Map ExecChannel to tmux suffix. */
+/** Map ExecChannel to tmux suffix. Matches the name used by tmuxRunner. */
 function tmuxSuffix(channel: ExecChannel): string | undefined {
-  return channel === 'hub' ? '-hub' : undefined;
+  if (channel === 'hub') return '-hub';
+  if (channel.startsWith('hub-channel:')) return `-hub-ch-${hubChSlug(channel)}`;
+  return undefined;
 }
 
 /** Active SSH executions — keyed by execKey for abort support. */
@@ -85,8 +102,11 @@ function fireGlobalCallbacks(sessionId: string, jobId: string): void {
  */
 export function isSessionBusy(sessionId: string, channel?: ExecChannel): boolean {
   if (!channel) {
-    // Check both possible keys
-    return activeExecutions.has(sessionId) || activeExecutions.has(`${sessionId}:hub`);
+    if (activeExecutions.has(sessionId)) return true;
+    for (const key of activeExecutions.keys()) {
+      if (key.startsWith(`${sessionId}:`)) return true;
+    }
+    return false;
   }
   // Channel-specific check — need machine info
   const session = sessionStore.get(sessionId);
@@ -99,17 +119,19 @@ export function isSessionBusy(sessionId: string, channel?: ExecChannel): boolean
 export function getActiveSessionIds(): string[] {
   const ids = new Set<string>();
   for (const key of activeExecutions.keys()) {
-    // Strip ':hub' suffix to get the base session ID
-    ids.add(key.replace(/:hub$/, ''));
+    const colonIdx = key.indexOf(':');
+    ids.add(colonIdx >= 0 ? key.slice(0, colonIdx) : key);
   }
   return Array.from(ids);
 }
 
 /** Return the number of jobs waiting in the per-session queue. */
 export function getPendingJobCount(sessionId: string): number {
-  const base = pendingQueue.get(sessionId)?.length ?? 0;
-  const hub = pendingQueue.get(`${sessionId}:hub`)?.length ?? 0;
-  return base + hub;
+  let total = 0;
+  for (const [key, jobs] of pendingQueue.entries()) {
+    if (key === sessionId || key.startsWith(`${sessionId}:`)) total += jobs.length;
+  }
+  return total;
 }
 
 function fmtDuration(ms: number): string {

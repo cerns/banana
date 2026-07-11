@@ -53,6 +53,8 @@
     <div id="content">
       <div id="content-header">
         <span id="content-title" style="color:var(--muted)">Select a session</span>
+        <button id="show-archived-jobs-btn" class="btn btn-sm" style="display:none" title="View archived messages">0 archived</button>
+        <button id="archive-all-jobs-btn" class="btn btn-sm" style="display:none" title="Archive all messages in this session">Archive all</button>
         <button id="clear-queue-btn" class="btn btn-sm" style="display:none;background:var(--yellow,orange);color:#000" title="Clear hub message queue">Clear Queue</button>
         <button id="kill-btn" class="btn btn-danger btn-sm" style="display:none">Kill</button>
       </div>
@@ -67,6 +69,7 @@
       <div id="prompt-bar">
         <textarea id="prompt-input" rows="1" placeholder="Send a prompt..." autocomplete="off" data-1p-ignore data-lpignore="true"></textarea>
         <button id="send-btn" class="btn">Send</button>
+        <button id="bg-btn" class="btn btn-sm" style="display:none" title="Send ctrl+b ctrl+b — run blocking command in background so Claude can continue">Bg</button>
         <button id="stop-btn" class="btn btn-danger" style="display:none" title="Stop running job (Esc)">Stop</button>
       </div>
     </div>
@@ -101,7 +104,7 @@
         <div id="hub-messages-view">
           <div id="hub-messages"></div>
           <div id="hub-post-bar">
-            <input id="hub-content-input" type="text" placeholder="Post a message..." autocomplete="off" data-1p-ignore data-lpignore="true" data-form-type="other" />
+            <textarea id="hub-content-input" rows="1" placeholder="Post a message..." autocomplete="off" data-1p-ignore data-lpignore="true" data-form-type="other"></textarea>
             <input id="hub-tags-input" type="text" placeholder="tags (comma-sep)" style="width:120px" autocomplete="off" data-1p-ignore />
             <input id="hub-mentions-input" type="text" placeholder="@mentions" style="width:120px" autocomplete="off" data-1p-ignore />
             <button id="hub-post-btn" class="btn">Post</button>
@@ -136,6 +139,17 @@
           </div>
         </div>
       </div>
+    </div>
+  </div>
+
+  <!-- Archived session messages modal -->
+  <div id="archived-jobs-modal" class="modal" style="display:none">
+    <div class="modal-content modal-lg">
+      <div class="modal-header">
+        <span>Archived Messages</span>
+        <button class="modal-close" data-close="archived-jobs-modal">&times;</button>
+      </div>
+      <div class="modal-body" id="archived-jobs-list"></div>
     </div>
   </div>
 

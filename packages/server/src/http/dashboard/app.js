@@ -18,6 +18,11 @@ let channelTasks = {}; // channelId → ChannelTask[]
 let channelDocs = {}; // channelId → ChannelDoc[]
 let currentDocId = null;
 
+const CHUNK_MEM_CAP = 2000;    // max chunks kept in memory per job
+const CHUNK_RENDER_CAP = 500;  // max chunks rendered in a full (re)paint
+const HUB_MEM_CAP = 500;       // max hub messages kept per channel in memory
+const HUB_RENDER_CAP = 150;    // max hub messages rendered in a full repaint
+
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const authPanel = document.getElementById('auth-panel');
 const mainPanel = document.getElementById('main');
@@ -58,6 +63,41 @@ function restoreOutputs(sessionId) {
     if (raw) outputs[sessionId] = JSON.parse(raw);
   } catch (e) {
     // corrupt cache — ignore
+  }
+}
+
+// ── Archived jobs (collapse without deleting) ─────────────────────────────────
+let archivedJobs = {};     // sessionId → Set<jobId>
+
+(function loadArchivedJobs() {
+  try {
+    const raw = localStorage.getItem('banana_archived_jobs');
+    if (!raw) return;
+    for (const [sid, ids] of Object.entries(JSON.parse(raw))) {
+      archivedJobs[sid] = new Set(ids);
+    }
+  } catch {}
+})();
+
+function saveArchivedJobs() {
+  try {
+    const obj = {};
+    for (const [sid, set] of Object.entries(archivedJobs)) {
+      if (set.size) obj[sid] = [...set];
+    }
+    localStorage.setItem('banana_archived_jobs', JSON.stringify(obj));
+  } catch {}
+}
+
+function updateArchivedBadge() {
+  const count = archivedJobs[activeSessionId]?.size ?? 0;
+  const btn = document.getElementById('show-archived-jobs-btn');
+  if (!btn) return;
+  if (count > 0) {
+    btn.style.display = 'inline-block';
+    btn.textContent = `${count} archived`;
+  } else {
+    btn.style.display = 'none';
   }
 }
 
@@ -320,7 +360,9 @@ function handleEvent(msg) {
 
   if (event === 'OUTPUT_CHUNK') {
     ensureOutput(sessionId, msg.jobId);
-    outputs[sessionId][msg.jobId].chunks.push(msg.chunk);
+    const _jobChunks = outputs[sessionId][msg.jobId].chunks;
+    _jobChunks.push(msg.chunk);
+    if (_jobChunks.length > CHUNK_MEM_CAP) _jobChunks.splice(0, _jobChunks.length - CHUNK_MEM_CAP);
     saveOutputs(sessionId);
     markUnread(sessionId);
     if (sessionId === activeSessionId) renderOutput();
@@ -460,9 +502,16 @@ function renderSessionItem(s) {
       <div class="session-tooltip-cmd"><code>${esc(resumeCmd)}</code><button class="session-tooltip-copy" data-copy="${esc(resumeCmd)}" title="Copy">⧉</button></div>`;
   }
   if (isPersistent) {
-    const tmuxCmd = `${sshPrefix}tmux attach -t banana-${sid8}`;
-    tooltipHtml += `<div class="session-tooltip-label">Attach tmux</div>
-      <div class="session-tooltip-cmd"><code>${esc(tmuxCmd)}</code><button class="session-tooltip-copy" data-copy="${esc(tmuxCmd)}" title="Copy">⧉</button></div>`;
+    const mkEntry = (label, cmd) =>
+      `<div class="session-tooltip-label">${label}</div>` +
+      `<div class="session-tooltip-cmd"><code>${esc(cmd)}</code><button class="session-tooltip-copy" data-copy="${esc(cmd)}" title="Copy">⧉</button></div>`;
+    tooltipHtml += mkEntry('Work tmux', `${sshPrefix}tmux attach -t banana-${sid8}`);
+    tooltipHtml += mkEntry('Hub tmux',  `${sshPrefix}tmux attach -t banana-${sid8}-hub`);
+    (s.channels || []).forEach(chId => {
+      const ch = hubChannels.find(c => c.id === chId);
+      const chName = ch?.name || chId;
+      tooltipHtml += mkEntry(`Hub-ch tmux (${esc(chName)})`, `${sshPrefix}tmux attach -t banana-${sid8}-hub-ch-${chId}`);
+    });
   }
 
   return `
@@ -657,6 +706,8 @@ async function selectSession(id) {
   const s = sessions[id];
   contentTitle.textContent = buildContentTitle(s, id);
   killBtn.style.display = 'inline-block';
+  document.getElementById('archive-all-jobs-btn').style.display = 'inline-block';
+  updateArchivedBadge();
   // Show Clear Queue button if session has queued hub messages
   const hasQueue = s && Array.isArray(s.hubQueue) && s.hubQueue.length > 0;
   clearQueueBtn.style.display = hasQueue ? 'inline-block' : 'none';
@@ -712,6 +763,7 @@ function updateInputState() {
   promptInput.placeholder = 'Send a prompt...';
   const running = isJobRunning();
   stopBtn.style.display = running ? 'inline-block' : 'none';
+  document.getElementById('bg-btn').style.display = running ? 'inline-block' : 'none';
 }
 
 // ── Output ────────────────────────────────────────────────────────────────────
@@ -747,11 +799,23 @@ function _doRenderOutput() {
       // Update status in header
       const statusEl = block.querySelector('.job-status');
       if (statusEl) statusEl.innerHTML = _jobStatus(job);
-      // Update body content
+      // Append only new chunks since last render (O(delta) instead of O(n))
       const body = block.querySelector('.output-body');
       if (body) {
         const wasAtBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 30;
-        body.innerHTML = renderChunks(job.chunks) || '<span style="color:var(--muted);font-size:11px;">(no output)</span>';
+        const rendered = parseInt(body.dataset.chunkCount ?? '0', 10);
+        if (rendered > job.chunks.length) {
+          // Chunks were trimmed from memory — full re-render of body
+          body.innerHTML = renderChunksWindowed(job.chunks);
+          body.dataset.chunkCount = job.chunks.length;
+        } else {
+          const newChunks = job.chunks.slice(rendered);
+          if (newChunks.length > 0) {
+            const delta = renderChunks(newChunks);
+            if (delta) body.insertAdjacentHTML('beforeend', delta);
+            body.dataset.chunkCount = job.chunks.length;
+          }
+        }
         if (wasAtBottom) body.scrollTop = body.scrollHeight;
       }
       // Keep outer scroll at bottom if it was there
@@ -761,15 +825,24 @@ function _doRenderOutput() {
     }
   }
 
-  // Full render (new jobs or first render)
-  const html = entries.map(([jobId, job]) => `
+  // Full render (new jobs or first render) — archived jobs are excluded; view them via the modal
+  const sessionArchived = archivedJobs[activeSessionId] ?? new Set();
+  const visible = entries.filter(([jobId]) => !sessionArchived.has(jobId));
+  updateArchivedBadge();
+  if (visible.length === 0) {
+    outputDiv.innerHTML = '<div class="empty-state"><div class="big">🍌</div><div>No output yet</div></div>';
+    _lastRenderedJobKey = jobKey;
+    return;
+  }
+  const html = visible.map(([jobId, job]) => `
     <div class="output-block" id="job-${jobId}">
       <div class="output-header">
         <span class="job-id">${jobId.slice(0, 8)}</span>
         <span class="job-prompt">${esc(job.prompt)}</span>
         <span class="job-status">${_jobStatus(job)}</span>
+        <button class="job-archive-btn" data-job-id="${jobId}" title="Archive this message">⊟</button>
       </div>
-      <div class="output-body">${renderChunks(job.chunks) || '<span style="color:var(--muted);font-size:11px;">(no output)</span>'}</div>
+      <div class="output-body" data-chunk-count="${job.chunks.length}">${renderChunksWindowed(job.chunks)}</div>
     </div>`).join('');
 
   outputDiv.innerHTML = html;
@@ -788,6 +861,15 @@ function _jobStatus(job) {
   if (job.error) return `<span style="color:var(--red)">error: ${esc(job.error)}</span>`;
   if (job.done)  return `<span style="color:var(--green)">done (exit ${job.exitCode ?? 0})</span>`;
   return `<span style="color:var(--accent)">running…</span>`;
+}
+
+function renderChunksWindowed(chunks) {
+  const omitted = Math.max(0, chunks.length - CHUNK_RENDER_CAP);
+  const display = omitted > 0 ? chunks.slice(-CHUNK_RENDER_CAP) : chunks;
+  const notice = omitted > 0
+    ? `<div class="chunk-truncated">↑ ${omitted} earlier lines not shown</div>`
+    : '';
+  return notice + (renderChunks(display) || '<span style="color:var(--muted);font-size:11px;">(no output)</span>');
 }
 
 function renderChunks(chunks) {
@@ -830,11 +912,81 @@ function renderChunks(chunks) {
     if (c.type === 'result') return c.is_error ? `<span class="chunk-stderr">Error: ${esc(c.result || '')}</span>` : '';
     if (c.type === 'system') return '';
     if (c.type === 'stderr') return `<span class="chunk-stderr">${esc(c.text)}</span>`;
+    if (c.type === 'input_request') return renderInputRequest(c);
     return `<span class="chunk-raw">${esc(JSON.stringify(c))}</span>`;
   }).join('');
 }
 
+// ── Interactive input_request rendering & response ────────────────────────────
+function renderInputRequest(c) {
+  const lines = (c.screen || '').split('\n').map(l => l.trim()).filter(Boolean);
+  // Extract numbered choices (lines matching "N." or "N .")
+  const choices = [];
+  let question = '';
+  for (const line of lines) {
+    const m = line.match(/^(\d+)[.)]\s+(.+)/);
+    if (m) {
+      choices.push({ n: m[1], label: m[2] });
+    } else if (!choices.length && !/Enter to select|Tab.*navigate|Esc to cancel/i.test(line)) {
+      question = line; // last non-hint line before choices is the question
+    }
+  }
+  const choiceButtons = choices.map(ch =>
+    `<button class="input-req-choice" data-keys="${esc(ch.n + ' Enter')}" title="Send: ${esc(ch.n)} + Enter">${esc(ch.n)}. ${esc(ch.label)}</button>`
+  ).join('');
+  return `<div class="input-request">
+    <div class="input-req-label">Claude is waiting for your input${question ? ': ' + esc(question) : ''}</div>
+    ${choiceButtons ? `<div class="input-req-choices">${choiceButtons}</div>` : ''}
+    <div class="input-req-freetext">
+      <input class="input-req-text" placeholder="Type a response and press Enter…" autocomplete="off" />
+      <button class="input-req-send">Send</button>
+    </div>
+  </div>`;
+}
+
+async function sendSessionKeys(keys) {
+  if (!activeSessionId) return;
+  await apiFetch(`/api/sessions/${activeSessionId}/keys`, {
+    method: 'POST',
+    body: JSON.stringify({ keys }),
+  });
+}
+
+// Event delegation for input_request widgets inside output div
+outputDiv.addEventListener('click', async e => {
+  const choiceBtn = e.target.closest('.input-req-choice');
+  const sendBtn = e.target.closest('.input-req-send');
+  if (choiceBtn) {
+    await sendSessionKeys(choiceBtn.dataset.keys);
+    return;
+  }
+  if (sendBtn) {
+    const widget = sendBtn.closest('.input-request');
+    const input = widget?.querySelector('.input-req-text');
+    if (input?.value.trim()) {
+      await sendSessionKeys(input.value.trim() + ' Enter');
+      input.value = '';
+    }
+  }
+});
+outputDiv.addEventListener('keydown', async e => {
+  if (e.key !== 'Enter') return;
+  const input = e.target.closest('.input-req-text');
+  if (!input) return;
+  e.preventDefault();
+  if (input.value.trim()) {
+    await sendSessionKeys(input.value.trim() + ' Enter');
+    input.value = '';
+  }
+});
+
 // ── Actions ───────────────────────────────────────────────────────────────────
+function autoResize(el) {
+  el.style.height = 'auto';
+  el.style.height = el.scrollHeight + 'px';
+}
+promptInput.addEventListener('input', () => autoResize(promptInput));
+
 sendBtn.addEventListener('click', sendPrompt);
 promptInput.addEventListener('keydown', e => { if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); sendPrompt(); } });
 
@@ -842,6 +994,7 @@ async function sendPrompt() {
   const prompt = promptInput.value.trim();
   if (!prompt || !activeSessionId) return;
   promptInput.value = '';
+  autoResize(promptInput);
   // Use the session's stored model, falling back to the header dropdown selection.
   const session = sessions[activeSessionId];
   const model = session?.model || document.getElementById('model-select')?.value || '';
@@ -860,6 +1013,84 @@ async function sendPrompt() {
     updateSessionSpinner(activeSessionId);
   }
 }
+
+// ── Archive / restore job messages ───────────────────────────────────────────
+outputDiv.addEventListener('click', e => {
+  const btn = e.target.closest('.job-archive-btn');
+  if (!btn) return;
+  const jobId = btn.dataset.jobId;
+  if (!jobId || !activeSessionId) return;
+  if (!archivedJobs[activeSessionId]) archivedJobs[activeSessionId] = new Set();
+  archivedJobs[activeSessionId].add(jobId);
+  saveArchivedJobs();
+  renderOutput();
+});
+
+document.getElementById('archive-all-jobs-btn').addEventListener('click', () => {
+  if (!activeSessionId) return;
+  const jobs = outputs[activeSessionId];
+  if (!jobs) return;
+  if (!archivedJobs[activeSessionId]) archivedJobs[activeSessionId] = new Set();
+  for (const jobId of Object.keys(jobs)) archivedJobs[activeSessionId].add(jobId);
+  saveArchivedJobs();
+  renderOutput();
+});
+
+document.getElementById('show-archived-jobs-btn').addEventListener('click', openArchivedJobsModal);
+
+function openArchivedJobsModal() {
+  const jobs = outputs[activeSessionId] ?? {};
+  const archived = archivedJobs[activeSessionId] ?? new Set();
+  const entries = Object.entries(jobs).filter(([id]) => archived.has(id));
+  const list = document.getElementById('archived-jobs-list');
+  if (entries.length === 0) {
+    list.innerHTML = '<div style="color:var(--muted);text-align:center;padding:20px;font-size:12px">No archived messages</div>';
+  } else {
+    list.innerHTML = entries.map(([jobId, job]) => {
+      const preview = _chunksTextPreview(job.chunks, 200);
+      return `
+      <div class="archived-job-item" data-job-id="${jobId}">
+        <div class="archived-job-header">
+          <span class="job-id">${jobId.slice(0, 8)}</span>
+          <span class="archived-job-prompt">${esc(job.prompt)}</span>
+          <button class="restore-archived-btn btn btn-sm" data-job-id="${jobId}">↩ Restore</button>
+        </div>
+        ${preview ? `<div class="archived-job-preview">${esc(preview)}</div>` : ''}
+      </div>`;
+    }).join('');
+    list.querySelectorAll('.restore-archived-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        archivedJobs[activeSessionId]?.delete(btn.dataset.jobId);
+        saveArchivedJobs();
+        renderOutput();
+        openArchivedJobsModal(); // refresh modal
+      });
+    });
+  }
+  document.getElementById('archived-jobs-modal').style.display = 'flex';
+}
+
+function _chunksTextPreview(chunks, maxLen) {
+  let text = '';
+  for (const c of chunks) {
+    if (!c || typeof c !== 'object') continue;
+    if (c.type === 'stream_event') {
+      const d = c.event?.delta;
+      if (d?.type === 'text_delta' && d.text) text += d.text;
+    } else if (c.type === 'assistant') {
+      for (const b of c.message?.content ?? []) {
+        if (b.type === 'text') text += b.text;
+      }
+    }
+    if (text.length >= maxLen) break;
+  }
+  return text.slice(0, maxLen).trim();
+}
+
+// ── Background blocking command (ctrl+b ctrl+b) ───────────────────────────────
+document.getElementById('bg-btn').addEventListener('click', async () => {
+  await sendSessionKeys('C-b C-b');
+});
 
 // ── Stop (abort running job) ──────────────────────────────────────────────────
 stopBtn.addEventListener('click', stopJob);
@@ -884,6 +1115,8 @@ killBtn.addEventListener('click', async () => {
   localStorage.removeItem('banana_active_session');
   contentTitle.textContent = 'Select a session';
   killBtn.style.display = 'none';
+  document.getElementById('archive-all-jobs-btn').style.display = 'none';
+  document.getElementById('show-archived-jobs-btn').style.display = 'none';
   clearQueueBtn.style.display = 'none';
   renderSidebar();
   outputDiv.innerHTML = '<div class="empty-state"><div class="big">🍌</div><div>Select a session</div></div>';
@@ -1785,6 +2018,77 @@ async function selectHubChannel(channelId) {
   if (hubViewMode === 'docs') loadChannelDocs(channelId);
 }
 
+function renderOneHubMessage(m) {
+  const labelFor = sid => { const s = sessions[sid]; return s?.screenName || s?.name || sid.slice(0, 6); };
+  const indent = Math.min(m.depth, 5) * 16;
+  const dispatches = m.dispatches ?? [];
+  const colors = { queued: 'var(--muted)', running: 'var(--blue)', acted: 'var(--green)', skipped: 'var(--muted)', error: 'var(--red)', aborted: 'var(--yellow, orange)' };
+  const dispBadges = dispatches.map(d =>
+    `<span class="hub-dispatch-badge" style="color:${colors[d.status] || 'var(--muted)'}" title="${esc(d.sessionId)}">${esc(labelFor(d.sessionId))}:${d.status}</span>`
+  ).join(' ');
+
+  // While the message is not yet 'complete', surface any in-flight workers
+  // (running + queued) prominently with a spinner so it's obvious WHO we're
+  // waiting on right now. The high-level msg.status is 'pending' before any
+  // dispatch is added and 'dispatched' once at least one is in flight; we
+  // care about both.
+  const inFlight = m.status !== 'complete'
+    ? dispatches.filter(d => d.status === 'running' || d.status === 'queued')
+    : [];
+  const inFlightBlock = inFlight.length > 0
+    ? `<div class="hub-msg-inflight">
+         <span class="hub-spinner">⏳</span>
+         <span class="hub-inflight-label">processing:</span>
+         ${inFlight.map(d => `<span class="hub-inflight-agent hub-inflight-${d.status}" title="${esc(d.sessionId)} — ${d.status}">${esc(labelFor(d.sessionId))}${d.status === 'queued' ? ' (queued)' : ''}</span>`).join('')}
+       </div>`
+    : '';
+
+  const tagBadges = m.tags.map(t => `<span class="hub-tag">${esc(t)}</span>`).join('');
+  const mentionBadges = m.mentions.map(n => `<span class="hub-mention">@${esc(n)}</span>`).join('');
+
+  // Detect [SKIP][#REASON] messages for special rendering
+  const skipMatch = m.content.match(/^\[SKIP\]\[#([A-Z0-9_]+)\]\s*(.*)/is);
+  const isSkipMsg = !!skipMatch;
+  const skipReason = skipMatch ? skipMatch[1] : '';
+  const skipExplanation = skipMatch ? skipMatch[2].trim() : '';
+  const skipBadge = isSkipMsg
+    ? `<span class="hub-skip-badge" title="${esc(skipExplanation || skipReason)}">SKIP #${esc(skipReason)}</span>`
+    : '';
+  const contentHtml = isSkipMsg
+    ? (skipExplanation ? `<span class="hub-skip-text">${esc(skipExplanation)}</span>` : '')
+    : esc(m.content);
+
+  return `
+  <div class="hub-msg${isSkipMsg ? ' hub-msg-skip' : ''}" style="margin-left:${indent}px" data-msg-id="${m.id}">
+    <div class="hub-msg-header">
+      <button class="hub-retry-btn" data-retry="${m.id}" title="Retry / continue — re-dispatch a session that previously ran on this message (e.g. after rate limit reset)">↻</button>
+      <span class="hub-msg-from" data-session-id="${m.from}">${esc(m.fromName)}</span>
+      ${skipBadge}
+      <span class="hub-msg-time">${new Date(m.timestamp).toLocaleTimeString()}</span>
+      <span class="hub-msg-status hub-status-${m.status}">${m.status}</span>
+      <button class="hub-trigger-btn" data-trigger="${m.id}" title="Trigger a session to act on this message">▶ Trigger</button>
+    </div>
+    <div class="hub-msg-content">${contentHtml}</div>
+    ${inFlightBlock}
+    <div class="hub-msg-meta">${tagBadges} ${mentionBadges} ${dispBadges}</div>
+  </div>`;
+}
+
+function attachHubMsgListeners(root) {
+  root.querySelectorAll('.hub-trigger-btn').forEach(btn => {
+    btn.addEventListener('click', e => { e.stopPropagation(); openTriggerPicker(btn.dataset.trigger, btn); });
+  });
+  root.querySelectorAll('.hub-retry-btn').forEach(btn => {
+    btn.addEventListener('click', e => { e.stopPropagation(); openRetryPicker(btn.dataset.retry, btn); });
+  });
+  root.querySelectorAll('.hub-msg-from').forEach(el => {
+    const sessionId = el.dataset.sessionId;
+    if (!sessionId) return;
+    el.addEventListener('mouseenter', () => { clearTimeout(_hubFromHideTimer); showHubFromTooltip(el, sessionId); });
+    el.addEventListener('mouseleave', () => { _hubFromHideTimer = setTimeout(hideHubFromTooltip, 150); });
+  });
+}
+
 function renderHubMessages() {
   const container = document.getElementById('hub-messages');
   const msgs = hubMessages[activeChannelId] ?? [];
@@ -1792,90 +2096,14 @@ function renderHubMessages() {
     container.innerHTML = '<div class="empty-state"><div>No messages</div></div>';
     return;
   }
-  // Friendly label for a sessionId — prefers screenName, then name, then short id.
-  const labelFor = sid => {
-    const s = sessions[sid];
-    return s?.screenName || s?.name || sid.slice(0, 6);
-  };
-  container.innerHTML = msgs.map(m => {
-    const indent = Math.min(m.depth, 5) * 16;
-    const dispatches = m.dispatches ?? [];
-    const colors = { queued: 'var(--muted)', running: 'var(--blue)', acted: 'var(--green)', skipped: 'var(--muted)', error: 'var(--red)', aborted: 'var(--yellow, orange)' };
-    const dispBadges = dispatches.map(d =>
-      `<span class="hub-dispatch-badge" style="color:${colors[d.status] || 'var(--muted)'}" title="${esc(d.sessionId)}">${esc(labelFor(d.sessionId))}:${d.status}</span>`
-    ).join(' ');
-
-    // While the message is not yet 'complete', surface any in-flight workers
-    // (running + queued) prominently with a spinner so it's obvious WHO we're
-    // waiting on right now. The high-level msg.status is 'pending' before any
-    // dispatch is added and 'dispatched' once at least one is in flight; we
-    // care about both.
-    const inFlight = m.status !== 'complete'
-      ? dispatches.filter(d => d.status === 'running' || d.status === 'queued')
-      : [];
-    const inFlightBlock = inFlight.length > 0
-      ? `<div class="hub-msg-inflight">
-           <span class="hub-spinner">⏳</span>
-           <span class="hub-inflight-label">processing:</span>
-           ${inFlight.map(d => `<span class="hub-inflight-agent hub-inflight-${d.status}" title="${esc(d.sessionId)} — ${d.status}">${esc(labelFor(d.sessionId))}${d.status === 'queued' ? ' (queued)' : ''}</span>`).join('')}
-         </div>`
-      : '';
-
-    const tagBadges = m.tags.map(t => `<span class="hub-tag">${esc(t)}</span>`).join('');
-    const mentionBadges = m.mentions.map(n => `<span class="hub-mention">@${esc(n)}</span>`).join('');
-
-    // Detect [SKIP][#REASON] messages for special rendering
-    const skipMatch = m.content.match(/^\[SKIP\]\[#([A-Z0-9_]+)\]\s*(.*)/is);
-    const isSkipMsg = !!skipMatch;
-    const skipReason = skipMatch ? skipMatch[1] : '';
-    const skipExplanation = skipMatch ? skipMatch[2].trim() : '';
-    const skipBadge = isSkipMsg
-      ? `<span class="hub-skip-badge" title="${esc(skipExplanation || skipReason)}">SKIP #${esc(skipReason)}</span>`
-      : '';
-    const contentHtml = isSkipMsg
-      ? (skipExplanation ? `<span class="hub-skip-text">${esc(skipExplanation)}</span>` : '')
-      : esc(m.content);
-
-    return `
-    <div class="hub-msg${isSkipMsg ? ' hub-msg-skip' : ''}" style="margin-left:${indent}px" data-msg-id="${m.id}">
-      <div class="hub-msg-header">
-        <button class="hub-retry-btn" data-retry="${m.id}" title="Retry / continue — re-dispatch a session that previously ran on this message (e.g. after rate limit reset)">↻</button>
-        <span class="hub-msg-from" data-session-id="${m.from}">${esc(m.fromName)}</span>
-        ${skipBadge}
-        <span class="hub-msg-time">${new Date(m.timestamp).toLocaleTimeString()}</span>
-        <span class="hub-msg-status hub-status-${m.status}">${m.status}</span>
-        <button class="hub-trigger-btn" data-trigger="${m.id}" title="Trigger a session to act on this message">▶ Trigger</button>
-      </div>
-      <div class="hub-msg-content">${contentHtml}</div>
-      ${inFlightBlock}
-      <div class="hub-msg-meta">${tagBadges} ${mentionBadges} ${dispBadges}</div>
-    </div>`;
-  }).join('');
+  const omitted = Math.max(0, msgs.length - HUB_RENDER_CAP);
+  const display = omitted > 0 ? msgs.slice(-HUB_RENDER_CAP) : msgs;
+  const notice = omitted > 0
+    ? `<div class="hub-older-notice">${omitted} older messages not shown — use ⊟ Compact to archive them</div>`
+    : '';
+  container.innerHTML = notice + display.map(m => renderOneHubMessage(m)).join('');
   container.scrollTop = container.scrollHeight;
-  container.querySelectorAll('.hub-trigger-btn').forEach(btn => {
-    btn.addEventListener('click', e => {
-      e.stopPropagation();
-      openTriggerPicker(btn.dataset.trigger, btn);
-    });
-  });
-  container.querySelectorAll('.hub-retry-btn').forEach(btn => {
-    btn.addEventListener('click', e => {
-      e.stopPropagation();
-      openRetryPicker(btn.dataset.retry, btn);
-    });
-  });
-  // Tooltip hover for agent name — shows tmux commands in a floating popup
-  container.querySelectorAll('.hub-msg-from').forEach(el => {
-    const sessionId = el.dataset.sessionId;
-    if (!sessionId) return;
-    el.addEventListener('mouseenter', () => {
-      clearTimeout(_hubFromHideTimer);
-      showHubFromTooltip(el, sessionId);
-    });
-    el.addEventListener('mouseleave', () => {
-      _hubFromHideTimer = setTimeout(hideHubFromTooltip, 150);
-    });
-  });
+  attachHubMsgListeners(container);
 }
 
 // ── Hub "from" tooltip (floating, shared, with copy buttons) ──────────────
@@ -1905,11 +2133,18 @@ function showHubFromTooltip(anchor, sessionId) {
   }
 
   _hubFromAnchor = anchor;
-  _hubFromTip.innerHTML = `
-    <div class="session-tooltip-label">Work tmux</div>
-    <div class="session-tooltip-cmd"><code>${esc(workCmd)}</code><button class="session-tooltip-copy" data-copy="${esc(workCmd)}">⧉</button></div>
-    <div class="session-tooltip-label">Hub tmux</div>
-    <div class="session-tooltip-cmd"><code>${esc(hubCmd)}</code><button class="session-tooltip-copy" data-copy="${esc(hubCmd)}">⧉</button></div>`;
+  const activeCh = hubChannels.find(c => c.id === activeChannelId);
+  const activeChName = activeCh?.name || (activeChannelId ? activeChannelId.slice(0, 8) : '');
+  const hubChCmd = activeChannelId
+    ? `${sshPrefix}tmux attach -t banana-${sid8}-hub-ch-${activeChannelId.slice(0, 8)}`
+    : null;
+  const mkTip = (label, cmd) =>
+    `<div class="session-tooltip-label">${label}</div>` +
+    `<div class="session-tooltip-cmd"><code>${esc(cmd)}</code><button class="session-tooltip-copy" data-copy="${esc(cmd)}">⧉</button></div>`;
+  _hubFromTip.innerHTML =
+    mkTip('Work tmux', workCmd) +
+    mkTip('Hub tmux', hubCmd) +
+    (hubChCmd ? mkTip(`Hub-ch tmux (${esc(activeChName)})`, hubChCmd) : '');
 
   _hubFromTip.querySelectorAll('.session-tooltip-copy').forEach(btn => {
     btn.onclick = (e) => {
@@ -2059,7 +2294,21 @@ function handleHubEvent(msg) {
     const m = msg.message;
     if (!hubMessages[m.channelId]) hubMessages[m.channelId] = [];
     hubMessages[m.channelId].push(m);
-    if (m.channelId === activeChannelId) renderHubMessages();
+    // Cap in-memory list to avoid unbounded growth
+    if (hubMessages[m.channelId].length > HUB_MEM_CAP) {
+      hubMessages[m.channelId].splice(0, hubMessages[m.channelId].length - HUB_MEM_CAP);
+    }
+    if (m.channelId === activeChannelId) {
+      const container = document.getElementById('hub-messages');
+      // Remove empty-state placeholder if present
+      const empty = container.querySelector('.empty-state');
+      if (empty) empty.remove();
+      const wasAtBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 50;
+      container.insertAdjacentHTML('beforeend', renderOneHubMessage(m));
+      const newEl = container.lastElementChild;
+      if (newEl) attachHubMsgListeners(newEl);
+      if (wasAtBottom) container.scrollTop = container.scrollHeight;
+    }
     // Auto-add channel if not known
     if (!hubChannels.find(c => c.id === m.channelId)) {
       loadHubChannels();
@@ -2074,7 +2323,18 @@ function handleHubEvent(msg) {
       if (target) {
         target.dispatches = msg.dispatches;
         if (msg.status) target.status = msg.status;
-        if (msg.channelId === activeChannelId) renderHubMessages();
+        if (msg.channelId === activeChannelId) {
+          // Update only the specific message DOM node in-place
+          const container = document.getElementById('hub-messages');
+          const existing = container.querySelector(`[data-msg-id="${msg.messageId}"]`);
+          if (existing) {
+            existing.outerHTML = renderOneHubMessage(target);
+            const replaced = container.querySelector(`[data-msg-id="${msg.messageId}"]`);
+            if (replaced) attachHubMsgListeners(replaced);
+          } else {
+            renderHubMessages();
+          }
+        }
       }
     }
   }
@@ -2775,16 +3035,19 @@ function debounce(fn, ms) {
 }
 
 document.getElementById('hub-post-btn').addEventListener('click', hubPost);
-document.getElementById('hub-content-input').addEventListener('keydown', e => {
-  if (e.key === 'Enter') { e.preventDefault(); hubPost(); }
+const hubContentInput = document.getElementById('hub-content-input');
+hubContentInput.addEventListener('input', () => autoResize(hubContentInput));
+hubContentInput.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); hubPost(); }
 });
 
 async function hubPost() {
-  const content = document.getElementById('hub-content-input').value.trim();
+  const content = hubContentInput.value.trim();
   if (!content || !activeChannelId) return;
   const tags = document.getElementById('hub-tags-input').value.split(',').map(s => s.trim()).filter(Boolean);
   const mentions = document.getElementById('hub-mentions-input').value.split(',').map(s => s.trim().replace(/^@/, '')).filter(Boolean);
-  document.getElementById('hub-content-input').value = '';
+  hubContentInput.value = '';
+  autoResize(hubContentInput);
   document.getElementById('hub-tags-input').value = '';
   document.getElementById('hub-mentions-input').value = '';
   await apiFetch('/api/hub/messages', {
