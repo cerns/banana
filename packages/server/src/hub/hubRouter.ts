@@ -1306,8 +1306,14 @@ export function processQueue(sessionId: string): void {
 
   // Respect concurrency limit even while draining
   if (runningHubJobs >= config.hubMaxConcurrentJobs) return;
-  // Respect busy state (hub channel)
-  if (isSessionBusy(sessionId, 'hub')) return;
+  // Respect busy state on the channel the next item will actually run on:
+  // triggered items execute on hub-channel:<id>, everything else on hub.
+  const peek = queue[0];
+  const peekMsg = hubStore.getMessage(peek.hubMessageId);
+  const gateChannel: ExecChannel = peek.engagement === 'triggered' && peekMsg
+    ? `hub-channel:${peekMsg.channelId}`
+    : 'hub';
+  if (isSessionBusy(sessionId, gateChannel)) return;
 
   // Take next message from queue
   const next = queue.shift()!;
@@ -1369,7 +1375,7 @@ export function drainGlobalQueue(): void {
     if (runningHubJobs >= config.hubMaxConcurrentJobs) break;
     const queue = session.hubQueue ?? [];
     if (queue.length === 0) continue;
-    if (isSessionBusy(session.sessionId, 'hub')) continue;
+    // Busy check happens inside processQueue against the next item's actual channel
     const last = sessionCooldowns.get(session.sessionId);
     if (last && (Date.now() - last) < config.hubCooldownMs) continue;
     processQueue(session.sessionId);
@@ -1400,8 +1406,10 @@ export function triggerSessionOnMessage(
 
   const sid = sessionId.slice(0, 8);
 
-  if (isSessionBusy(sessionId, 'work')) {
-    console.log(`[hub]   ${sid} TRIGGER → queue (work busy)`);
+  // Triggered work executes on the hub-channel:<id> exec channel — gate on that,
+  // not 'work' (direct sends), so a busy work chat doesn't block channel triggers.
+  if (isSessionBusy(sessionId, `hub-channel:${msg.channelId}`)) {
+    console.log(`[hub]   ${sid} TRIGGER → queue (hub-channel busy)`);
     queueForSession(sessionId, hubMessageId, 'triggered');
     return { ok: true, status: 'queued' };
   }

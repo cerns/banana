@@ -455,19 +455,36 @@ function broadcastError(sessionId: string, jobId: string, error: string): void {
   });
 }
 
-/** Abort an active SSH execution for a session and clear any pending queues (both channels). */
+/** All exec keys (activeExecutions/pendingQueue) belonging to a session: bare, :hub, :hub-ch-*. */
+function execKeysForSession(sessionId: string): string[] {
+  const keys = new Set<string>([sessionId, `${sessionId}:hub`]);
+  for (const key of activeExecutions.keys()) {
+    if (key === sessionId || key.startsWith(`${sessionId}:`)) keys.add(key);
+  }
+  for (const key of pendingQueue.keys()) {
+    if (key === sessionId || key.startsWith(`${sessionId}:`)) keys.add(key);
+  }
+  return [...keys];
+}
+
+/** Map an exec key back to its tmux suffix ('' for work, '-hub', '-hub-ch-…'). */
+function tmuxSuffixForKey(sessionId: string, key: string): string {
+  return key === sessionId ? '' : `-${key.slice(sessionId.length + 1)}`;
+}
+
+/** Abort all active SSH executions for a session and clear pending queues on every channel. */
 export function abortRemoteJob(sessionId: string): boolean {
-  // Clear pending queues for both channels — abort means "stop everything for this session"
+  // Abort means "stop everything for this session" — work, hub, and every hub-channel key.
   // IMPORTANT: Fire completion callbacks for cleared jobs so hub counters (runningHubJobs)
   // decrement properly. Without this, dispatchToSession's runningHubJobs++ is never
   // matched by onSessionJobComplete's runningHubJobs-- and the counter grows without bound.
-  const workQueue = pendingQueue.get(sessionId) ?? [];
-  const hubKey = `${sessionId}:hub`;
-  const hubQueue = pendingQueue.get(hubKey) ?? [];
-  const clearedJobs = [...workQueue, ...hubQueue];
+  const keys = execKeysForSession(sessionId);
+  const clearedJobs: PendingJob[] = [];
+  for (const key of keys) {
+    clearedJobs.push(...(pendingQueue.get(key) ?? []));
+    pendingQueue.delete(key);
+  }
   const queuedCount = clearedJobs.length;
-  pendingQueue.delete(sessionId);
-  pendingQueue.delete(hubKey);
   if (queuedCount > 0) {
     console.log(`[remote-executor] Cleared ${queuedCount} queued job(s) for ${sessionId.slice(0, 8)}`);
     // Fire completion callbacks for each cleared job — this lets hub's
@@ -485,26 +502,25 @@ export function abortRemoteJob(sessionId: string): boolean {
     clearSessionQueue(sessionId);
   } catch { /* hub module may not be loaded yet */ }
 
-  // Abort work channel
-  const workController = activeExecutions.get(sessionId);
-  // Abort hub channel
-  const hubController = activeExecutions.get(hubKey);
-
+  // Abort every active controller for this session (work, hub, hub-ch-*)
   let aborted = queuedCount > 0;
-  if (workController) { workController.abort(); aborted = true; }
-  if (hubController) { hubController.abort(); aborted = true; }
+  for (const key of keys) {
+    const controller = activeExecutions.get(key);
+    if (controller) { controller.abort(); aborted = true; }
+  }
 
-  // For tmux sessions, send C-c to both tmux sessions
+  // For tmux sessions, send C-c to every tmux session belonging to this sessionId
   const session = sessionStore.get(sessionId);
   if (session?.machineId) {
     const machine = machineStore.get(session.machineId);
     if (machine?.persistentMode) {
-      abortTmuxJob(machine, sessionId).catch((e) => {
-        console.warn(`[remote-executor] tmux abort (work) failed: ${(e as Error).message}`);
-      });
-      abortTmuxJob(machine, sessionId, '-hub').catch((e) => {
-        console.warn(`[remote-executor] tmux abort (hub) failed: ${(e as Error).message}`);
-      });
+      for (const key of keys) {
+        const sfx = tmuxSuffixForKey(sessionId, key);
+        const p = sfx ? abortTmuxJob(machine, sessionId, sfx) : abortTmuxJob(machine, sessionId);
+        p.catch((e) => {
+          console.warn(`[remote-executor] tmux abort (${sfx || 'work'}) failed: ${(e as Error).message}`);
+        });
+      }
     }
   }
 

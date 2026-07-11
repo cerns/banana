@@ -1435,21 +1435,27 @@ describe('tmuxRunner', () => {
       logSpy.mockRestore();
     });
 
-    it('killAllTmuxSessions should kill both work and hub sessions', async () => {
+    it('killAllTmuxSessions should kill work, hub, and every hub-ch session', async () => {
       setupAutoReply();
       const machine = makeMachine();
       const logSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
 
       await tmuxRunner.ensureTmuxSession(machine, 'kill-all', '/work');
       await tmuxRunner.ensureTmuxSession(machine, 'kill-all', '/work', undefined, undefined, '-hub');
+      await tmuxRunner.ensureTmuxSession(machine, 'kill-all', '/work', undefined, undefined, '-hub-ch-chan1');
+      await tmuxRunner.ensureTmuxSession(machine, 'kill-all', '/work', undefined, undefined, '-hub-ch-chan2');
 
       expect(tmuxRunner.hasTmuxSession('kill-all')).toBe(true);
       expect(tmuxRunner.hasTmuxSession('kill-all', '-hub')).toBe(true);
+      expect(tmuxRunner.hasTmuxSession('kill-all', '-hub-ch-chan1')).toBe(true);
+      expect(tmuxRunner.hasTmuxSession('kill-all', '-hub-ch-chan2')).toBe(true);
 
       await tmuxRunner.killAllTmuxSessions(machine, 'kill-all');
 
       expect(tmuxRunner.hasTmuxSession('kill-all')).toBe(false);
       expect(tmuxRunner.hasTmuxSession('kill-all', '-hub')).toBe(false);
+      expect(tmuxRunner.hasTmuxSession('kill-all', '-hub-ch-chan1')).toBe(false);
+      expect(tmuxRunner.hasTmuxSession('kill-all', '-hub-ch-chan2')).toBe(false);
       logSpy.mockRestore();
     });
   });
@@ -1773,6 +1779,11 @@ describe('tmuxRunner', () => {
 
     it('returns fatal-error for FATAL with root # prompt', () => {
       const screen = 'FATAL: config file not found\nroot@host:~#';
+      expect(tmuxRunner.classifyStartupScreen(screen)).toBe('fatal-error');
+    });
+
+    it('returns fatal-error for all-caps ERROR with bash $ prompt (case-insensitive)', () => {
+      const screen = 'ERROR: cannot bind port\nuser@host:~$';
       expect(tmuxRunner.classifyStartupScreen(screen)).toBe('fatal-error');
     });
 

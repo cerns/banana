@@ -360,9 +360,13 @@ function handleEvent(msg) {
 
   if (event === 'OUTPUT_CHUNK') {
     ensureOutput(sessionId, msg.jobId);
-    const _jobChunks = outputs[sessionId][msg.jobId].chunks;
-    _jobChunks.push(msg.chunk);
-    if (_jobChunks.length > CHUNK_MEM_CAP) _jobChunks.splice(0, _jobChunks.length - CHUNK_MEM_CAP);
+    const _jobOut = outputs[sessionId][msg.jobId];
+    // Track total chunks ever received — chunks.length stops growing once the
+    // memory cap trims old entries, and the incremental renderer needs the
+    // real count to keep painting new output past the cap.
+    _jobOut.received = (_jobOut.received ?? _jobOut.chunks.length) + 1;
+    _jobOut.chunks.push(msg.chunk);
+    if (_jobOut.chunks.length > CHUNK_MEM_CAP) _jobOut.chunks.splice(0, _jobOut.chunks.length - CHUNK_MEM_CAP);
     saveOutputs(sessionId);
     markUnread(sessionId);
     if (sessionId === activeSessionId) renderOutput();
@@ -736,6 +740,7 @@ async function selectSession(id) {
         outputs[id][job.jobId] = {
           prompt: job.prompt,
           chunks: job.chunks || [],
+          received: (job.chunks || []).length,
           done: job.finishedAt != null,
           exitCode: job.exitCode,
           error: job.error,
@@ -763,7 +768,10 @@ function updateInputState() {
   promptInput.placeholder = 'Send a prompt...';
   const running = isJobRunning();
   stopBtn.style.display = running ? 'inline-block' : 'none';
-  document.getElementById('bg-btn').style.display = running ? 'inline-block' : 'none';
+  // Bg (ctrl+b ctrl+b) only works on persistent tmux sessions
+  const activeMachine = machines.find(m => m.id === sessions[activeSessionId]?.machineId);
+  const canSendKeys = running && !!activeMachine?.persistentMode;
+  document.getElementById('bg-btn').style.display = canSendKeys ? 'inline-block' : 'none';
 }
 
 // ── Output ────────────────────────────────────────────────────────────────────
@@ -799,23 +807,23 @@ function _doRenderOutput() {
       // Update status in header
       const statusEl = block.querySelector('.job-status');
       if (statusEl) statusEl.innerHTML = _jobStatus(job);
-      // Append only new chunks since last render (O(delta) instead of O(n))
+      // Append only new chunks since last render (O(delta) instead of O(n)).
+      // Compare against total-received (not chunks.length) so rendering keeps
+      // working after the memory cap starts trimming old chunks.
       const body = block.querySelector('.output-body');
       if (body) {
         const wasAtBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 30;
+        const received = job.received ?? job.chunks.length;
         const rendered = parseInt(body.dataset.chunkCount ?? '0', 10);
-        if (rendered > job.chunks.length) {
-          // Chunks were trimmed from memory — full re-render of body
+        const newCount = received - rendered;
+        if (newCount < 0 || newCount > job.chunks.length) {
+          // Out of sync (restored/merged history) — full windowed re-render
           body.innerHTML = renderChunksWindowed(job.chunks);
-          body.dataset.chunkCount = job.chunks.length;
-        } else {
-          const newChunks = job.chunks.slice(rendered);
-          if (newChunks.length > 0) {
-            const delta = renderChunks(newChunks);
-            if (delta) body.insertAdjacentHTML('beforeend', delta);
-            body.dataset.chunkCount = job.chunks.length;
-          }
+        } else if (newCount > 0) {
+          const delta = renderChunks(job.chunks.slice(-newCount));
+          if (delta) body.insertAdjacentHTML('beforeend', delta);
         }
+        body.dataset.chunkCount = received;
         if (wasAtBottom) body.scrollTop = body.scrollHeight;
       }
       // Keep outer scroll at bottom if it was there
@@ -842,7 +850,7 @@ function _doRenderOutput() {
         <span class="job-status">${_jobStatus(job)}</span>
         <button class="job-archive-btn" data-job-id="${jobId}" title="Archive this message">⊟</button>
       </div>
-      <div class="output-body" data-chunk-count="${job.chunks.length}">${renderChunksWindowed(job.chunks)}</div>
+      <div class="output-body" data-chunk-count="${job.received ?? job.chunks.length}">${renderChunksWindowed(job.chunks)}</div>
     </div>`).join('');
 
   outputDiv.innerHTML = html;
@@ -912,38 +920,13 @@ function renderChunks(chunks) {
     if (c.type === 'result') return c.is_error ? `<span class="chunk-stderr">Error: ${esc(c.result || '')}</span>` : '';
     if (c.type === 'system') return '';
     if (c.type === 'stderr') return `<span class="chunk-stderr">${esc(c.text)}</span>`;
-    if (c.type === 'input_request') return renderInputRequest(c);
     return `<span class="chunk-raw">${esc(JSON.stringify(c))}</span>`;
   }).join('');
 }
 
-// ── Interactive input_request rendering & response ────────────────────────────
-function renderInputRequest(c) {
-  const lines = (c.screen || '').split('\n').map(l => l.trim()).filter(Boolean);
-  // Extract numbered choices (lines matching "N." or "N .")
-  const choices = [];
-  let question = '';
-  for (const line of lines) {
-    const m = line.match(/^(\d+)[.)]\s+(.+)/);
-    if (m) {
-      choices.push({ n: m[1], label: m[2] });
-    } else if (!choices.length && !/Enter to select|Tab.*navigate|Esc to cancel/i.test(line)) {
-      question = line; // last non-hint line before choices is the question
-    }
-  }
-  const choiceButtons = choices.map(ch =>
-    `<button class="input-req-choice" data-keys="${esc(ch.n + ' Enter')}" title="Send: ${esc(ch.n)} + Enter">${esc(ch.n)}. ${esc(ch.label)}</button>`
-  ).join('');
-  return `<div class="input-request">
-    <div class="input-req-label">Claude is waiting for your input${question ? ': ' + esc(question) : ''}</div>
-    ${choiceButtons ? `<div class="input-req-choices">${choiceButtons}</div>` : ''}
-    <div class="input-req-freetext">
-      <input class="input-req-text" placeholder="Type a response and press Enter…" autocomplete="off" />
-      <button class="input-req-send">Send</button>
-    </div>
-  </div>`;
-}
-
+// Send named tmux keys (e.g. 'C-b C-b') to the active session's work tmux.
+// Note: interactive choice menus are auto-resolved server-side (tmuxRunner
+// picks "chat about this" / Escape) — no user-facing input widget exists.
 async function sendSessionKeys(keys) {
   if (!activeSessionId) return;
   await apiFetch(`/api/sessions/${activeSessionId}/keys`, {
@@ -951,34 +934,6 @@ async function sendSessionKeys(keys) {
     body: JSON.stringify({ keys }),
   });
 }
-
-// Event delegation for input_request widgets inside output div
-outputDiv.addEventListener('click', async e => {
-  const choiceBtn = e.target.closest('.input-req-choice');
-  const sendBtn = e.target.closest('.input-req-send');
-  if (choiceBtn) {
-    await sendSessionKeys(choiceBtn.dataset.keys);
-    return;
-  }
-  if (sendBtn) {
-    const widget = sendBtn.closest('.input-request');
-    const input = widget?.querySelector('.input-req-text');
-    if (input?.value.trim()) {
-      await sendSessionKeys(input.value.trim() + ' Enter');
-      input.value = '';
-    }
-  }
-});
-outputDiv.addEventListener('keydown', async e => {
-  if (e.key !== 'Enter') return;
-  const input = e.target.closest('.input-req-text');
-  if (!input) return;
-  e.preventDefault();
-  if (input.value.trim()) {
-    await sendSessionKeys(input.value.trim() + ' Enter');
-    input.value = '';
-  }
-});
 
 // ── Actions ───────────────────────────────────────────────────────────────────
 function autoResize(el) {
@@ -2136,7 +2091,7 @@ function showHubFromTooltip(anchor, sessionId) {
   const activeCh = hubChannels.find(c => c.id === activeChannelId);
   const activeChName = activeCh?.name || (activeChannelId ? activeChannelId.slice(0, 8) : '');
   const hubChCmd = activeChannelId
-    ? `${sshPrefix}tmux attach -t banana-${sid8}-hub-ch-${activeChannelId.slice(0, 8)}`
+    ? `${sshPrefix}tmux attach -t banana-${sid8}-hub-ch-${activeChannelId}`
     : null;
   const mkTip = (label, cmd) =>
     `<div class="session-tooltip-label">${label}</div>` +

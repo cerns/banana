@@ -979,7 +979,7 @@ export type StartupScreenClass = 'ready' | 'stale-resume' | 'fatal-error' | 'tru
 export function classifyStartupScreen(cleaned: string): StartupScreenClass {
   if (cleaned.split('\n').some(l => isPromptLine(l))) return 'ready';
   if (/[Nn]o conversation found/i.test(cleaned)) return 'stale-resume';
-  if ((/error|Error|fatal|FATAL/.test(cleaned) || /No executable.*found/i.test(cleaned) || /command not found/i.test(cleaned)) && /[$#]\s*$/m.test(cleaned)) return 'fatal-error';
+  if ((/error|fatal/i.test(cleaned) || /No executable.*found/i.test(cleaned) || /command not found/i.test(cleaned)) && /[$#]\s*$/m.test(cleaned)) return 'fatal-error';
   if (/Yes.*trust.*folder|trust.*folder.*Yes|Enter to confirm.*Esc to cancel/i.test(cleaned)) return 'trust-prompt';
   return 'pending';
 }
@@ -1248,7 +1248,9 @@ export async function streamTmuxOutput(
       }
 
       // ── Interactive choice/input detection ─────────────────────────────
-      // Detect Claude's numbered-choice menus.
+      // Detect Claude's numbered-choice menus and auto-resolve them — the user
+      // should never have to answer. Prefer the "Chat about this" / "other"
+      // option (keeps the conversation going); otherwise dismiss with Escape.
       // Pattern: "Enter to select · Tab/Arrow keys to navigate · Esc to cancel"
       if (/Enter to select\s*·\s*Tab|Arrow keys to navigate/i.test(screen)) {
         const screenFingerprint = screen.slice(-400);
@@ -1264,33 +1266,26 @@ export async function streamTmuxOutput(
             if (m) choices.push({ n: m[1], label: m[2].trim() });
           }
 
-          // Dismiss the menu with Escape so Claude falls back to free-text conversation.
-          // "Esc to cancel" is shown in the nav hint — this is the safest neutral action.
-          // If Escape doesn't work on this Claude version, fall back to auto-selecting
-          // "Chat about this" or "other".
           const chatChoice =
             choices.find(c => /chat about/i.test(c.label)) ??
-            choices.find(c => /other/i.test(c.label));
+            choices.find(c => /other/i.test(c.label));
 
-          console.log(`[tmux-runner] Choice menu detected — sending Escape to dismiss`);
-          onChunk({ type: 'stderr', text: `[banana-tmux] Choice menu dismissed (Esc)${chatChoice ? ` — fallback: ${chatChoice.n}. ${chatChoice.label}` : ''}\n` });
-          sendKeysForApprove('Escape');
-
-          // If Escape doesn't dismiss within ~1s, the next poll will re-detect and
-          // the dedup fingerprint will still match so we won't re-fire immediately.
-          // Clear the fingerprint after a delay so a fallback can fire if needed.
           if (chatChoice) {
-            setTimeout(() => {
-              if (lastInputRequestScreen === screenFingerprint) {
-                console.log(`[tmux-runner] Escape didn't dismiss — auto-selecting "${chatChoice.label}"`);
-                sendKeysForApprove(`${chatChoice.n} Enter`);
-                lastInputRequestScreen = '';
-              }
-            }, 2000);
+            console.log(`[tmux-runner] Choice menu detected — auto-selecting "${chatChoice.label}"`);
+            onChunk({ type: 'stderr', text: `[banana-tmux] Choice menu auto-resolved: ${chatChoice.n}. ${chatChoice.label}\n` });
+            sendKeysForApprove(`${chatChoice.n} Enter`);
+          } else {
+            console.log(`[tmux-runner] Choice menu detected — sending Escape to dismiss`);
+            onChunk({ type: 'stderr', text: `[banana-tmux] Choice menu dismissed (Esc)\n` });
+            sendKeysForApprove('Escape');
           }
         }
-        // Keep job alive while waiting for user or auto-response to take effect
+        // Keep job alive while the auto-response takes effect
         lastChangeAt = Date.now();
+      } else if (lastInputRequestScreen) {
+        // Menu gone from screen — reset the dedup fingerprint so an identical
+        // menu appearing later is handled again.
+        lastInputRequestScreen = '';
       }
 
       // Check for prompt (response complete)
@@ -1569,12 +1564,19 @@ export async function killTmuxSession(machine: MachineRecord, sessionId: string,
 }
 
 /**
- * Kill ALL tmux session variants (work + hub) for a banana session.
+ * Kill ALL tmux session variants (work + hub + every hub-ch-*) for a banana session.
  * Called when a session is deleted.
  */
 export async function killAllTmuxSessions(machine: MachineRecord, sessionId: string): Promise<void> {
-  await killTmuxSession(machine, sessionId);
-  await killTmuxSession(machine, sessionId, '-hub');
+  // Collect every suffix tracked for this sessionId (keys are `${sessionId}${suffix}`),
+  // then always include work + '-hub' in case they're not in the map.
+  const suffixes = new Set<string>(['', '-hub']);
+  for (const key of tmuxSessions.keys()) {
+    if (key.startsWith(sessionId)) suffixes.add(key.slice(sessionId.length));
+  }
+  for (const sfx of suffixes) {
+    await killTmuxSession(machine, sessionId, sfx || undefined);
+  }
 }
 
 /** Check if a tmux session exists for the given banana sessionId. */

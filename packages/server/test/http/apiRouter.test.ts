@@ -56,8 +56,10 @@ vi.mock('../../src/ssh/sshRunner.js', () => ({
 }));
 
 const mockKillTmuxSession = vi.fn().mockResolvedValue(undefined);
+const mockSendKeysToTmuxSession = vi.fn().mockResolvedValue(undefined);
 vi.mock('../../src/ssh/tmuxRunner.js', () => ({
   killTmuxSession: mockKillTmuxSession,
+  sendKeysToTmuxSession: mockSendKeysToTmuxSession,
 }));
 
 const mockJumpHostStore = {
@@ -670,6 +672,58 @@ describe('apiRouter', () => {
       const res = createRes();
       await handleApiRequest(req, res);
       expect(res._status).toBe(404);
+    });
+  });
+
+  // ── Keys (raw tmux input) ────────────────────────────────────────────────
+
+  describe('POST /api/sessions/:id/keys', () => {
+    function seedKeysSession() {
+      machineStore.machineStore.upsert({
+        id: 'm1', name: 'machine', alias: 'mc', ip: '1.1.1.1', port: 22,
+        username: 'root', defaultWorkdir: '/opt', createdAt: '', updatedAt: '',
+      });
+      sessionStore.sessionStore.upsert({
+        sessionId: 'sess-keys', clientId: '', hostname: 'h', workdir: '/w',
+        connectedAt: '', status: 'connected', jobs: [], type: 'remote', machineId: 'm1',
+      });
+    }
+
+    it('should send valid named key tokens', async () => {
+      seedKeysSession();
+      const req = createReq('POST', '/api/sessions/sess-keys/keys', { keys: 'C-b C-b' });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+      expect(mockSendKeysToTmuxSession).toHaveBeenCalledWith(expect.anything(), 'sess-keys', 'C-b C-b');
+    });
+
+    it('should accept digit + Enter choice selection', async () => {
+      seedKeysSession();
+      const req = createReq('POST', '/api/sessions/sess-keys/keys', { keys: '1 Enter' });
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(200);
+    });
+
+    it('should reject free text / shell metacharacters with 400', async () => {
+      seedKeysSession();
+      for (const bad of ['hello world; rm -rf ~', "'quoted' Enter", 'foo$(id)', 'Enter; ls']) {
+        mockSendKeysToTmuxSession.mockClear();
+        const req = createReq('POST', '/api/sessions/sess-keys/keys', { keys: bad });
+        const res = createRes();
+        await handleApiRequest(req, res);
+        expect(res._status).toBe(400);
+        expect(mockSendKeysToTmuxSession).not.toHaveBeenCalled();
+      }
+    });
+
+    it('should return 400 when keys missing', async () => {
+      seedKeysSession();
+      const req = createReq('POST', '/api/sessions/sess-keys/keys', {});
+      const res = createRes();
+      await handleApiRequest(req, res);
+      expect(res._status).toBe(400);
     });
   });
 

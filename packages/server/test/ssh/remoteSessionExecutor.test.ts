@@ -1547,6 +1547,34 @@ describe('remoteSessionExecutor', () => {
       consoleSpy.mockRestore();
     });
 
+    it('abortRemoteJob should abort hub-channel executions too', async () => {
+      setupPersistentSession();
+
+      mockRunClaudeViaTmuxForSession.mockImplementation(
+        async (_m: any, _sid: any, _p: any, _w: any, _on: Function, signal: AbortSignal) => {
+          return new Promise((_resolve, reject) => {
+            signal?.addEventListener('abort', () => reject(new Error('Aborted')));
+          });
+        },
+      );
+
+      const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+      // Triggered hub work runs on a per-channel exec key
+      executor.executeRemoteJob('sess-p1', 'job-c1', 'triggered work', undefined, 'hub-channel:chan-42');
+      await vi.waitFor(() => expect(mockRunClaudeViaTmuxForSession).toHaveBeenCalledTimes(1));
+      expect(executor.isSessionBusy('sess-p1', 'hub-channel:chan-42')).toBe(true);
+
+      const aborted = executor.abortRemoteJob('sess-p1');
+      expect(aborted).toBe(true);
+
+      // C-c must reach the hub-ch tmux session (plus baseline work + hub)
+      expect(mockAbortTmuxJob).toHaveBeenCalledWith(expect.anything(), 'sess-p1', '-hub-ch-chan-42');
+      await vi.waitFor(() => expect(executor.isSessionBusy('sess-p1', 'hub-channel:chan-42')).toBe(false));
+
+      consoleSpy.mockRestore();
+    });
+
     it('non-persistent machines should share one execution slot for both channels', async () => {
       // Non-persistent: same key regardless of channel
       const machine = makeMachine(); // no persistentMode

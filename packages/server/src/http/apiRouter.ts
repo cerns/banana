@@ -458,6 +458,15 @@ export async function handleApiRequest(req: IncomingMessage, res: ServerResponse
     if (!sessionId) { json(res, 404, { error: 'Session not found' }); return true; }
     const body = await readBody(req) as { keys?: string };
     if (!body.keys || typeof body.keys !== 'string') { json(res, 400, { error: 'keys required' }); return true; }
+    // The keys string is interpolated into a remote shell command (tmux send-keys),
+    // so only allow whitespace-separated tmux key tokens — single printable chars,
+    // C-x / M-x chords, and named keys. Reject anything else (quotes, ;, $, …).
+    const TMUX_KEY_TOKEN = /^(?:[A-Za-z0-9]|[CM]-[A-Za-z0-9]|Enter|Escape|Tab|Space|BSpace|BTab|Up|Down|Left|Right|Home|End|PPage|NPage|PageUp|PageDown|DC|IC|F(?:[1-9]|1[0-2]))$/;
+    const tokens = body.keys.trim().split(/\s+/);
+    if (tokens.length === 0 || !tokens.every(t => TMUX_KEY_TOKEN.test(t))) {
+      json(res, 400, { error: 'keys must be space-separated tmux key tokens (e.g. "1 Enter", "C-b C-b", "Escape")' });
+      return true;
+    }
     const session = sessionStore.get(sessionId);
     if (!session) { json(res, 404, { error: 'Session not found' }); return true; }
     const machine = machineStore.get(session.machineId ?? '');

@@ -326,54 +326,6 @@ header h1 { font-size: 16px; color: var(--accent); }
 .chunk-raw { color: var(--muted); display: block; font-size: 10px; white-space: pre-wrap; opacity: 0.6; }
 .chunk-truncated { color: var(--muted); font-size: 10px; padding: 2px 0 4px; border-bottom: 1px dashed var(--border); margin-bottom: 4px; }
 
-.input-request {
-  border: 1px solid var(--accent);
-  border-radius: 6px;
-  padding: 10px 12px;
-  margin: 8px 0;
-  background: color-mix(in srgb, var(--accent) 8%, var(--bg));
-}
-.input-req-label {
-  font-size: 11px;
-  color: var(--accent);
-  font-weight: 600;
-  margin-bottom: 8px;
-}
-.input-req-choices { display: flex; flex-direction: column; gap: 4px; margin-bottom: 8px; }
-.input-req-choice {
-  text-align: left;
-  background: var(--surface);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  padding: 5px 10px;
-  font-size: 12px;
-  font-family: var(--font-mono);
-  color: var(--text);
-  cursor: pointer;
-}
-.input-req-choice:hover { border-color: var(--accent); color: var(--accent); }
-.input-req-freetext { display: flex; gap: 6px; }
-.input-req-text {
-  flex: 1;
-  background: var(--bg);
-  border: 1px solid var(--border);
-  border-radius: 4px;
-  color: var(--text);
-  font-family: var(--font-mono);
-  font-size: 12px;
-  padding: 4px 8px;
-}
-.input-req-text:focus { outline: none; border-color: var(--accent); }
-.input-req-send {
-  background: var(--accent);
-  border: none;
-  border-radius: 4px;
-  color: #fff;
-  font-size: 12px;
-  padding: 4px 10px;
-  cursor: pointer;
-}
-
 .archived-job-item {
   border: 1px solid var(--border);
   border-radius: 4px;
