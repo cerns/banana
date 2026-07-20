@@ -52,6 +52,13 @@ npm run test:coverage # run with coverage report
 - **Config**: `vitest.config.ts` at repo root
 - **Test files**: `packages/server/test/**/*.test.ts`
 - **Coverage thresholds**: 90% lines/functions/statements, 85% branches
+- **Expected passing count**: 727 tests across 20 files.
+- **Expected stderr noise (NOT failures)**: `tmuxRunner.test.ts` intentionally
+  exercises the persist-error path (`killAllTmuxSessions` / `killTmuxSession`
+  with no persist path set), so `npm test` prints `[tmux-runner] persist error
+  TypeError: The "path" argument must be of type string. Received undefined`.
+  The test asserts the code logs and continues rather than throwing — all
+  assertions still pass. Do not treat this log line as a broken test.
 
 ### Test Structure
 ```
