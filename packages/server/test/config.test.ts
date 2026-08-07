@@ -101,11 +101,11 @@ describe('config', () => {
     expect(config.promptCompressEnabled).toBe(true);
   });
 
-  it('should default compactTokenThreshold=10000', async () => {
+  it('should default compactTokenThreshold=500000', async () => {
     process.env.BANANA_TOKEN = 'test';
     delete process.env.BANANA_COMPACT_TOKEN_THRESHOLD;
     const { config } = await import('../src/config.js');
-    expect(config.compactTokenThreshold).toBe(10000);
+    expect(config.compactTokenThreshold).toBe(500000);
   });
 
   it('should load compactTokenThreshold from env', async () => {

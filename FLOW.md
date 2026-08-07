@@ -634,7 +634,7 @@ hubQueue      QueuedMessage[]   pending hub dispatches
 | `hubWaveSize` | 2 | `BANANA_HUB_WAVE_SIZE` | Max sessions in wave1 (A2 staggered dispatch) |
 | `hubChatMaxTurns` | 3 | `BANANA_HUB_CHAT_MAX_TURNS` | Max agentic turns for hub chat (B4) |
 | `sshMaxTurns` | 25 | `BANANA_SSH_MAX_TURNS` | Max agentic turns for work sessions (B4) |
-| `compactTokenThreshold` | 80000 | — | Auto-compact when context exceeds this |
+| `compactTokenThreshold` | 500000 | `BANANA_COMPACT_TOKEN_THRESHOLD` | Auto-compact when context exceeds this (0 = disable) |
 | `tmuxIdleCompletionMs` | 30000 | — | Idle timeout for tmux completion detection |
 | `tmuxAutoApprovePermissions` | true | — | Auto-approve permission prompts in tmux |
 

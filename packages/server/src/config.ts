@@ -53,8 +53,9 @@ export const config = {
   compactChunkTokens: parseInt(process.env.BANANA_COMPACT_CHUNK_TOKENS ?? '80000', 10),
   // Auto-compact: when the last run's input token count exceeds this threshold,
   // run /compact before the next prompt to keep context lean. Set to 0 to disable.
-  // Default 10000 — triggers compact early to keep context lean.
-  compactTokenThreshold: parseInt(process.env.BANANA_COMPACT_TOKEN_THRESHOLD ?? '10000', 10),
+  // Default 500000 — compact only when context genuinely grows large (1M-context
+  // models); avoids paying a /compact round-trip on nearly every prompt.
+  compactTokenThreshold: parseInt(process.env.BANANA_COMPACT_TOKEN_THRESHOLD ?? '500000', 10),
   jumpHostPersistPath: process.env.BANANA_JUMPHOSTS_PATH ?? path.join(os.homedir(), '.banana', 'jumphosts.json'),
   // ── Hub dispatch tuning ──────────────────────────────────────────────────
   // Max agentic turns for work sessions (--max-turns).
